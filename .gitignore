@@ -1,0 +1,4 @@
+# Local build-environment workarounds (proxy CA certs, test Dockerfiles, etc.)
+# These are only used when building behind a TLS-inspecting corporate proxy.
+build-ca-certs/
+Dockerfile.buildtest
