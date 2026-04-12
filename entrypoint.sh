@@ -21,6 +21,17 @@ if ! gst-launch-1.0 ximagesrc num-buffers=1 ! fakesink sync=false 2>/dev/null; t
 fi
 echo "[entrypoint] X11 display OK."
 
+# ── GPU pre-flight ────────────────────────────────────────────────────────────
+# nvidia-container-toolkit injects nvidia-smi when the container runs with --gpus.
+# Log GPU info early so operators can confirm the GPU was injected correctly.
+if command -v nvidia-smi &>/dev/null; then
+    echo "[entrypoint] NVIDIA GPU detected:"
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null \
+        || echo "  (nvidia-smi present but query failed)"
+else
+    echo "[entrypoint] No NVIDIA GPU detected (software encoding will be used)."
+fi
+
 # ── Signalling server ─────────────────────────────────────────────────────────
 echo "[entrypoint] Starting signalling server on ${SIGNALLING_HOST}:${SIGNALLING_PORT} ..."
 

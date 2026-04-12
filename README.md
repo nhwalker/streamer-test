@@ -12,10 +12,11 @@ Streams a Linux desktop (X11) to any modern web browser in real time, with sub-s
 4. [Container internals](#container-internals)
 5. [Build process](#build-process)
 6. [Running the container](#running-the-container)
-7. [Configuration reference](#configuration-reference)
-8. [Verifying it works](#verifying-it-works)
-9. [Adapting for Wayland](#adapting-for-wayland)
-10. [Production upgrade path](#production-upgrade-path)
+7. [NVIDIA GPU encoding](#nvidia-gpu-encoding)
+8. [Configuration reference](#configuration-reference)
+9. [Verifying it works](#verifying-it-works)
+10. [Adapting for Wayland](#adapting-for-wayland)
+11. [Production upgrade path](#production-upgrade-path)
 
 ---
 
@@ -319,6 +320,67 @@ docker run --rm \
 
 ---
 
+## NVIDIA GPU encoding
+
+When the container runs on a host with an NVIDIA GPU and [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), it can use NVENC hardware encoding for H.264 and H.265. This offloads video encoding from the CPU to the GPU's dedicated encoder, freeing CPU cores and often improving quality at the same bitrate.
+
+### How it works
+
+The container image includes the GStreamer `nvcodec` plugin, which provides `nvh264enc` and `nvh265enc` encoder elements. The plugin uses `dlopen` to load NVIDIA driver libraries at runtime:
+
+- **With a GPU** (`--gpus all`): nvidia-container-toolkit injects the NVIDIA driver libraries (`libcuda.so`, `libnvidia-encode.so`). The nvcodec plugin loads successfully, and `webrtcsink` automatically prefers the hardware encoders over software ones.
+- **Without a GPU**: The plugin cannot load the NVIDIA libraries, so GStreamer silently skips it. Everything works exactly as before (VP9/VP8 software encoding).
+
+### Prerequisites
+
+- NVIDIA GPU with NVENC support (Kepler or newer — GTX 600+, Tesla T4/A10/L4, etc.)
+- NVIDIA driver installed on the host
+- [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed and configured
+
+### Running with GPU
+
+```bash
+docker run --rm --gpus all \
+  --network=host \
+  -e DISPLAY=:0 \
+  -e STREAM_CODEC=h264 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
+  x11-webrtc-streamer
+```
+
+H.265 is also supported (better compression, but limited browser support — see note below):
+
+```bash
+docker run --rm --gpus all \
+  --network=host \
+  -e DISPLAY=:0 \
+  -e STREAM_CODEC=h265 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
+  x11-webrtc-streamer
+```
+
+> **H.265 browser support**: H.265 (HEVC) over WebRTC is supported in Chrome and Edge but **not in Firefox**. Use H.264 for maximum browser compatibility, or VP9 if you don't need GPU encoding.
+
+### Verifying GPU encoding
+
+```bash
+# Check that the nvcodec plugin loaded and nvh264enc is available
+docker run --rm --gpus all x11-webrtc-streamer \
+  gst-inspect-1.0 nvh264enc
+
+# During streaming, monitor GPU encoder utilization on the host
+nvidia-smi dmon -s u -d 1
+```
+
+The container logs will also show GPU detection at startup:
+```
+[entrypoint] NVIDIA GPU detected:
+  Tesla T4, 535.129.03, 15360 MiB
+[pipeline] NVIDIA NVENC detected: hardware encoding available (nvh264enc, nvh265enc)
+```
+
+---
+
 ## Configuration reference
 
 All settings are environment variables passed to `docker run -e`:
@@ -326,7 +388,7 @@ All settings are environment variables passed to `docker run -e`:
 | Variable | Default | Description |
 |---|---|---|
 | `DISPLAY` | `:0` | X11 display to capture |
-| `STREAM_CODEC` | `vp9` | Video codec: `vp9`, `vp8`, or `h264`\* |
+| `STREAM_CODEC` | `vp9` | Video codec: `vp9`, `vp8`, `h264`, or `h265`\* |
 | `STREAM_WIDTH` | `1920` | Capture width in pixels |
 | `STREAM_HEIGHT` | `1080` | Capture height in pixels |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
@@ -336,7 +398,7 @@ All settings are environment variables passed to `docker run -e`:
 | `WEB_PORT` | `8080` | Port for the HTTP page server |
 | `GST_WEBRTC_STUN_SERVER` | _(empty)_ | STUN server URI, e.g. `stun://stun.l.google.com:19302` |
 
-\* H.264 requires adding EPEL and `gstreamer1-plugins-ugly` to the runtime stage of the Dockerfile.
+\* H.264 and H.265 use NVENC hardware encoding when a GPU is available (`--gpus all`). Without a GPU, H.264 needs a software encoder (add EPEL + `gstreamer1-plugins-ugly` + `x264` to the runtime stage). H.265 WebRTC is supported in Chrome/Edge but not Firefox.
 
 ### Example: lower-bandwidth 720p stream
 
@@ -471,11 +533,8 @@ webrtcsink signaller::uri="https://your-sfu.example.com/whip/ingest" \
 
 `webrtcsink` manages multiple browser peers natively. For very large deployments (hundreds of simultaneous viewers), introduce a Selective Forwarding Unit (SFU) such as LiveKit or Janus between `webrtcsink` and the browsers. The SFU receives one stream from the container and fans it out to viewers, reducing upstream bandwidth from the capture host.
 
-### H.264 (wider hardware support)
+### H.264 / H.265 hardware encoding
 
-VP9 is used by default because it requires no additional packages. To enable H.264 (better hardware encoder support on GPU-equipped hosts):
+The container image includes the GStreamer nvcodec plugin. When run with `--gpus all` (requires nvidia-container-toolkit on the host), NVENC hardware encoding is used automatically. Set `STREAM_CODEC=h264` or `STREAM_CODEC=h265` at runtime.
 
-1. Add EPEL to both build and runtime stages of the Dockerfile
-2. Install `gstreamer1-plugins-ugly` in the runtime stage
-3. Set `STREAM_CODEC=h264` at runtime
-4. For hardware encoding (VAAPI), pass `--device /dev/dri` to `docker run`
+For software H.264 encoding without a GPU, add EPEL and `gstreamer1-plugins-ugly` to the runtime stage of the Dockerfile. For VAAPI hardware encoding on Intel/AMD GPUs, pass `--device /dev/dri` to `docker run`.
