@@ -7,7 +7,36 @@
 FROM registry.access.redhat.com/ubi9:latest AS builder
 
 # Layer A — OS build dependencies (rarely changes; outermost cache layer)
+# UBI9 repos lack several -devel packages and gstreamer1-plugins-good.
+# We supplement with Rocky 9 AppStream/CRB (priority 200, lower than UBI9 defaults)
+# and EPEL.
+# UBI9 CRB provides: meson, ninja-build
+# UBI9 AppStream provides: rust, cargo
+# Rocky 9 AppStream provides: gstreamer1-devel, gstreamer1-plugins-base-devel
+# Rocky 9 CRB provides: gstreamer1-plugins-bad-free-devel
+# EPEL provides: libnice-devel, cargo-c
+COPY <<'ROCKY_APPSTREAM' /etc/yum.repos.d/rocky9-appstream.repo
+[rocky9-appstream]
+name=Rocky Linux 9 - AppStream
+baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/x86_64/os/
+gpgcheck=1
+gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9
+enabled=1
+priority=200
+ROCKY_APPSTREAM
+COPY <<'ROCKY_CRB' /etc/yum.repos.d/rocky9-crb.repo
+[rocky9-crb]
+name=Rocky Linux 9 - CRB
+baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/x86_64/os/
+gpgcheck=1
+gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9
+enabled=1
+priority=200
+ROCKY_CRB
 RUN dnf install -y --setopt=install_weak_deps=False \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+    && dnf config-manager --set-enabled ubi-9-codeready-builder-rpms \
+    && dnf install -y --allowerasing --setopt=install_weak_deps=False \
         gstreamer1-devel \
         gstreamer1-plugins-base-devel \
         gstreamer1-plugins-bad-free-devel \
@@ -16,23 +45,13 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         gcc gcc-c++ pkg-config make git curl \
         nodejs npm \
         meson ninja-build \
+        rust cargo cargo-c \
     && dnf clean all
-
-# Layer B — Rust toolchain (invalidated only on toolchain version bump)
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain 1.78.0 --no-modify-path --profile minimal
-
-# Layer C — cargo-c (needed for `cargo cbuild` / `cargo cinstall`)
-RUN cargo install cargo-c --version "^0.9" --locked
 
 # Layer D — Clone gst-plugins-rs at pinned tag
 # Pin version: 0.12.7 targets gstreamer-rs 0.22, requiring GStreamer >= 1.22
-# UBI9 AppStream ships GStreamer 1.22.x — this tag is the correct match.
-# To upgrade: bump tag to 0.13.x once UBI9 ships GStreamer >= 1.24.
+# UBI9 / Rocky 9 AppStream ships GStreamer 1.22.x — this tag is the correct match.
+# To upgrade: bump tag to 0.13.x once the base ships GStreamer >= 1.24.
 ARG GST_PLUGINS_RS_TAG=0.12.7
 RUN git clone --depth 1 --branch "${GST_PLUGINS_RS_TAG}" \
     https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git /src
@@ -99,12 +118,26 @@ FROM registry.access.redhat.com/ubi9:latest
 # gstreamer1-plugins-bad-free : webrtcbin (WebRTC engine used internally by webrtcsink)
 # python3      : serves the web page (replace with nginx in production)
 # nmap-ncat    : nc for the signalling server readiness probe in entrypoint.sh
+# Rocky 9 AppStream (priority 200) provides: gstreamer1-plugins-good
+# EPEL provides: libnice, libnice-gstreamer1
+COPY <<'ROCKY_APPSTREAM' /etc/yum.repos.d/rocky9-appstream.repo
+[rocky9-appstream]
+name=Rocky Linux 9 - AppStream
+baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/x86_64/os/
+gpgcheck=1
+gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9
+enabled=1
+priority=200
+ROCKY_APPSTREAM
 RUN dnf install -y --setopt=install_weak_deps=False \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+    && dnf install -y --setopt=install_weak_deps=False \
         gstreamer1 \
         gstreamer1-plugins-base \
         gstreamer1-plugins-good \
         gstreamer1-plugins-bad-free \
         libnice \
+        libnice-gstreamer1 \
         openssl-libs \
         python3 \
         nmap-ncat \
