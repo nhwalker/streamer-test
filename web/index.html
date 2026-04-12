@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Desktop Stream</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #111;
+      color: #ddd;
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+
+    #status {
+      padding: 0.75em 1.25em;
+      background: rgba(255,255,255,0.07);
+      border-radius: 6px;
+      margin-bottom: 1em;
+      max-width: 480px;
+      text-align: center;
+      line-height: 1.5;
+    }
+
+    #status.error { color: #f88; background: rgba(255,80,80,0.12); }
+    #status.hidden { display: none; }
+
+    video {
+      max-width: 100vw;
+      max-height: 100vh;
+      display: block;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <p id="status">Connecting to signalling server…</p>
+  <video id="stream" autoplay playsinline></video>
+
+  <script type="module">
+    /**
+     * Desktop stream viewer
+     *
+     * Query parameters:
+     *   ?signalling=ws://host:8443   Override the signalling server URL.
+     *                                Defaults to ws://<this page's hostname>:8443
+     *   ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
+     *                                  browser and container are on different hosts.
+     *
+     * NOTE: The import path below references the gstwebrtc-api JS bundle built
+     * from gst-plugins-rs and served alongside this page.  If the filename in
+     * /var/www/html/gstwebrtc-api/ is different from gstwebrtc-api.js (check
+     * `ls` in the container after first build), update the import path.
+     *
+     * Production: replace the Python HTTP server with nginx/CDN and adjust the
+     * signalling URL via the ?signalling= query parameter.
+     */
+    import GstWebRTCAPI from './gstwebrtc-api/gstwebrtc-api.js';
+
+    const params  = new URLSearchParams(window.location.search);
+    const sigUrl  = params.get('signalling') ??
+                    `ws://${window.location.hostname}:8443`;
+    const stunUrl = params.get('stun');
+
+    const video  = document.getElementById('stream');
+    const status = document.getElementById('status');
+
+    const setStatus = (msg, isError = false) => {
+      status.textContent = msg;
+      status.className   = isError ? 'error' : '';
+    };
+
+    setStatus(`Connecting to ${sigUrl} …`);
+
+    // iceServers: empty means rely on direct host-network ICE candidates
+    // (works fine with --network=host or same-machine access).
+    // Set GST_WEBRTC_STUN_SERVER on the container side AND pass ?stun= on the
+    // browser side when crossing network boundaries.
+    const iceServers = stunUrl ? [{ urls: `stun:${stunUrl}` }] : [];
+
+    const api = new GstWebRTCAPI({
+      signalingServerUrl: sigUrl,
+      iceServers,
+    });
+
+    api.registerConsumerListener({
+      producerAdded(producer) {
+        setStatus(`Producer found (${producer.id}) — starting stream…`);
+
+        const session = api.createConsumerSession(producer.id);
+        if (!session) {
+          setStatus('Failed to create consumer session.', true);
+          return;
+        }
+
+        session.element = video;
+
+        session.addEventListener('error', (e) => {
+          setStatus(`Stream error: ${e.message ?? e}`, true);
+        });
+
+        session.addEventListener('closed', () => {
+          setStatus('Stream ended.');
+          video.srcObject = null;
+        });
+
+        video.addEventListener('playing', () => {
+          status.className = 'hidden';
+        }, { once: true });
+
+        session.connect();
+      },
+
+      producerRemoved(_producer) {
+        setStatus('Producer disconnected. Waiting for stream…');
+        video.srcObject = null;
+      },
+    });
+  </script>
+</body>
+</html>
