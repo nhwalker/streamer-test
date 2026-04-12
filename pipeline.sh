@@ -3,7 +3,7 @@
 #
 # Environment variables (all have defaults from Dockerfile ENV):
 #   DISPLAY               X11 display to capture         (:0)
-#   STREAM_CODEC          vp9 | vp8 | h264               (vp9)
+#   STREAM_CODEC          vp9 | vp8 | h264 | h265        (vp9)
 #   STREAM_WIDTH          capture width in pixels         (1920)
 #   STREAM_HEIGHT         capture height in pixels        (1080)
 #   STREAM_FRAMERATE      frames per second               (30)
@@ -25,12 +25,23 @@ set -euo pipefail
 case "${STREAM_CODEC:-vp9}" in
     vp9)  VIDEO_CAPS="video/x-vp9" ;;
     vp8)  VIDEO_CAPS="video/x-vp8" ;;
-    h264) VIDEO_CAPS="video/x-h264" ;;  # Requires EPEL + gstreamer1-plugins-ugly + x264
+    h264) VIDEO_CAPS="video/x-h264" ;;
+    h265) VIDEO_CAPS="video/x-h265" ;;
     *)
-        echo "[pipeline] ERROR: Unknown STREAM_CODEC '${STREAM_CODEC}'. Use vp9, vp8, or h264."
+        echo "[pipeline] ERROR: Unknown STREAM_CODEC '${STREAM_CODEC}'. Use vp9, vp8, h264, or h265."
         exit 1
         ;;
 esac
+
+# ── GPU encoder detection ─────────────────────────────────────────────────────
+# Log whether NVENC hardware encoders are available in the GStreamer registry.
+# webrtcsink auto-selects the highest-ranked encoder for the chosen codec, so
+# hardware encoders (nvh264enc, nvh265enc) are preferred when present.
+if gst-inspect-1.0 nvh264enc &>/dev/null; then
+    echo "[pipeline] NVIDIA NVENC detected: hardware encoding available (nvh264enc, nvh265enc)"
+else
+    echo "[pipeline] NVIDIA NVENC not detected: software encoding will be used"
+fi
 
 # ── Optional STUN server property ────────────────────────────────────────────
 # Needed when browser and container are NOT on the same host and --network=host
