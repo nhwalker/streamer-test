@@ -1,0 +1,36 @@
+FROM registry.access.redhat.com/ubi9:latest
+
+# Rocky 9 AppStream supplies X11 server utilities not present in base UBI 9.
+COPY <<'ROCKY_APPSTREAM' /etc/yum.repos.d/rocky9-appstream.repo
+[rocky9-appstream]
+name=Rocky Linux 9 - AppStream
+baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/x86_64/os/
+gpgcheck=1
+gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9
+enabled=1
+priority=200
+ROCKY_APPSTREAM
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        xorg-x11-server-Xvfb \
+        xorg-x11-utils \
+        xorg-x11-server-utils \
+    && dnf clean all
+
+# Pre-create /tmp/.X11-unix with the sticky-bit that X servers expect.
+# Docker copies image content into a named volume on first use, establishing
+# correct permissions even when the volume is freshly created.
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+# Start Xvfb on display :1 with a 1280x720 24-bit virtual screen.
+#   -ac           disables access control so the GStreamer container can
+#                 connect without an Xauthority cookie file.
+#   +extension RANDR  silences RANDR-missing warnings from some GStreamer elements.
+# After a short stabilisation pause, paint the root window solid red so the
+# capture pipeline has a recognisable colour to verify in the browser.
+CMD ["sh", "-c", "\
+    Xvfb :1 -screen 0 1280x720x24 -ac +extension RANDR & \
+    XVFB_PID=$!; \
+    sleep 2; \
+    xsetroot -display :1 -solid red; \
+    wait $XVFB_PID"]

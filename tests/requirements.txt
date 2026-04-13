@@ -1,0 +1,6 @@
+testcontainers[selenium]==4.14.2
+selenium>=4.20.0,<5
+requests>=2.31.0
+pytest>=8.0.0
+pytest-timeout>=2.3.0
+docker>=7.0.0

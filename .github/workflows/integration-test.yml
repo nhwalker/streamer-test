@@ -1,0 +1,87 @@
+name: WebRTC Integration Test
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    # Upper bound covers a cold Rust build (~40 min) plus test execution (~5 min).
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── GStreamer image: cache as a Docker tarball ────────────────────────────
+      # The GStreamer image takes 20-40 minutes to build on a cold cache because
+      # it compiles gst-plugins-rs (Rust) from source.  We cache the final image
+      # as a tar archive keyed on the files that affect the build.  On a cache
+      # hit the image loads in < 30 seconds; on a miss we build and save it so
+      # subsequent runs benefit from the cache.
+      - name: Restore GStreamer image cache
+        id: cache-gstreamer
+        uses: actions/cache@v4
+        with:
+          path: /tmp/gstreamer-image.tar
+          key: gstreamer-image-${{ runner.os }}-${{ hashFiles('Dockerfile', 'entrypoint.sh', 'pipeline.sh', 'web/**') }}
+
+      - name: Load GStreamer image from cache
+        if: steps.cache-gstreamer.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/gstreamer-image.tar
+
+      - name: Build GStreamer image (cache miss)
+        if: steps.cache-gstreamer.outputs.cache-hit != 'true'
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build -t webrtc-test-gstreamer:latest .
+
+      - name: Save GStreamer image to cache
+        if: steps.cache-gstreamer.outputs.cache-hit != 'true'
+        run: docker save webrtc-test-gstreamer:latest -o /tmp/gstreamer-image.tar
+
+      # ── Xvfb image ───────────────────────────────────────────────────────────
+      # The Xvfb image is quick to build (< 2 minutes; just package installs) so
+      # we let the conftest.py DockerImage fixture build it at test time.  There
+      # is no need to pre-build or cache it in CI.
+
+      # ── Selenium Chrome ──────────────────────────────────────────────────────
+      # Pre-pull to avoid a slow first-time download counting against the test
+      # timeout when the selenium_container fixture starts.
+      - name: Pre-pull Selenium Chrome image
+        run: docker pull selenium/standalone-chrome:latest
+
+      # ── Python test dependencies ─────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      # ── Run tests ────────────────────────────────────────────────────────────
+      - name: Run integration tests
+        env:
+          # Ryuk (the testcontainers resource reaper) maintains a socket
+          # connection and kills containers if it times out.  On ephemeral CI
+          # runners cleanup is guaranteed by the job ending, so Ryuk is
+          # unnecessary and can cause spurious failures during long builds.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+          # Use BuildKit so testcontainers DockerImage builds (Xvfb image) share
+          # the same layer cache as direct docker build calls.
+          DOCKER_BUILDKIT: "1"
+        run: pytest tests/ -v --tb=short
+
+      # ── Artefacts on failure ─────────────────────────────────────────────────
+      - name: Upload test artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failure-artefacts
+          path: /tmp/pytest-*
+          retention-days: 7
