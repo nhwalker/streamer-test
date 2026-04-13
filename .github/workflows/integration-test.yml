@@ -73,7 +73,7 @@ jobs:
 
       # ── Run tests ────────────────────────────────────────────────────────────
       - name: Run integration tests
-        working-directory: tests
+        working-directory: integration-tests
         env:
           # Ryuk (the testcontainers resource reaper) maintains a keepalive socket
           # and destroys containers if it times out.  On ephemeral CI runners
