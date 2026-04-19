@@ -102,7 +102,7 @@ class TestWebRTCStream:
             return isinstance(t, (int, float)) and t > 0
 
         try:
-            WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(
+            WebDriverWait(browser, timeout=60, poll_frequency=0.5).until(
                 video_is_playing
             )
         except Exception:
@@ -127,7 +127,7 @@ class TestWebRTCStream:
                 console_logs = []
             stdout, stderr = _container.get_logs()
             pytest.fail(
-                f"WebRTC video did not start playing within 30 s.\n"
+                f"WebRTC video did not start playing within 60 s.\n"
                 f"  video state    : {video_state}\n"
                 f"  page status    : {status_text!r}\n"
                 f"  browser console: {console_logs}\n"

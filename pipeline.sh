@@ -83,6 +83,7 @@ exec gst-launch-1.0 -e \
     ! videoscale \
     ! "${SIZE_CAPS}" \
     ! videoconvert \
+    ! queue \
     ! webrtcsink name=ws \
         "signaller::uri=ws://127.0.0.1:${SIGNALLING_PORT}" \
         "video-caps=${VIDEO_CAPS}" \

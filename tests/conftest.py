@@ -35,6 +35,10 @@ TEST_IMAGE = os.environ.get("TEST_IMAGE", "streamer-test:ci")
 XVFB_DISPLAY = ":99"
 XVFB_GEOMETRY = "1280x720x24"
 
+# Fixed ports used when the container runs with host networking.
+HTTP_PORT = 8080
+WS_PORT = 8443
+
 
 @pytest.fixture(scope="session")
 def xvfb_display():
@@ -75,6 +79,10 @@ def _container(xvfb_display):
     """
     Raw DockerContainer object, kept alive for the whole test session.
 
+    Runs with host networking so the GStreamer pipeline and headless Chrome
+    both use 127.0.0.1 ICE candidates, eliminating Docker-bridge ICE
+    connectivity failures in CI.
+
     Exposed separately from streaming_container so tests that need to
     inspect container logs on failure can request this fixture directly
     without changing the streaming_container API.
@@ -82,8 +90,13 @@ def _container(xvfb_display):
     container = (
         DockerContainer(TEST_IMAGE)
         .with_env("DISPLAY", xvfb_display)
+        # Match Xvfb geometry to avoid unnecessary scaling overhead.
+        .with_env("STREAM_WIDTH", "1280")
+        .with_env("STREAM_HEIGHT", "720")
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
-        .with_exposed_ports(8080, 8443)
+        # Host networking: container shares the host network namespace so
+        # WebRTC ICE candidates are 127.0.0.1 on both sides.
+        .with_kwargs(network_mode="host")
     )
     with container:
         yield container
@@ -95,16 +108,11 @@ def streaming_container(_container):
     Wait until HTTP and WebSocket services are reachable, then yield
     (http_port, ws_port).
 
-    Uses dynamic port mapping (with_exposed_ports) so the fixture works
-    in CI environments where 8080/8443 may already be bound.
+    With host networking the container's ports are the host's ports
+    directly — no dynamic mapping is needed.
     """
-    # Read port bindings first, while the container is freshly running.
-    # testcontainers 4.8+ makes get_exposed_port() call wait_until_ready()
-    # internally, which raises TimeoutError if the container has already
-    # exited.  Docker assigns host port mappings at creation time, so we
-    # can safely read them before the services are ready.
-    http_port = int(_container.get_exposed_port(8080))
-    ws_port = int(_container.get_exposed_port(8443))
+    http_port = HTTP_PORT
+    ws_port = WS_PORT
 
     # The web server log line is the last thing entrypoint.sh prints
     # before handing off to pipeline.sh, so it confirms both the
@@ -144,6 +152,10 @@ def browser():
     --autoplay-policy=no-user-gesture-required  allows <video> autoplay
                                     without a user click, which headless
                                     Chrome otherwise blocks.
+    --disable-features=WebRtcHideLocalIpsWithMdns
+                                    expose real IP addresses in ICE
+                                    candidates instead of mDNS hostnames,
+                                    required for loopback ICE to work.
     goog:loggingPrefs browser=ALL   captures JS console output so failures
                                     include browser-side error messages.
     """
@@ -153,6 +165,7 @@ def browser():
     options.add_argument("--use-fake-ui-for-media-stream")
     options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
     options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
     service = Service(ChromeDriverManager().install())
