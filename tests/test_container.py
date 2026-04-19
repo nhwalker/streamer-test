@@ -80,7 +80,7 @@ class TestServiceAvailability:
 class TestWebRTCStream:
     """Browser-driven test that verifies live video playback over WebRTC."""
 
-    def test_webrtc_video_plays(self, streaming_container, browser):
+    def test_webrtc_video_plays(self, streaming_container, _container, browser):
         """
         Headless Chrome loads the streaming page and receives a WebRTC stream.
 
@@ -121,8 +121,16 @@ class TestWebRTCStream:
                 "const s = document.getElementById('status');"
                 "return s ? s.textContent : 'status element not found';"
             )
+            try:
+                console_logs = browser.get_log("browser")
+            except Exception:
+                console_logs = []
+            stdout, stderr = _container.get_logs()
             pytest.fail(
                 f"WebRTC video did not start playing within 30 s.\n"
-                f"  video state : {video_state}\n"
-                f"  page status : {status_text!r}"
+                f"  video state    : {video_state}\n"
+                f"  page status    : {status_text!r}\n"
+                f"  browser console: {console_logs}\n"
+                f"  container stdout:\n{stdout.decode(errors='replace')}\n"
+                f"  container stderr:\n{stderr.decode(errors='replace')}"
             )
