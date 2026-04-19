@@ -113,10 +113,10 @@ RUN npm install && npm run build && \
     echo "=== files in /opt/gstwebrtc-api ===" && \
     ls -la /opt/gstwebrtc-api && \
     ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "gstwebrtc-api*.js" \
-                 -not -name "*.min.js" 2>/dev/null | sort | head -1) && \
+                 -not -name "*.js.map" 2>/dev/null | sort | head -1) && \
     if [ -z "${ENTRY}" ]; then \
         ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "*.js" \
-                     -not -name "*.min.js" 2>/dev/null | sort | head -1); \
+                     -not -name "*.js.map" 2>/dev/null | sort | head -1); \
     fi && \
     if [ -z "${ENTRY}" ]; then \
         echo "ERROR: no JS entry point found in ${OUTPUT_DIR}" && exit 1; \
