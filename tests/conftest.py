@@ -112,7 +112,8 @@ def streaming_container(xvfb_display):
             stdout, stderr = container.get_logs()
             raise RuntimeError(
                 f"HTTP server on :{http_port} did not respond within 10 s.\n"
-                f"Container stdout:\n{stdout.decode()}"
+                f"Container stdout:\n{stdout.decode()}\n"
+                f"Container stderr:\n{stderr.decode()}"
             )
 
         yield http_port, ws_port

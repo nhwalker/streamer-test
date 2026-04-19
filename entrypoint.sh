@@ -1,9 +1,13 @@
 #!/bin/bash
-# entrypoint.sh — starts three services in order, then hands off to the pipeline
+# entrypoint.sh — starts three services in order, then watches over all of them
 #
 #  1. gst-webrtc-signalling-server  (background, WebSocket :SIGNALLING_PORT)
 #  2. python3 -m http.server        (background, HTTP :WEB_PORT, serves web/)
-#  3. pipeline.sh                   (foreground via exec, GStreamer capture loop)
+#  3. pipeline.sh                   (background, GStreamer capture loop)
+#
+# All three run as background jobs so a GStreamer pipeline crash does not kill
+# the HTTP or signalling servers.  The main process waits for all jobs and
+# handles SIGTERM/SIGINT cleanly.
 #
 # All env vars have defaults set in the Dockerfile ENV block.
 set -euo pipefail
@@ -42,9 +46,11 @@ gst-webrtc-signalling-server \
     --host "${SIGNALLING_HOST}" \
     --port "${SIGNALLING_PORT}" &
 SIGPID=$!
+PIPPID=""
 
-# Clean up background processes on exit/interrupt
-trap 'echo "[entrypoint] Shutting down..."; kill "${SIGPID}" 2>/dev/null; exit' \
+# Kill all tracked background processes on exit/interrupt.
+# PIPPID may be empty until the pipeline block runs, so guard the kill.
+trap 'echo "[entrypoint] Shutting down..."; kill "${SIGPID}" 2>/dev/null; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; exit' \
      EXIT INT TERM
 
 # Readiness probe — wait up to 2 s for the signalling server to accept connections
@@ -82,5 +88,13 @@ echo "│  Same host?  http://localhost:${WEB_PORT}           "
 echo "└─────────────────────────────────────────────────────┘"
 echo ""
 
-# ── GStreamer pipeline (replaces this shell; signals propagate cleanly) ───────
-exec /usr/local/bin/pipeline.sh
+# ── GStreamer pipeline ────────────────────────────────────────────────────────
+# Run as a background job rather than exec-ing so a pipeline crash does not
+# propagate to the HTTP server and signalling server (they are still useful
+# for diagnostics and for tests that don't need active streaming).
+/usr/local/bin/pipeline.sh &
+PIPPID=$!
+
+# Wait for all background jobs.  Returns when every job has exited, or when
+# the trap fires on SIGTERM/SIGINT and calls exit.
+wait
