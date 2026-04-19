@@ -90,8 +90,25 @@ RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
 
 # ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
 WORKDIR /src/net/webrtc/gstwebrtc-api
-RUN npm install && npm run build \
-    && echo "=== gstwebrtc-api dist ===" && ls -la dist/
+RUN npm install && npm run build && \
+    echo "=== all JS files produced (excluding node_modules) ===" && \
+    find /src/net/webrtc -name "*.js" -not -path "*/node_modules/*" | sort && \
+    BUNDLE=$(find /src/net/webrtc -name "gstwebrtc-api*.js" \
+                  -not -path "*/node_modules/*" \
+                  -not -name "*.min.js" 2>/dev/null | sort | head -1) && \
+    if [ -z "${BUNDLE}" ]; then \
+        BUNDLE=$(find /src/net/webrtc -name "*.js" \
+                      -not -path "*/node_modules/*" \
+                      -not -path "*/src/*" \
+                      -not -name "*.min.js" 2>/dev/null | sort | head -1); \
+    fi && \
+    if [ -n "${BUNDLE}" ]; then \
+        mkdir -p /opt/gstwebrtc-api && \
+        cp "${BUNDLE}" /opt/gstwebrtc-api/gstwebrtc-api.js && \
+        echo "Normalised: ${BUNDLE} -> /opt/gstwebrtc-api/gstwebrtc-api.js"; \
+    else \
+        echo "ERROR: no JS bundle found after npm run build" && exit 1; \
+    fi
 
 # ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
 # nvcodec provides NVIDIA hardware encoders (nvh264enc, nvh265enc) via NVENC
@@ -172,21 +189,9 @@ RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 COPY --from=builder /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
 RUN chmod +x /usr/local/bin/gst-webrtc-signalling-server
 
-# Copy the gstwebrtc-api browser-side JS library.
-COPY --from=builder /src/net/webrtc/gstwebrtc-api/dist/ /var/www/html/gstwebrtc-api/
-# Guarantee a stable import path for index.html regardless of what rollup names
-# the output file.  ls shows the build log exactly what was copied.  If the
-# build already produces gstwebrtc-api.js this is a no-op; otherwise a symlink
-# is created pointing at the first non-minified JS file found.
-RUN echo "=== gstwebrtc-api dist ===" && ls -la /var/www/html/gstwebrtc-api/ && \
-    cd /var/www/html/gstwebrtc-api && \
-    if [ ! -f gstwebrtc-api.js ]; then \
-        src=$(ls *.js 2>/dev/null | grep -v '\.min\.js$' | sort | head -1); \
-        [ -n "$src" ] \
-            && ln -sf "$src" gstwebrtc-api.js \
-            && echo "Linked $src -> gstwebrtc-api.js" \
-            || echo "WARNING: no .js file found in gstwebrtc-api dist"; \
-    fi
+# Copy the gstwebrtc-api browser-side JS library (normalised to a stable name
+# by step G in the builder regardless of rollup's output filename).
+COPY --from=builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 
 # Copy web page and startup scripts.
 COPY web/index.html  /var/www/html/index.html
