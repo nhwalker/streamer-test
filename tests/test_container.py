@@ -8,6 +8,7 @@ Level 2 (TestWebRTCStream): drives a headless Chrome browser to load the
   streaming page and confirms that a WebRTC video stream actually plays.
 """
 import asyncio
+import re
 
 import pytest
 import requests
@@ -38,12 +39,15 @@ class TestServiceAvailability:
     def test_gstwebrtc_api_js_served(self, streaming_container):
         """Confirms the JS bundle was copied from the builder stage."""
         http_port, _ = streaming_container
-        r = requests.get(
-            f"http://localhost:{http_port}/gstwebrtc-api/gstwebrtc-api.js",
-            timeout=10,
-        )
-        assert r.status_code == 200
-        assert len(r.content) > 0, "gstwebrtc-api.js must not be empty"
+        page = requests.get(f"http://localhost:{http_port}/", timeout=10)
+        # Derive the path from the actual import statement in index.html so
+        # the test is not brittle against build-output filename changes.
+        m = re.search(r"""from\s+['"]([^'"]*gstwebrtc-api[^'"]*\.js)['"]""", page.text)
+        assert m, "Could not find a gstwebrtc-api JS import in index.html"
+        js_path = m.group(1).lstrip("./")
+        r = requests.get(f"http://localhost:{http_port}/{js_path}", timeout=10)
+        assert r.status_code == 200, f"JS bundle at /{js_path} returned {r.status_code}"
+        assert len(r.content) > 0, "gstwebrtc-api JS bundle must not be empty"
 
     def test_websocket_accepts_connection(self, streaming_container):
         """
@@ -58,7 +62,9 @@ class TestServiceAvailability:
             uri = f"ws://localhost:{ws_port}"
             async with websockets.connect(uri, open_timeout=10) as ws:
                 await asyncio.sleep(0.2)
-                assert not ws.closed, "WebSocket closed immediately after connect"
+                # websockets 12 exposed `ws.closed`; 13+ replaced it with
+                # `ws.state` (an enum).  Use `state.name` which works in both.
+                assert ws.state.name == "OPEN", "WebSocket closed immediately after connect"
 
         asyncio.run(_connect())
 
@@ -74,8 +80,11 @@ class TestWebRTCStream:
         frames have arrived from the GStreamer pipeline and been decoded.
         Timeout is 30 s to accommodate ICE gathering and codec negotiation.
         """
-        http_port, _ = streaming_container
-        browser.get(f"http://localhost:{http_port}/")
+        http_port, ws_port = streaming_container
+        # index.html defaults signalingServerUrl to ws://<hostname>:8443, which
+        # is the container-internal port.  Pass the host-mapped port explicitly
+        # so headless Chrome (running on the host) can reach the server.
+        browser.get(f"http://localhost:{http_port}/?signalling=ws://localhost:{ws_port}")
 
         def video_is_playing(driver):
             t = driver.execute_script(
