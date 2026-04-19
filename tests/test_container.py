@@ -46,7 +46,15 @@ class TestServiceAvailability:
         assert m, "Could not find a gstwebrtc-api JS import in index.html"
         js_path = m.group(1).lstrip("./")
         r = requests.get(f"http://localhost:{http_port}/{js_path}", timeout=10)
-        assert r.status_code == 200, f"JS bundle at /{js_path} returned {r.status_code}"
+        if r.status_code != 200:
+            listing = requests.get(
+                f"http://localhost:{http_port}/gstwebrtc-api/", timeout=10
+            )
+            found = re.findall(r'href="([^"?#]+)"', listing.text)
+            pytest.fail(
+                f"JS bundle at /{js_path} returned {r.status_code}.\n"
+                f"Files in /gstwebrtc-api/: {found}"
+            )
         assert len(r.content) > 0, "gstwebrtc-api JS bundle must not be empty"
 
     def test_websocket_accepts_connection(self, streaming_container):

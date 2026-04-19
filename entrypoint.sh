@@ -72,6 +72,7 @@ echo "[entrypoint] Signalling server ready."
 # ── Web server ────────────────────────────────────────────────────────────────
 # Serves /var/www/html/ which contains index.html and gstwebrtc-api/.
 # Replace with nginx/CDN in production.
+echo "[entrypoint] gstwebrtc-api files: $(ls /var/www/html/gstwebrtc-api/ 2>/dev/null | tr '\n' ' ')"
 echo "[entrypoint] Starting web server on port ${WEB_PORT} ..."
 python3 -m http.server --directory /var/www/html "${WEB_PORT}" &
 

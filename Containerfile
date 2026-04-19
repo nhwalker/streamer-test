@@ -174,6 +174,19 @@ RUN chmod +x /usr/local/bin/gst-webrtc-signalling-server
 
 # Copy the gstwebrtc-api browser-side JS library.
 COPY --from=builder /src/net/webrtc/gstwebrtc-api/dist/ /var/www/html/gstwebrtc-api/
+# Guarantee a stable import path for index.html regardless of what rollup names
+# the output file.  ls shows the build log exactly what was copied.  If the
+# build already produces gstwebrtc-api.js this is a no-op; otherwise a symlink
+# is created pointing at the first non-minified JS file found.
+RUN echo "=== gstwebrtc-api dist ===" && ls -la /var/www/html/gstwebrtc-api/ && \
+    cd /var/www/html/gstwebrtc-api && \
+    if [ ! -f gstwebrtc-api.js ]; then \
+        src=$(ls *.js 2>/dev/null | grep -v '\.min\.js$' | sort | head -1); \
+        [ -n "$src" ] \
+            && ln -sf "$src" gstwebrtc-api.js \
+            && echo "Linked $src -> gstwebrtc-api.js" \
+            || echo "WARNING: no .js file found in gstwebrtc-api dist"; \
+    fi
 
 # Copy web page and startup scripts.
 COPY web/index.html  /var/www/html/index.html
