@@ -85,7 +85,8 @@ RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c \
 # Cargo reuses the already-compiled artifacts from step E.
 RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
     && install -m755 target/release/gst-webrtc-signalling-server \
-                     /opt/gst-webrtc-signalling-server
+                     /opt/gst-webrtc-signalling-server \
+    && rm -rf /src/target /root/.cargo/registry /root/.rustup
 
 # ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
 WORKDIR /src/net/webrtc/gstwebrtc-api
