@@ -84,13 +84,18 @@ def streaming_container(xvfb_display):
     )
 
     with container:
+        # Read port bindings first, while the container is freshly running.
+        # testcontainers 4.8+ makes get_exposed_port() call wait_until_ready()
+        # internally, which raises TimeoutError if the container has already
+        # exited.  Docker assigns host port mappings at creation time, so we
+        # can safely read them before the services are ready.
+        http_port = int(container.get_exposed_port(8080))
+        ws_port = int(container.get_exposed_port(8443))
+
         # The web server log line is the last thing entrypoint.sh prints
         # before handing off to pipeline.sh, so it confirms both the
         # signalling server and HTTP server are up.
         wait_for_logs(container, "web server on port", timeout=60)
-
-        http_port = int(container.get_exposed_port(8080))
-        ws_port = int(container.get_exposed_port(8443))
 
         # Secondary HTTP poll closes the window between the log line
         # appearing and Python's http.server actually calling listen().
@@ -104,7 +109,11 @@ def streaming_container(xvfb_display):
                 pass
             time.sleep(0.25)
         else:
-            raise RuntimeError("HTTP server did not become reachable within 10 s")
+            stdout, stderr = container.get_logs()
+            raise RuntimeError(
+                f"HTTP server on :{http_port} did not respond within 10 s.\n"
+                f"Container stdout:\n{stdout.decode()}"
+            )
 
         yield http_port, ws_port
 
