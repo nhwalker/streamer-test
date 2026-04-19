@@ -34,22 +34,23 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
 
-      - name: Build image with Buildah
+      - name: Build image with Podman
         id: build-image
-        uses: redhat-actions/buildah-build@v2
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: ${{ steps.meta.outputs.tags }}
-          containerfiles: Containerfile
-          context: .
-          labels: ${{ steps.meta.outputs.labels }}
+        run: |
+          PRIMARY_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          TAGS_ARGS=""
+          while IFS= read -r tag; do
+            TAGS_ARGS="$TAGS_ARGS -t $tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          podman build $TAGS_ARGS \
+            --label "${{ steps.meta.outputs.labels }}" \
+            -f Containerfile .
+          echo "image=$PRIMARY_TAG" >> $GITHUB_OUTPUT
 
       - name: Push to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: redhat-actions/push-to-registry@v2
-        with:
-          image: ${{ steps.build-image.outputs.image }}
-          tags: ${{ steps.build-image.outputs.tags }}
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          while IFS= read -r tag; do
+            podman push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
