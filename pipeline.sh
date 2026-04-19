@@ -76,9 +76,6 @@ echo "  Signalling : ws://127.0.0.1:${SIGNALLING_PORT}"
 # webrtcsink properties:
 #   signaller::uri   points at the standalone signalling server started by entrypoint.sh
 #   video-caps       constrains codec selection during SDP negotiation
-#   target-bitrate   initial / fixed bitrate (bits/s) when congestion-control=disabled
-#   congestion-control=disabled  use a fixed bitrate rather than GCC adaptive control;
-#                                remove this line to re-enable adaptive bitrate
 exec gst-launch-1.0 -e \
     ximagesrc display-name="${DISPLAY}" use-damage=false \
     ! videorate \
@@ -89,6 +86,4 @@ exec gst-launch-1.0 -e \
     ! webrtcsink name=ws \
         "signaller::uri=ws://127.0.0.1:${SIGNALLING_PORT}" \
         "video-caps=${VIDEO_CAPS}" \
-        "target-bitrate=${BITRATE}" \
-        congestion-control=disabled \
         ${STUN_PROP}

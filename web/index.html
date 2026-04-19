@@ -78,7 +78,7 @@
       iceServers,
     });
 
-    api.registerConsumerListener({
+    api.registerProducersListener({
       producerAdded(producer) {
         setStatus(`Producer found (${producer.id}) — starting stream…`);
 
