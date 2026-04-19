@@ -89,25 +89,43 @@ RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
     && rm -rf /src/target /root/.cargo/registry /root/.rustup
 
 # ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
+# The rollup config may emit a code-split bundle (multiple .js files) or a
+# single self-contained file depending on the version.  Copy the entire output
+# directory so companion chunks are always available alongside the entry point.
 WORKDIR /src/net/webrtc/gstwebrtc-api
 RUN npm install && npm run build && \
-    echo "=== all JS files produced (excluding node_modules) ===" && \
-    find /src/net/webrtc -name "*.js" -not -path "*/node_modules/*" | sort && \
-    BUNDLE=$(find /src/net/webrtc -name "gstwebrtc-api*.js" \
-                  -not -path "*/node_modules/*" \
-                  -not -name "*.min.js" 2>/dev/null | sort | head -1) && \
-    if [ -z "${BUNDLE}" ]; then \
-        BUNDLE=$(find /src/net/webrtc -name "*.js" \
-                      -not -path "*/node_modules/*" \
-                      -not -path "*/src/*" \
-                      -not -name "*.min.js" 2>/dev/null | sort | head -1); \
+    echo "=== all non-node_modules files after npm run build ===" && \
+    find /src/net/webrtc -not -path "*/node_modules/*" -type f | sort && \
+    OUTPUT_DIR="" && \
+    for candidate in dist build output out; do \
+        if [ -d "/src/net/webrtc/gstwebrtc-api/${candidate}" ]; then \
+            OUTPUT_DIR="/src/net/webrtc/gstwebrtc-api/${candidate}"; \
+            break; \
+        fi; \
+    done && \
+    if [ -z "${OUTPUT_DIR}" ]; then \
+        echo "ERROR: could not find dist/, build/, output/, or out/ directory" && exit 1; \
     fi && \
-    if [ -n "${BUNDLE}" ]; then \
-        mkdir -p /opt/gstwebrtc-api && \
-        cp "${BUNDLE}" /opt/gstwebrtc-api/gstwebrtc-api.js && \
-        echo "Normalised: ${BUNDLE} -> /opt/gstwebrtc-api/gstwebrtc-api.js"; \
+    echo "=== output directory: ${OUTPUT_DIR} ===" && \
+    ls -la "${OUTPUT_DIR}" && \
+    mkdir -p /opt/gstwebrtc-api && \
+    cp -r "${OUTPUT_DIR}/." /opt/gstwebrtc-api/ && \
+    echo "=== files in /opt/gstwebrtc-api ===" && \
+    ls -la /opt/gstwebrtc-api && \
+    ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "gstwebrtc-api*.js" \
+                 -not -name "*.min.js" 2>/dev/null | sort | head -1) && \
+    if [ -z "${ENTRY}" ]; then \
+        ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "*.js" \
+                     -not -name "*.min.js" 2>/dev/null | sort | head -1); \
+    fi && \
+    if [ -z "${ENTRY}" ]; then \
+        echo "ERROR: no JS entry point found in ${OUTPUT_DIR}" && exit 1; \
+    fi && \
+    if [ "$(basename "${ENTRY}")" != "gstwebrtc-api.js" ]; then \
+        ln -s "$(basename "${ENTRY}")" /opt/gstwebrtc-api/gstwebrtc-api.js && \
+        echo "Symlinked: $(basename "${ENTRY}") -> gstwebrtc-api.js"; \
     else \
-        echo "ERROR: no JS bundle found after npm run build" && exit 1; \
+        echo "Entry point: ${ENTRY}"; \
     fi
 
 # ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
