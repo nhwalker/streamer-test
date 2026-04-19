@@ -151,10 +151,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libnice10 \
         libdav1d7 \
         libsodium23 \
-        libzvbi0 \
+        libzvbi0t64 \
         libwebp7 \
         libgtk-4-1 \
-        libcsound64-0 \
+        libcsound64-6.0 \
         # Application runtime
         python3 \
         netcat-openbsd \
