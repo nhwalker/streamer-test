@@ -1,5 +1,6 @@
 # ─── Build Stage ─────────────────────────────────────────────────────────────
 FROM ubuntu:24.04 AS builder
+SHELL ["/bin/bash", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
 
