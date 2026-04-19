@@ -98,7 +98,7 @@ jobs:
 
       - name: Load image into Docker
         run: |
-          IMAGE=$(docker load -i /tmp/streamer-test.tar | grep "Loaded image:" | awk '{print $NF}')
+          IMAGE=$(docker load -i /tmp/streamer-test.tar | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${IMAGE}" streamer-test:ci
 
       - name: Run integration tests
