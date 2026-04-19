@@ -90,7 +90,7 @@ RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
 
 # ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
 WORKDIR /src/net/webrtc/gstwebrtc-api
-RUN npm ci && npm run build \
+RUN npm install && npm run build \
     && echo "=== gstwebrtc-api dist ===" && ls -la dist/
 
 # ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
