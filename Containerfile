@@ -61,17 +61,8 @@ RUN cargo fetch
 # printing SKIP for any that fail (e.g. gst-plugin-skia, which requires a
 # pre-built Skia library not available in Ubuntu 24.04 apt).
 # --jobs 2 prevents OOM on build agents with < 8 GB RAM.
-RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-pkgs = []
-for p in data['packages']:
-    for t in p['targets']:
-        if 'cdylib' in t.get('crate_types', []):
-            pkgs.append(p['name'])
-            break
-print(' '.join(pkgs))
-") \
+RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c \
+    'import sys,json;d=json.load(sys.stdin);print(" ".join(p["name"] for p in d["packages"] if any("cdylib" in t.get("crate_types",[]) for t in p["targets"])))') \
     && echo "=== Rust plugin packages to build ===" \
     && echo "$PKGS" | tr ' ' '\n' \
     && INSTALLED=0; FAILED=0 \
@@ -94,11 +85,12 @@ print(' '.join(pkgs))
 # Cargo reuses the already-compiled artifacts from step E.
 RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
     && install -m755 target/release/gst-webrtc-signalling-server \
-                     /opt/gst-webrtc-signalling-server
+                     /opt/gst-webrtc-signalling-server \
+    && rm -rf /src/target /root/.cargo/registry /root/.rustup
 
 # ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
 WORKDIR /src/net/webrtc/gstwebrtc-api
-RUN npm ci && npm run build \
+RUN npm install && npm run build \
     && echo "=== gstwebrtc-api dist ===" && ls -la dist/
 
 # ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
@@ -159,10 +151,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libnice10 \
         libdav1d7 \
         libsodium23 \
-        libzvbi0 \
+        libzvbi0t64 \
         libwebp7 \
         libgtk-4-1 \
-        libcsound64-0 \
+        libcsound64-6.0 \
         # Application runtime
         python3 \
         netcat-openbsd \
