@@ -1,6 +1,5 @@
 # ─── Build Stage ─────────────────────────────────────────────────────────────
 FROM ubuntu:24.04 AS builder
-SHELL ["/bin/bash", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -62,17 +61,8 @@ RUN cargo fetch
 # printing SKIP for any that fail (e.g. gst-plugin-skia, which requires a
 # pre-built Skia library not available in Ubuntu 24.04 apt).
 # --jobs 2 prevents OOM on build agents with < 8 GB RAM.
-RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-pkgs = []
-for p in data['packages']:
-    for t in p['targets']:
-        if 'cdylib' in t.get('crate_types', []):
-            pkgs.append(p['name'])
-            break
-print(' '.join(pkgs))
-") \
+RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c \
+    'import sys,json;d=json.load(sys.stdin);print(" ".join(p["name"] for p in d["packages"] if any("cdylib" in t.get("crate_types",[]) for t in p["targets"])))') \
     && echo "=== Rust plugin packages to build ===" \
     && echo "$PKGS" | tr ' ' '\n' \
     && INSTALLED=0; FAILED=0 \
