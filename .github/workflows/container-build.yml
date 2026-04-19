@@ -34,37 +34,26 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
 
+      - name: Patch Containerfile to use bash for RUN commands
+        run: |
+          sed -i '/^FROM ubuntu:24.04 AS builder$/a SHELL ["/bin/bash", "-c"]' Containerfile
+
       - name: Build image with Buildah
         id: build-image
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-          LABELS: ${{ steps.meta.outputs.labels }}
-        run: |
-          TAGS_ARGS=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && TAGS_ARGS+=(-t "$tag")
-          done <<< "$TAGS"
-
-          LABEL_ARGS=()
-          while IFS= read -r label; do
-            [ -n "$label" ] && LABEL_ARGS+=(--label "$label")
-          done <<< "$LABELS"
-
-          buildah bud --shell '/bin/bash -c' \
-            "${TAGS_ARGS[@]}" \
-            "${LABEL_ARGS[@]}" \
-            -f Containerfile .
-
-          echo "image=$(echo "$TAGS" | head -n1)" >> "$GITHUB_OUTPUT"
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: ${{ steps.meta.outputs.tags }}
+          containerfiles: Containerfile
+          context: .
+          labels: ${{ steps.meta.outputs.labels }}
 
       - name: Push to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          echo "$GITHUB_TOKEN" | buildah login "${{ env.REGISTRY }}" \
-            -u "${{ github.actor }}" --password-stdin
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && buildah push "$tag"
-          done <<< "$TAGS"
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build-image.outputs.image }}
+          tags: ${{ steps.build-image.outputs.tags }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
