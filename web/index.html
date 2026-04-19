@@ -44,26 +44,18 @@
   <p id="status">Connecting to signalling server…</p>
   <video id="stream" autoplay playsinline></video>
 
-  <script type="module">
-    /**
-     * Desktop stream viewer
-     *
-     * Query parameters:
-     *   ?signalling=ws://host:8443   Override the signalling server URL.
-     *                                Defaults to ws://<this page's hostname>:8443
-     *   ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
-     *                                  browser and container are on different hosts.
-     *
-     * NOTE: The import path below references the gstwebrtc-api JS bundle built
-     * from gst-plugins-rs and served alongside this page.  If the filename in
-     * /var/www/html/gstwebrtc-api/ is different from gstwebrtc-api.js (check
-     * `ls` in the container after first build), update the import path.
-     *
-     * Production: replace the Python HTTP server with nginx/CDN and adjust the
-     * signalling URL via the ?signalling= query parameter.
-     */
-    import GstWebRTCAPI from './gstwebrtc-api/gstwebrtc-api.js';
+  <!--
+    The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
+    so it must be loaded as a classic script before the inline script runs.
 
+    Query parameters:
+      ?signalling=ws://host:8443   Override the signalling server URL.
+                                   Defaults to ws://<this page's hostname>:8443
+      ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
+                                     browser and container are on different hosts.
+  -->
+  <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
+  <script>
     const params  = new URLSearchParams(window.location.search);
     const sigUrl  = params.get('signalling') ??
                     `ws://${window.location.hostname}:8443`;
@@ -79,10 +71,6 @@
 
     setStatus(`Connecting to ${sigUrl} …`);
 
-    // iceServers: empty means rely on direct host-network ICE candidates
-    // (works fine with --network=host or same-machine access).
-    // Set GST_WEBRTC_STUN_SERVER on the container side AND pass ?stun= on the
-    // browser side when crossing network boundaries.
     const iceServers = stunUrl ? [{ urls: `stun:${stunUrl}` }] : [];
 
     const api = new GstWebRTCAPI({

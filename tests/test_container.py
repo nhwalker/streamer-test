@@ -42,8 +42,8 @@ class TestServiceAvailability:
         page = requests.get(f"http://localhost:{http_port}/", timeout=10)
         # Derive the path from the actual import statement in index.html so
         # the test is not brittle against build-output filename changes.
-        m = re.search(r"""from\s+['"]([^'"]*gstwebrtc-api[^'"]*\.js)['"]""", page.text)
-        assert m, "Could not find a gstwebrtc-api JS import in index.html"
+        m = re.search(r"""(?:from|src=)\s*['"]([^'"]*gstwebrtc-api[^'"]*\.js)['"]""", page.text)
+        assert m, "Could not find a gstwebrtc-api JS src/import in index.html"
         js_path = m.group(1).lstrip("./")
         r = requests.get(f"http://localhost:{http_port}/{js_path}", timeout=10)
         if r.status_code != 200:
