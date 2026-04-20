@@ -127,7 +127,16 @@ jobs:
       - name: Run integration tests
         env:
           TEST_IMAGE: streamer-test:ci
+          # GStreamer side: pipeline.py passes this to webrtcbin via add-turn-server
+          GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
+          # Browser side: index.html reads these from URL params
           WEBRTC_TURN_SERVER: "turn:127.0.0.1:3478"
           WEBRTC_TURN_USER: "ci"
           WEBRTC_TURN_CRED: "ci"
         run: pytest tests/ -v --tb=short
+
+      - name: Show TURN server log
+        if: always()
+        run: |
+          echo "=== coturn log ==="
+          cat /tmp/turnserver.log 2>/dev/null || echo "(no log file)"

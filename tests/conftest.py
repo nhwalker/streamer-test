@@ -39,12 +39,13 @@ XVFB_GEOMETRY = "1280x720x24"
 HTTP_PORT = 8080
 WS_PORT = 8443
 
-# Optional browser-side TURN config (set in CI to work around Azure hairpin UDP).
-# webrtcsink 0.13.x has no turn-server property, so TURN is Chrome-side only:
-# Chrome allocates a relay at 127.0.0.1:PORT; GStreamer (host network) can reach it.
+# Optional TURN config for both sides (set in CI to bypass Azure hairpin UDP).
+# GStreamer uses it via webrtcbin-ready in pipeline.py (format: turn://u:p@h:p).
+# Chrome uses it via ?turn_uri URL param (format: turn:h:p with separate u/p).
+GST_TURN_SERVER    = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_SERVER = os.environ.get("WEBRTC_TURN_SERVER", "")
-WEBRTC_TURN_USER = os.environ.get("WEBRTC_TURN_USER", "")
-WEBRTC_TURN_CRED = os.environ.get("WEBRTC_TURN_CRED", "")
+WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
+WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
 @pytest.fixture(scope="session")
@@ -97,12 +98,12 @@ def _container(xvfb_display):
     container = (
         DockerContainer(TEST_IMAGE)
         .with_env("DISPLAY", xvfb_display)
-        # Match Xvfb geometry to avoid unnecessary scaling overhead.
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")
+        # pipeline.py reads this and calls add-turn-server on each webrtcbin.
+        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
-        # Host networking: container shares the host network namespace so
-        # GStreamer can reach Chrome's loopback TURN relay at 127.0.0.1.
+        # Host networking so GStreamer can reach coturn on 127.0.0.1.
         .with_kwargs(network_mode="host")
     )
     with container:

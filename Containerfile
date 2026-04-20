@@ -193,6 +193,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # Application runtime
         python3 \
         netcat-openbsd \
+        # Python GStreamer bindings — used by pipeline.py for TURN configuration
+        python3-gst-1.0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy all compiled GStreamer Rust plugins into the local plugin directory.
@@ -215,7 +217,8 @@ COPY --from=builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 COPY web/index.html  /var/www/html/index.html
 COPY entrypoint.sh   /usr/local/bin/entrypoint.sh
 COPY pipeline.sh     /usr/local/bin/pipeline.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.sh
+COPY pipeline.py     /usr/local/bin/pipeline.py
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.sh /usr/local/bin/pipeline.py
 
 # ── Environment defaults (all overridable at runtime via -e) ──────────────────
 # GST_PLUGIN_PATH          : where GStreamer finds the Rust + nvcodec plugins
@@ -235,6 +238,7 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     SIGNALLING_PORT=8443 \
     WEB_PORT=8080 \
     GST_WEBRTC_STUN_SERVER="" \
+    GST_WEBRTC_TURN_SERVER="" \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=video,compute
 
