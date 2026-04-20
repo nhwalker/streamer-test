@@ -58,6 +58,67 @@ WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 # redraw keeps the pixels live.
 
 
+def _assert_xvfb_is_red(display, xvfb_proc, red_window_proc):
+    """
+    Confirm the Xvfb root window's center pixel is red before yielding
+    control to the container.  Uses xwd (x11-utils) to dump the framebuffer
+    and ImageMagick's "convert" to read the sample pixel, because both are
+    already available in CI and neither depends on a Python X11 binding.
+
+    Raises RuntimeError with the observed color on mismatch so the failure
+    surfaces at fixture-setup time (clearly a host painting problem) rather
+    than inside the browser-driven WebRTC test (which is ambiguous).
+    """
+    width, height = (int(x) for x in XVFB_GEOMETRY.split("x")[:2])
+    cx, cy = width // 2, height // 2
+
+    try:
+        xwd = subprocess.run(
+            ["xwd", "-display", display, "-root", "-silent"],
+            check=True, timeout=5,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
+        _cleanup_procs(red_window_proc, xvfb_proc)
+        raise RuntimeError(
+            f"xwd failed on {display}: {exc}. "
+            "Install x11-utils on the test host."
+        ) from exc
+
+    try:
+        pixel = subprocess.run(
+            ["convert", "xwd:-", "-format", f"%[pixel:p{{{cx},{cy}}}]", "info:"],
+            check=True, timeout=5, input=xwd.stdout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
+        _cleanup_procs(red_window_proc, xvfb_proc)
+        raise RuntimeError(
+            f"ImageMagick 'convert' failed reading xwd output: {exc}. "
+            "Install imagemagick on the test host."
+        ) from exc
+
+    sample = pixel.stdout.decode(errors="replace").strip()
+    # "convert" emits e.g. "srgb(255,0,0)" or "red" depending on version.
+    if "255,0,0" not in sample and sample.lower() not in {"red", "#ff0000"}:
+        _cleanup_procs(red_window_proc, xvfb_proc)
+        raise RuntimeError(
+            f"Xvfb framebuffer is not red at ({cx},{cy}); got {sample!r}. "
+            "The red-window helper is not painting the display — "
+            "the WebRTC test would fail with an all-black stream."
+        )
+
+
+def _cleanup_procs(*procs):
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
 @pytest.fixture(scope="session")
 def xvfb_display():
     """
@@ -117,6 +178,13 @@ def xvfb_display():
             f"stderr: {stderr.decode(errors='replace')!r}. "
             "Install x11-apps on the test host."
         )
+
+    # Host-side verification: dump the Xvfb framebuffer with xwd and parse a
+    # sample pixel with ImageMagick's "convert".  This isolates painting
+    # failures on the test host from capture/encode failures in the
+    # container — a useful split because the two surface identically at the
+    # browser end (all-black frame).
+    _assert_xvfb_is_red(XVFB_DISPLAY, proc, red_window)
 
     yield XVFB_DISPLAY
 

@@ -80,6 +80,7 @@ jobs:
             google-chrome-stable \
             x11-utils \
             x11-apps \
+            imagemagick \
             coturn
 
       - name: Set up Python
