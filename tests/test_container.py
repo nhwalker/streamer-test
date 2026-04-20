@@ -188,36 +188,77 @@ class TestWebRTCStream:
         # the red Xvfb root, not a black/empty placeholder.  Chroma subsampling
         # and YUV<->RGB rounding in the codec shift pure red a few units, so
         # thresholds allow ~20 % slack rather than requiring exactly (255,0,0).
-        pixel_stats = WebDriverWait(browser, timeout=10, poll_frequency=0.5).until(
-            lambda d: d.execute_script("""
-                const v = document.querySelector('video');
-                if (!v || !v.videoWidth || !v.videoHeight) return null;
-                const c = document.createElement('canvas');
-                c.width = v.videoWidth;
-                c.height = v.videoHeight;
-                const ctx = c.getContext('2d');
+        #
+        # Poll with a wait loop because video.currentTime can advance on the
+        # first RTP packet before readyState reaches HAVE_CURRENT_DATA (2),
+        # and drawImage() on a video without a current frame leaves the canvas
+        # at its initial transparent-black state (returning avg RGB = 0,0,0
+        # with no exception).  The loop waits for readyState >= 2 and for the
+        # drawn canvas to contain non-zero pixels.
+        capture_script = """
+            const v = document.querySelector('video');
+            if (!v || !v.videoWidth || !v.videoHeight) {
+                return {stage: 'no-video-size',
+                        readyState: v ? v.readyState : -1};
+            }
+            if (v.readyState < 2) {
+                return {stage: 'not-ready',
+                        readyState: v.readyState,
+                        currentTime: v.currentTime};
+            }
+            const c = document.createElement('canvas');
+            c.width = v.videoWidth;
+            c.height = v.videoHeight;
+            const ctx = c.getContext('2d');
+            try {
                 ctx.drawImage(v, 0, 0, c.width, c.height);
-                const data = ctx.getImageData(0, 0, c.width, c.height).data;
-                let r = 0, g = 0, b = 0;
-                const n = data.length / 4;
-                for (let i = 0; i < data.length; i += 4) {
-                    r += data[i]; g += data[i + 1]; b += data[i + 2];
-                }
-                return {
-                    width: c.width, height: c.height,
-                    avgR: r / n, avgG: g / n, avgB: b / n,
-                };
-            """)
-        )
-        assert (
-            pixel_stats["avgR"] > 200
-            and pixel_stats["avgG"] < 60
-            and pixel_stats["avgB"] < 60
-        ), (
-            "Decoded WebRTC frame is not red.  Expected R>200, G<60, B<60 "
-            "from the red Xvfb root, but got "
-            f"R={pixel_stats['avgR']:.1f} "
-            f"G={pixel_stats['avgG']:.1f} "
-            f"B={pixel_stats['avgB']:.1f} "
-            f"({pixel_stats['width']}x{pixel_stats['height']})."
-        )
+            } catch (e) {
+                return {stage: 'drawImage-error', error: String(e),
+                        readyState: v.readyState};
+            }
+            let data;
+            try {
+                data = ctx.getImageData(0, 0, c.width, c.height).data;
+            } catch (e) {
+                return {stage: 'getImageData-error', error: String(e)};
+            }
+            let r = 0, g = 0, b = 0;
+            const n = data.length / 4;
+            for (let i = 0; i < data.length; i += 4) {
+                r += data[i]; g += data[i + 1]; b += data[i + 2];
+            }
+            return {
+                stage: 'ok',
+                width: c.width, height: c.height,
+                avgR: r / n, avgG: g / n, avgB: b / n,
+                readyState: v.readyState,
+                currentTime: v.currentTime,
+            };
+        """
+
+        def frame_is_red(stats):
+            return (
+                stats is not None
+                and stats.get("stage") == "ok"
+                and stats.get("avgR", 0) > 200
+                and stats.get("avgG", 255) < 60
+                and stats.get("avgB", 255) < 60
+            )
+
+        last_stats = {}
+
+        def red_frame_available(driver):
+            stats = driver.execute_script(capture_script)
+            last_stats.clear()
+            last_stats.update(stats or {})
+            return stats if frame_is_red(stats) else False
+
+        try:
+            WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(
+                red_frame_available
+            )
+        except Exception:
+            pytest.fail(
+                "Decoded WebRTC frame is not red.  Expected R>200, G<60, B<60 "
+                f"from the red Xvfb root. Last sample: {last_stats}"
+            )

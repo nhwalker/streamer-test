@@ -78,9 +78,12 @@ def xvfb_display():
         proc.terminate()
         raise RuntimeError(f"Xvfb socket {socket_path} did not appear within 5 s")
 
+    # Paint the root red.  Use an explicit hex triplet rather than the
+    # "red" color name so the result is independent of whether an X11
+    # rgb.txt color database is installed on the test host.
     try:
         subprocess.run(
-            ["xsetroot", "-display", XVFB_DISPLAY, "-solid", "red"],
+            ["xsetroot", "-display", XVFB_DISPLAY, "-solid", "#ff0000"],
             check=True,
             timeout=5,
             stdout=subprocess.PIPE,
