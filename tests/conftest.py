@@ -48,25 +48,14 @@ WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
-# A borderless full-screen red window painted on the Xvfb display, used as a
-# known-color capture target.  Tkinter ships with CPython and creates a real
-# X11 window that actively renders pixels into the framebuffer — unlike
-# "xsetroot -solid", which only sets the root background pixmap and (on a
-# headless Xvfb without a WM or any other clients) may never actually commit
-# those pixels to the framebuffer that ximagesrc reads.
-_RED_WINDOW_SCRIPT = """
-import os, sys, tkinter as tk
-os.environ['DISPLAY'] = sys.argv[1]
-geom = sys.argv[2]
-root = tk.Tk()
-root.overrideredirect(True)
-root.geometry(geom)
-root.configure(bg='#ff0000')
-frame = tk.Frame(root, bg='#ff0000')
-frame.pack(fill='both', expand=True)
-root.update()
-root.mainloop()
-"""
+# xlogo from x11-apps is a tiny long-running X11 client that actively redraws
+# itself on every Expose event.  Using -bg and -fg both set to the same hex
+# red paints the entire window red (the logo glyph is invisible against a
+# same-colored background).  We use xlogo rather than "xsetroot -solid" or a
+# Tk window because Xvfb does not enable backing store by default — any
+# client that paints once and then sits idle has its pixels fall out of the
+# framebuffer, leaving ximagesrc to capture black.  xlogo's continuous
+# redraw keeps the pixels live.
 
 
 @pytest.fixture(scope="session")
@@ -78,11 +67,11 @@ def xvfb_display():
     entrypoint X11 pre-flight check (ximagesrc num-buffers=1) cannot
     race ahead of Xvfb being ready.
 
-    Also launches a borderless full-screen Tkinter window painted
-    #ff0000 on the display, so pixels captured by the container's
-    ximagesrc are a known color.  The WebRTC test then asserts the
-    decoded frame is red, which distinguishes "stream is live" from
-    "stream carries actual display content".
+    Also launches a borderless full-screen xlogo painted #ff0000 on
+    the display, so pixels captured by the container's ximagesrc are a
+    known color.  The WebRTC test then asserts the decoded frame is red,
+    which distinguishes "stream is live" from "stream carries actual
+    display content".
     """
     proc = subprocess.Popen(
         ["Xvfb", XVFB_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
@@ -100,26 +89,33 @@ def xvfb_display():
         proc.terminate()
         raise RuntimeError(f"Xvfb socket {socket_path} did not appear within 5 s")
 
-    # XVFB_GEOMETRY is "WxHxD" — strip the depth to get "WxH" for Tk geometry.
+    # XVFB_GEOMETRY is "WxHxD" — strip the depth for the xlogo -geometry arg.
     width_height = "x".join(XVFB_GEOMETRY.split("x")[:2]) + "+0+0"
     red_window = subprocess.Popen(
-        ["python3", "-c", _RED_WINDOW_SCRIPT, XVFB_DISPLAY, width_height],
+        [
+            "xlogo",
+            "-display", XVFB_DISPLAY,
+            "-geometry", width_height,
+            "-bg", "#ff0000",
+            "-fg", "#ff0000",
+            "-bw", "0",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 
-    # Give Tk a moment to map the window and render its first frame before
-    # the container starts probing ximagesrc.  If Tk crashed (e.g. python3-tk
-    # missing), surface the stderr immediately rather than letting the WebRTC
-    # test fail far downstream with an opaque "frame is not red" message.
+    # Give xlogo a moment to map and paint before the container starts
+    # probing ximagesrc.  If xlogo failed to launch (e.g. x11-apps missing),
+    # surface the stderr immediately rather than letting the WebRTC test
+    # fail far downstream with an opaque "frame is not red" message.
     time.sleep(1.0)
     if red_window.poll() is not None:
         _, stderr = red_window.communicate(timeout=2)
         proc.terminate()
         raise RuntimeError(
-            f"Red window helper exited early (rc={red_window.returncode}). "
+            f"xlogo red-window helper exited early (rc={red_window.returncode}). "
             f"stderr: {stderr.decode(errors='replace')!r}. "
-            "Install python3-tk on the test host."
+            "Install x11-apps on the test host."
         )
 
     yield XVFB_DISPLAY
