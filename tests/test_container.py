@@ -80,19 +80,24 @@ class TestServiceAvailability:
 class TestWebRTCStream:
     """Browser-driven test that verifies live video playback over WebRTC."""
 
-    def test_webrtc_video_plays(self, streaming_container, _container, browser):
+    def test_webrtc_video_plays(self, streaming_container, _container, browser, turn_params):
         """
         Headless Chrome loads the streaming page and receives a WebRTC stream.
 
         video.currentTime > 0 proves the decoder is advancing — encoded
         frames have arrived from the GStreamer pipeline and been decoded.
-        Timeout is 30 s to accommodate ICE gathering and codec negotiation.
+        Timeout is 60 s to accommodate ICE gathering and codec negotiation.
+
+        turn_params adds TURN relay candidates when WEBRTC_TURN_SERVER is set
+        (required in CI on Azure VMs where same-IP UDP hairpin is blocked).
         """
         http_port, ws_port = streaming_container
-        # index.html defaults signalingServerUrl to ws://<hostname>:8443, which
-        # is the container-internal port.  Pass the host-mapped port explicitly
-        # so headless Chrome (running on the host) can reach the server.
-        browser.get(f"http://localhost:{http_port}/?signalling=ws://localhost:{ws_port}")
+        # Pass the host-mapped signalling port and, in CI, a loopback TURN relay
+        # so ICE relay candidates bypass Azure's same-IP UDP hairpin restriction.
+        browser.get(
+            f"http://localhost:{http_port}/"
+            f"?signalling=ws://localhost:{ws_port}{turn_params}"
+        )
 
         def video_is_playing(driver):
             t = driver.execute_script(

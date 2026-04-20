@@ -78,7 +78,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             xvfb \
             google-chrome-stable \
-            x11-utils
+            x11-utils \
+            coturn
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -101,7 +102,33 @@ jobs:
           IMAGE=$(docker load -i /tmp/streamer-test.tar | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${IMAGE}" streamer-test:ci
 
+      - name: Start local TURN relay
+        run: |
+          # Start coturn on loopback so WebRTC ICE relay candidates are 127.0.0.1
+          # (Azure VMs block same-IP UDP hairpin on the external interface).
+          turnserver \
+            --listening-port=3478 \
+            --listening-ip=127.0.0.1 \
+            --relay-ip=127.0.0.1 \
+            --lt-cred-mech \
+            --user=ci:ci \
+            --realm=test.local \
+            --no-tls \
+            --no-dtls \
+            --allow-loopback-peers \
+            --log-file=/tmp/turnserver.log &
+          for i in $(seq 1 20); do
+            if ss -ulnp 2>/dev/null | grep -q ':3478 '; then
+              echo "TURN server ready on UDP 3478"; break
+            fi
+            sleep 0.5
+          done
+
       - name: Run integration tests
         env:
           TEST_IMAGE: streamer-test:ci
+          GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
+          WEBRTC_TURN_SERVER: "turn:127.0.0.1:3478"
+          WEBRTC_TURN_USER: "ci"
+          WEBRTC_TURN_CRED: "ci"
         run: pytest tests/ -v --tb=short

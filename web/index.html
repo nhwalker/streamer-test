@@ -56,10 +56,13 @@
   -->
   <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
   <script>
-    const params  = new URLSearchParams(window.location.search);
-    const sigUrl  = params.get('signalling') ??
-                    `ws://${window.location.hostname}:8443`;
-    const stunUrl = params.get('stun');
+    const params   = new URLSearchParams(window.location.search);
+    const sigUrl   = params.get('signalling') ??
+                     `ws://${window.location.hostname}:8443`;
+    const stunUrl  = params.get('stun');
+    const turnUri  = params.get('turn_uri');
+    const turnUser = params.get('turn_user');
+    const turnCred = params.get('turn_cred');
 
     const video  = document.getElementById('stream');
     const status = document.getElementById('status');
@@ -71,7 +74,9 @@
 
     setStatus(`Connecting to ${sigUrl} …`);
 
-    const iceServers = stunUrl ? [{ urls: `stun:${stunUrl}` }] : [];
+    const iceServers = [];
+    if (stunUrl) iceServers.push({ urls: `stun:${stunUrl}` });
+    if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
 
     const api = new GstWebRTCAPI({
       signalingServerUrl: sigUrl,

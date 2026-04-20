@@ -39,6 +39,12 @@ XVFB_GEOMETRY = "1280x720x24"
 HTTP_PORT = 8080
 WS_PORT = 8443
 
+# Optional TURN server config (set in CI to work around Azure hairpin UDP issues).
+GST_TURN_SERVER = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
+WEBRTC_TURN_SERVER = os.environ.get("WEBRTC_TURN_SERVER", "")
+WEBRTC_TURN_USER = os.environ.get("WEBRTC_TURN_USER", "")
+WEBRTC_TURN_CRED = os.environ.get("WEBRTC_TURN_CRED", "")
+
 
 @pytest.fixture(scope="session")
 def xvfb_display():
@@ -93,9 +99,12 @@ def _container(xvfb_display):
         # Match Xvfb geometry to avoid unnecessary scaling overhead.
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")
+        # Pass TURN server so GStreamer webrtcsink generates relay candidates on
+        # 127.0.0.1 — required on Azure VMs where same-IP UDP hairpin is blocked.
+        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         # Host networking: container shares the host network namespace so
-        # WebRTC ICE candidates are 127.0.0.1 on both sides.
+        # both GStreamer and Chrome can reach the loopback TURN relay.
         .with_kwargs(network_mode="host")
     )
     with container:
@@ -139,6 +148,25 @@ def streaming_container(_container):
         )
 
     yield http_port, ws_port
+
+
+@pytest.fixture(scope="session")
+def turn_params():
+    """
+    URL query string fragment to configure a TURN relay for the WebRTC test.
+
+    Returns "&turn_uri=...&turn_user=...&turn_cred=..." when WEBRTC_TURN_SERVER
+    is set in the environment (CI only), or "" for local runs without coturn.
+    """
+    from urllib.parse import urlencode
+
+    if not WEBRTC_TURN_SERVER:
+        return ""
+    return "&" + urlencode({
+        "turn_uri": WEBRTC_TURN_SERVER,
+        "turn_user": WEBRTC_TURN_USER,
+        "turn_cred": WEBRTC_TURN_CRED,
+    })
 
 
 @pytest.fixture(scope="function")
