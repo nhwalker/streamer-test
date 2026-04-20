@@ -71,11 +71,11 @@
       function PatchedRPC(cfg) {
         var pc = new _OrigRPC(cfg);
         pc.addEventListener('track', function (e) {
-          if (e.streams && e.streams.length > 0) return; // gstwebrtc-api handles it
           var vid = document.getElementById('stream');
-          if (!vid) return;
-          if (!vid.srcObject) vid.srcObject = new MediaStream();
-          vid.srcObject.addTrack(e.track);
+          if (!vid || vid.srcObject) return;
+          vid.srcObject = (e.streams && e.streams.length > 0)
+            ? e.streams[0]
+            : new MediaStream([e.track]);
         });
         return pc;
       }
