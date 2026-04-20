@@ -190,7 +190,7 @@ graph TD
     subgraph runtime["Runtime Container"]
         direction TB
         ep["/usr/local/bin/entrypoint.sh"]
-        pl["/usr/local/bin/pipeline.sh"]
+        pl["/usr/local/bin/pipeline.py"]
         ss["/usr/local/bin/gst-webrtc-signalling-server"]
         plug["/usr/local/lib64/gstreamer-1.0/\nlibgstrswebrtc.so"]
         www["/var/www/html/\nindex.html\ngstwebrtc-api/gstwebrtc-api.js"]
@@ -212,7 +212,7 @@ sequenceDiagram
     participant E as entrypoint.sh
     participant S as Signalling Server
     participant W as Web Server (python3)
-    participant P as pipeline.sh / gst-launch-1.0
+    participant P as pipeline.py / gst-launch-1.0
 
     D->>E: container start
     E->>E: X11 pre-flight check\n(1-frame probe via ximagesrc)
@@ -253,7 +253,7 @@ flowchart TD
         I["COPY libgstrswebrtc.so"]
         J["COPY gst-webrtc-signalling-server"]
         K["COPY gstwebrtc-api.js + index.html"]
-        L["COPY entrypoint.sh + pipeline.sh"]
+        L["COPY entrypoint.sh + pipeline.py"]
 
         H --> I --> J --> K --> L
     end
@@ -392,7 +392,6 @@ All settings are environment variables passed to `docker run -e`:
 | `STREAM_WIDTH` | `1920` | Capture width in pixels |
 | `STREAM_HEIGHT` | `1080` | Capture height in pixels |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
-| `STREAM_BITRATE_KBPS` | `2000` | Target encode bitrate (kilobits/s) |
 | `SIGNALLING_HOST` | `0.0.0.0` | Network interface for the signalling server |
 | `SIGNALLING_PORT` | `8443` | Port for the WebSocket signalling server |
 | `WEB_PORT` | `8080` | Port for the HTTP page server |
@@ -400,7 +399,7 @@ All settings are environment variables passed to `docker run -e`:
 
 \* H.264 and H.265 use NVENC hardware encoding when a GPU is available (`--gpus all`). Without a GPU, H.264 needs a software encoder (add EPEL + `gstreamer1-plugins-ugly` + `x264` to the runtime stage). H.265 WebRTC is supported in Chrome/Edge but not Firefox.
 
-### Example: lower-bandwidth 720p stream
+### Example: 720p stream
 
 ```bash
 docker run --rm --network=host \
@@ -408,7 +407,6 @@ docker run --rm --network=host \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -e STREAM_WIDTH=1280 \
   -e STREAM_HEIGHT=720 \
-  -e STREAM_BITRATE_KBPS=1000 \
   x11-webrtc-streamer
 ```
 
@@ -438,7 +436,7 @@ Then open `http://<server-ip>:8080?stun=stun.l.google.com:19302` in the browser 
 docker run --rm x11-webrtc-streamer gst-inspect-1.0 webrtcsink
 ```
 
-Expected: a long property list including `video-caps`, `signaller`, `target-bitrate`.
+Expected: a long property list including `video-caps` and `signaller`.
 
 **2 — Smoke test without X11 (synthetic video):**
 
@@ -468,24 +466,6 @@ docker stats <container-name>
 ```
 
 VP9 software encoding at 1080p30 typically uses 100–200% CPU (1–2 cores) on modern hardware. If CPU is a concern, reduce resolution or switch to VP8 (`STREAM_CODEC=vp8`), which is cheaper to encode.
-
----
-
-## Adapting for Wayland
-
-The design deliberately isolates the capture source from the rest of the stack. Migrating from X11 to Wayland requires changing **one line** in `pipeline.sh`:
-
-```bash
-# X11 (current)
-ximagesrc display-name="${DISPLAY}" use-damage=false \
-
-# Wayland — replace with PipeWire source
-pipewiresrc path="${PIPEWIRE_NODE_ID:-0}" do-timestamp=true \
-```
-
-PipeWire is the modern audio/video routing layer on Linux that works natively with Wayland compositors (GNOME, KDE Plasma, sway). On Wayland, screen capture goes through the `xdg-desktop-portal` → PipeWire → `pipewiresrc` path.
-
-Everything downstream — `videorate`, `videoscale`, `webrtcsink`, the signalling server, and the web page — is unchanged.
 
 ---
 
@@ -524,7 +504,7 @@ Deploy `gst-webrtc-signalling-server` as its own container. Set `SIGNALLING_PORT
 [WHIP](https://www.ietf.org/archive/id/draft-ietf-wish-whip-01.txt) is an HTTP-based WebRTC ingest standard supported by Cloudflare Stream, Janus, LiveKit, and others. Switch `webrtcsink` to use it by changing a single property — no pipeline restructuring:
 
 ```bash
-# In pipeline.sh, replace the signaller properties with:
+# In pipeline.py, replace the signaller properties with:
 webrtcsink signaller::uri="https://your-sfu.example.com/whip/ingest" \
            signaller=whipsink
 ```

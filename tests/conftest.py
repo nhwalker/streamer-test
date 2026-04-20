@@ -123,7 +123,7 @@ def streaming_container(_container):
     ws_port = WS_PORT
 
     # The web server log line is the last thing entrypoint.sh prints
-    # before handing off to pipeline.sh, so it confirms both the
+    # before handing off to pipeline.py, so it confirms both the
     # signalling server and HTTP server are up.
     wait_for_logs(_container, "web server on port", timeout=60)
 

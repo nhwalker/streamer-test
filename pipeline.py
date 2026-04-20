@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-pipeline.py — GStreamer desktop capture pipeline with TURN support.
+pipeline.py — GStreamer desktop capture pipeline.
 
-Replaces the gst-launch-1.0 invocation in pipeline.sh so that TURN servers
-can be configured on each per-consumer webrtcbin via the webrtcbin-ready
-signal.  webrtcsink 0.13.x does not expose a turn-server property, but the
-underlying webrtcbin element does accept the add-turn-server action signal.
+Launches ximagesrc → videorate → videoscale → videoconvert → webrtcsink,
+and (when GST_WEBRTC_TURN_SERVER is set) attaches a TURN server to each
+per-consumer webrtcbin that webrtcsink creates.
 
-Environment variables (same as pipeline.sh):
+Environment variables:
   DISPLAY                X11 display                   (:0)
   STREAM_CODEC           vp9 | vp8 | h264 | h265       (vp9)
   STREAM_WIDTH           capture width                  (1920)
   STREAM_HEIGHT          capture height                 (1080)
   STREAM_FRAMERATE       frames per second              (30)
-  STREAM_BITRATE_KBPS    target bitrate in kbps         (2000)
   SIGNALLING_PORT        signalling server port         (8443)
   GST_WEBRTC_STUN_SERVER optional STUN URI             ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI             ("")
@@ -53,9 +51,8 @@ def main():
               'Use vp9, vp8, h264, or h265.', file=sys.stderr)
         sys.exit(1)
 
-    caps     = CODEC_CAPS[CODEC]
-    sig_uri  = f'ws://127.0.0.1:{SIG_PORT}'
-    bitrate  = os.environ.get('STREAM_BITRATE_KBPS', '2000')
+    caps    = CODEC_CAPS[CODEC]
+    sig_uri = f'ws://127.0.0.1:{SIG_PORT}'
 
     if Gst.ElementFactory.find('nvh264enc'):
         print('[pipeline] NVIDIA NVENC detected: hardware encoding available')
@@ -65,7 +62,7 @@ def main():
     print('[pipeline] Starting capture:')
     print(f'  Display    : {DISPLAY}')
     print(f'  Resolution : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
-    print(f'  Codec      : {caps} @ {bitrate} kbps')
+    print(f'  Codec      : {caps}')
     print(f'  Signalling : {sig_uri}')
     if STUN:
         print(f'  STUN       : {STUN}')
@@ -93,20 +90,14 @@ def main():
         print(f'[pipeline] ERROR: Failed to parse pipeline: {exc}', file=sys.stderr)
         sys.exit(1)
 
-    ws = pipeline.get_by_name('ws')
-
-    # Configure TURN on every webrtcbin instance that webrtcsink creates.
-    # webrtcsink 0.13.x has no webrtcbin-ready signal.
-    #
-    # Strategy: connect deep-element-added on BOTH the pipeline AND webrtcsink
-    # so we catch webrtcbin regardless of where in the bin hierarchy it appears.
-    # add-turn-server must be called before webrtcbin starts create-offer/ICE.
+    # Configure TURN on every webrtcbin that webrtcsink creates.
+    # webrtcsink 0.13.x has no webrtcbin-ready signal, but deep-element-added
+    # on the pipeline walks the full descendant tree, so it fires for every
+    # webrtcbin the sink spawns per consumer before ICE starts.
     if TURN:
-        def _configure_turn(element):
+        def on_deep_element_added(_bin, _sub_bin, element):
             factory = element.get_factory()
-            fname = factory.get_name() if factory else '(no factory)'
-            print(f'[pipeline] element-added: {fname}', flush=True)
-            if fname == 'webrtcbin':
+            if factory and factory.get_name() == 'webrtcbin':
                 print('[pipeline] webrtcbin found — calling add-turn-server', flush=True)
                 try:
                     ok = element.emit('add-turn-server', TURN)
@@ -116,21 +107,7 @@ def main():
                     print(f'[pipeline] WARNING: add-turn-server failed: {exc}',
                           file=sys.stderr, flush=True)
 
-        def on_deep_element_added(bin_, sub_bin, element):
-            _configure_turn(element)
-
-        def on_element_added(bin_, element):
-            _configure_turn(element)
-            # If the added element is itself a bin, subscribe directly so
-            # we catch sub-elements even if deep-element-added doesn't propagate.
-            if isinstance(element, Gst.Bin):
-                element.connect('element-added', on_element_added)
-                element.connect('deep-element-added', on_deep_element_added)
-
         pipeline.connect('deep-element-added', on_deep_element_added)
-        if ws:
-            ws.connect('element-added', on_element_added)
-            ws.connect('deep-element-added', on_deep_element_added)
         print('[pipeline] Listening for webrtcbin creation to configure TURN',
               flush=True)
 
