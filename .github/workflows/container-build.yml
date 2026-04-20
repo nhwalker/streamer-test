@@ -116,6 +116,7 @@ jobs:
             --no-tls \
             --no-dtls \
             --allow-loopback-peers \
+            --no-cli \
             --verbose \
             --log-file=/tmp/turnserver.log &
           for i in $(seq 1 20); do
