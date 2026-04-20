@@ -54,6 +54,35 @@
       ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
                                      browser and container are on different hosts.
   -->
+  <!--
+    GStreamer's webrtcbin uses ssrc-level MSID (a=ssrc:... msid:...) rather than
+    the Unified-Plan m-line-level attribute (a=msid:).  Chrome's Unified-Plan
+    RTCPeerConnection therefore fires ontrack with event.streams = [].
+    gstwebrtc-api checks event.streams[0] and silently returns when it's absent,
+    leaving video.srcObject unset even though the connection is fully established.
+
+    This shim patches RTCPeerConnection BEFORE gstwebrtc-api loads so that every
+    consumer peer connection also has a track listener that creates a MediaStream
+    directly from event.track when event.streams is empty.
+  -->
+  <script>
+    (function () {
+      var _OrigRPC = window.RTCPeerConnection;
+      function PatchedRPC(cfg) {
+        var pc = new _OrigRPC(cfg);
+        pc.addEventListener('track', function (e) {
+          if (e.streams && e.streams.length > 0) return; // gstwebrtc-api handles it
+          var vid = document.getElementById('stream');
+          if (!vid) return;
+          if (!vid.srcObject) vid.srcObject = new MediaStream();
+          vid.srcObject.addTrack(e.track);
+        });
+        return pc;
+      }
+      PatchedRPC.prototype = _OrigRPC.prototype;
+      window.RTCPeerConnection = PatchedRPC;
+    })();
+  </script>
   <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
   <script>
     const params   = new URLSearchParams(window.location.search);

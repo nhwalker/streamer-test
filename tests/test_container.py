@@ -119,6 +119,12 @@ class TestWebRTCStream:
                             console.log('[diag] connection state: ' +
                                         pc.connectionState);
                         });
+                        pc.addEventListener('track', function(e) {
+                            var ns = e.streams ? e.streams.length : 0;
+                            console.log('[diag] track event: kind=' + e.track.kind +
+                                        ' streams=' + ns +
+                                        ' muted=' + e.track.muted);
+                        });
                         return pc;
                     }
                     DiagRPC.prototype = _RPC.prototype;
