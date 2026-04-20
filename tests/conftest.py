@@ -48,6 +48,27 @@ WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
+# A borderless full-screen red window painted on the Xvfb display, used as a
+# known-color capture target.  Tkinter ships with CPython and creates a real
+# X11 window that actively renders pixels into the framebuffer — unlike
+# "xsetroot -solid", which only sets the root background pixmap and (on a
+# headless Xvfb without a WM or any other clients) may never actually commit
+# those pixels to the framebuffer that ximagesrc reads.
+_RED_WINDOW_SCRIPT = """
+import os, sys, tkinter as tk
+os.environ['DISPLAY'] = sys.argv[1]
+geom = sys.argv[2]
+root = tk.Tk()
+root.overrideredirect(True)
+root.geometry(geom)
+root.configure(bg='#ff0000')
+frame = tk.Frame(root, bg='#ff0000')
+frame.pack(fill='both', expand=True)
+root.update()
+root.mainloop()
+"""
+
+
 @pytest.fixture(scope="session")
 def xvfb_display():
     """
@@ -57,10 +78,11 @@ def xvfb_display():
     entrypoint X11 pre-flight check (ximagesrc num-buffers=1) cannot
     race ahead of Xvfb being ready.
 
-    Paints the root window solid red with xsetroot so that pixels captured
-    by the container's ximagesrc are a known color.  The WebRTC test then
-    asserts the decoded frame is red, which distinguishes "stream is live"
-    from "stream carries actual display content".
+    Also launches a borderless full-screen Tkinter window painted
+    #ff0000 on the display, so pixels captured by the container's
+    ximagesrc are a known color.  The WebRTC test then asserts the
+    decoded frame is red, which distinguishes "stream is live" from
+    "stream carries actual display content".
     """
     proc = subprocess.Popen(
         ["Xvfb", XVFB_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
@@ -78,26 +100,35 @@ def xvfb_display():
         proc.terminate()
         raise RuntimeError(f"Xvfb socket {socket_path} did not appear within 5 s")
 
-    # Paint the root red.  Use an explicit hex triplet rather than the
-    # "red" color name so the result is independent of whether an X11
-    # rgb.txt color database is installed on the test host.
-    try:
-        subprocess.run(
-            ["xsetroot", "-display", XVFB_DISPLAY, "-solid", "#ff0000"],
-            check=True,
-            timeout=5,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired) as exc:
+    # XVFB_GEOMETRY is "WxHxD" — strip the depth to get "WxH" for Tk geometry.
+    width_height = "x".join(XVFB_GEOMETRY.split("x")[:2]) + "+0+0"
+    red_window = subprocess.Popen(
+        ["python3", "-c", _RED_WINDOW_SCRIPT, XVFB_DISPLAY, width_height],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Give Tk a moment to map the window and render its first frame before
+    # the container starts probing ximagesrc.  If Tk crashed (e.g. python3-tk
+    # missing), surface the stderr immediately rather than letting the WebRTC
+    # test fail far downstream with an opaque "frame is not red" message.
+    time.sleep(1.0)
+    if red_window.poll() is not None:
+        _, stderr = red_window.communicate(timeout=2)
         proc.terminate()
         raise RuntimeError(
-            f"Failed to paint Xvfb root window red with xsetroot: {exc}. "
-            "Install x11-xserver-utils on the test host."
-        ) from exc
+            f"Red window helper exited early (rc={red_window.returncode}). "
+            f"stderr: {stderr.decode(errors='replace')!r}. "
+            "Install python3-tk on the test host."
+        )
 
     yield XVFB_DISPLAY
+
+    red_window.terminate()
+    try:
+        red_window.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        red_window.kill()
 
     proc.terminate()
     try:

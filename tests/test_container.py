@@ -222,15 +222,25 @@ class TestWebRTCStream:
             } catch (e) {
                 return {stage: 'getImageData-error', error: String(e)};
             }
-            let r = 0, g = 0, b = 0;
+            // Sample the first pixel and a center pixel separately so we can
+            // distinguish "drawImage didn't run" (canvas alpha = 0 everywhere)
+            // from "stream is genuinely solid black" (alpha = 255) in the
+            // failure message — the root-cause shape is very different.
+            const centerIdx = (Math.floor(c.height / 2) * c.width +
+                               Math.floor(c.width / 2)) * 4;
+            let r = 0, g = 0, b = 0, a = 0;
             const n = data.length / 4;
             for (let i = 0; i < data.length; i += 4) {
-                r += data[i]; g += data[i + 1]; b += data[i + 2];
+                r += data[i]; g += data[i + 1];
+                b += data[i + 2]; a += data[i + 3];
             }
             return {
                 stage: 'ok',
                 width: c.width, height: c.height,
-                avgR: r / n, avgG: g / n, avgB: b / n,
+                avgR: r / n, avgG: g / n, avgB: b / n, avgA: a / n,
+                firstPixel:  [data[0], data[1], data[2], data[3]],
+                centerPixel: [data[centerIdx], data[centerIdx + 1],
+                              data[centerIdx + 2], data[centerIdx + 3]],
                 readyState: v.readyState,
                 currentTime: v.currentTime,
             };

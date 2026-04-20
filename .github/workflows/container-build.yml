@@ -79,7 +79,7 @@ jobs:
             xvfb \
             google-chrome-stable \
             x11-utils \
-            x11-xserver-utils \
+            python3-tk \
             coturn
 
       - name: Set up Python
