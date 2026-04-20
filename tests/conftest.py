@@ -223,7 +223,11 @@ def _container(xvfb_display):
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         # Host networking so GStreamer can reach coturn on 127.0.0.1.
-        .with_kwargs(network_mode="host")
+        # Host IPC namespace so ximagesrc's MIT-SHM requests can attach to
+        # SysV shared-memory segments created by the host Xvfb — without
+        # this, ximagesrc silently captures all-zero frames even though the
+        # X connection itself succeeds.
+        .with_kwargs(network_mode="host", ipc_mode="host")
     )
     with container:
         yield container
