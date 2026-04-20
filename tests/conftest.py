@@ -56,6 +56,11 @@ def xvfb_display():
     Polls for the X11 socket before yielding so the container's
     entrypoint X11 pre-flight check (ximagesrc num-buffers=1) cannot
     race ahead of Xvfb being ready.
+
+    Paints the root window solid red with xsetroot so that pixels captured
+    by the container's ximagesrc are a known color.  The WebRTC test then
+    asserts the decoded frame is red, which distinguishes "stream is live"
+    from "stream carries actual display content".
     """
     proc = subprocess.Popen(
         ["Xvfb", XVFB_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
@@ -72,6 +77,22 @@ def xvfb_display():
     else:
         proc.terminate()
         raise RuntimeError(f"Xvfb socket {socket_path} did not appear within 5 s")
+
+    try:
+        subprocess.run(
+            ["xsetroot", "-display", XVFB_DISPLAY, "-solid", "red"],
+            check=True,
+            timeout=5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
+        proc.terminate()
+        raise RuntimeError(
+            f"Failed to paint Xvfb root window red with xsetroot: {exc}. "
+            "Install x11-xserver-utils on the test host."
+        ) from exc
 
     yield XVFB_DISPLAY
 

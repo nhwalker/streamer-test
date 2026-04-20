@@ -183,3 +183,41 @@ class TestWebRTCStream:
                 f"  container stdout:\n{stdout.decode(errors='replace')}\n"
                 f"  container stderr:\n{stderr.decode(errors='replace')}"
             )
+
+        # Sample decoded pixels from the <video> to prove the stream carries
+        # the red Xvfb root, not a black/empty placeholder.  Chroma subsampling
+        # and YUV<->RGB rounding in the codec shift pure red a few units, so
+        # thresholds allow ~20 % slack rather than requiring exactly (255,0,0).
+        pixel_stats = WebDriverWait(browser, timeout=10, poll_frequency=0.5).until(
+            lambda d: d.execute_script("""
+                const v = document.querySelector('video');
+                if (!v || !v.videoWidth || !v.videoHeight) return null;
+                const c = document.createElement('canvas');
+                c.width = v.videoWidth;
+                c.height = v.videoHeight;
+                const ctx = c.getContext('2d');
+                ctx.drawImage(v, 0, 0, c.width, c.height);
+                const data = ctx.getImageData(0, 0, c.width, c.height).data;
+                let r = 0, g = 0, b = 0;
+                const n = data.length / 4;
+                for (let i = 0; i < data.length; i += 4) {
+                    r += data[i]; g += data[i + 1]; b += data[i + 2];
+                }
+                return {
+                    width: c.width, height: c.height,
+                    avgR: r / n, avgG: g / n, avgB: b / n,
+                };
+            """)
+        )
+        assert (
+            pixel_stats["avgR"] > 200
+            and pixel_stats["avgG"] < 60
+            and pixel_stats["avgB"] < 60
+        ), (
+            "Decoded WebRTC frame is not red.  Expected R>200, G<60, B<60 "
+            "from the red Xvfb root, but got "
+            f"R={pixel_stats['avgR']:.1f} "
+            f"G={pixel_stats['avgG']:.1f} "
+            f"B={pixel_stats['avgB']:.1f} "
+            f"({pixel_stats['width']}x{pixel_stats['height']})."
+        )
