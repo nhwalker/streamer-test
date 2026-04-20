@@ -3,7 +3,7 @@
 #
 #  1. gst-webrtc-signalling-server  (background, WebSocket :SIGNALLING_PORT)
 #  2. python3 -m http.server        (background, HTTP :WEB_PORT, serves web/)
-#  3. pipeline.sh                   (background, GStreamer capture loop)
+#  3. pipeline.py                   (background, GStreamer capture loop)
 #
 # All three run as background jobs so a GStreamer pipeline crash does not kill
 # the HTTP or signalling servers.  The main process waits for all jobs and
@@ -72,7 +72,6 @@ echo "[entrypoint] Signalling server ready."
 # ── Web server ────────────────────────────────────────────────────────────────
 # Serves /var/www/html/ which contains index.html and gstwebrtc-api/.
 # Replace with nginx/CDN in production.
-echo "[entrypoint] gstwebrtc-api files: $(ls /var/www/html/gstwebrtc-api/ 2>/dev/null | tr '\n' ' ')"
 echo "[entrypoint] Starting web server on port ${WEB_PORT} ..."
 python3 -m http.server --directory /var/www/html "${WEB_PORT}" &
 

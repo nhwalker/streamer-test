@@ -216,9 +216,8 @@ COPY --from=builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 # Copy web page and startup scripts.
 COPY web/index.html  /var/www/html/index.html
 COPY entrypoint.sh   /usr/local/bin/entrypoint.sh
-COPY pipeline.sh     /usr/local/bin/pipeline.sh
 COPY pipeline.py     /usr/local/bin/pipeline.py
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.sh /usr/local/bin/pipeline.py
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py
 
 # ── Environment defaults (all overridable at runtime via -e) ──────────────────
 # GST_PLUGIN_PATH          : where GStreamer finds the Rust + nvcodec plugins

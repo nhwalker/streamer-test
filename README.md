@@ -190,7 +190,7 @@ graph TD
     subgraph runtime["Runtime Container"]
         direction TB
         ep["/usr/local/bin/entrypoint.sh"]
-        pl["/usr/local/bin/pipeline.sh"]
+        pl["/usr/local/bin/pipeline.py"]
         ss["/usr/local/bin/gst-webrtc-signalling-server"]
         plug["/usr/local/lib64/gstreamer-1.0/\nlibgstrswebrtc.so"]
         www["/var/www/html/\nindex.html\ngstwebrtc-api/gstwebrtc-api.js"]
@@ -212,7 +212,7 @@ sequenceDiagram
     participant E as entrypoint.sh
     participant S as Signalling Server
     participant W as Web Server (python3)
-    participant P as pipeline.sh / gst-launch-1.0
+    participant P as pipeline.py / gst-launch-1.0
 
     D->>E: container start
     E->>E: X11 pre-flight check\n(1-frame probe via ximagesrc)
@@ -253,7 +253,7 @@ flowchart TD
         I["COPY libgstrswebrtc.so"]
         J["COPY gst-webrtc-signalling-server"]
         K["COPY gstwebrtc-api.js + index.html"]
-        L["COPY entrypoint.sh + pipeline.sh"]
+        L["COPY entrypoint.sh + pipeline.py"]
 
         H --> I --> J --> K --> L
     end
@@ -471,24 +471,6 @@ VP9 software encoding at 1080p30 typically uses 100–200% CPU (1–2 cores) on 
 
 ---
 
-## Adapting for Wayland
-
-The design deliberately isolates the capture source from the rest of the stack. Migrating from X11 to Wayland requires changing **one line** in `pipeline.sh`:
-
-```bash
-# X11 (current)
-ximagesrc display-name="${DISPLAY}" use-damage=false \
-
-# Wayland — replace with PipeWire source
-pipewiresrc path="${PIPEWIRE_NODE_ID:-0}" do-timestamp=true \
-```
-
-PipeWire is the modern audio/video routing layer on Linux that works natively with Wayland compositors (GNOME, KDE Plasma, sway). On Wayland, screen capture goes through the `xdg-desktop-portal` → PipeWire → `pipewiresrc` path.
-
-Everything downstream — `videorate`, `videoscale`, `webrtcsink`, the signalling server, and the web page — is unchanged.
-
----
-
 ## Production upgrade path
 
 The PoC uses simple in-process components for convenience. Each can be swapped independently for production:
@@ -524,7 +506,7 @@ Deploy `gst-webrtc-signalling-server` as its own container. Set `SIGNALLING_PORT
 [WHIP](https://www.ietf.org/archive/id/draft-ietf-wish-whip-01.txt) is an HTTP-based WebRTC ingest standard supported by Cloudflare Stream, Janus, LiveKit, and others. Switch `webrtcsink` to use it by changing a single property — no pipeline restructuring:
 
 ```bash
-# In pipeline.sh, replace the signaller properties with:
+# In pipeline.py, replace the signaller properties with:
 webrtcsink signaller::uri="https://your-sfu.example.com/whip/ingest" \
            signaller=whipsink
 ```
