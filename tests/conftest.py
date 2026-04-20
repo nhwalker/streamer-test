@@ -193,6 +193,10 @@ def browser():
     options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
+    # Allow loopback (127.x.x.x) as ICE host and relay candidates.
+    # Required when coturn relays via --relay-ip=127.0.0.1; without this flag
+    # Chrome silently drops relay candidates on loopback addresses.
+    options.add_argument("--allow-loopback-for-peer-connection")
     options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
     service = Service(ChromeDriverManager().install())

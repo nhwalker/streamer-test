@@ -92,6 +92,41 @@ class TestWebRTCStream:
         (required in CI on Azure VMs where same-IP UDP hairpin is blocked).
         """
         http_port, ws_port = streaming_container
+
+        # Inject diagnostic hooks that log RTCPeerConnection config and ICE
+        # events to the browser console.  Runs on every new document so all
+        # ICE candidates (including relay) and the iceServers config used by
+        # gstwebrtc-api are visible in the captured browser log on failure.
+        browser.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": """
+                (function() {
+                    var _RPC = window.RTCPeerConnection;
+                    function DiagRPC(cfg) {
+                        console.log('[diag] RTCPeerConnection config: ' +
+                                    JSON.stringify(cfg));
+                        var pc = new _RPC(cfg);
+                        pc.addEventListener('icecandidate', function(e) {
+                            console.log('[diag] ICE candidate: ' +
+                                        (e.candidate ? e.candidate.candidate
+                                                     : '(end-of-candidates)'));
+                        });
+                        pc.addEventListener('iceconnectionstatechange', function() {
+                            console.log('[diag] ICE state: ' +
+                                        pc.iceConnectionState);
+                        });
+                        pc.addEventListener('connectionstatechange', function() {
+                            console.log('[diag] connection state: ' +
+                                        pc.connectionState);
+                        });
+                        return pc;
+                    }
+                    DiagRPC.prototype = _RPC.prototype;
+                    window.RTCPeerConnection = DiagRPC;
+                })();
+            """},
+        )
+
         # Pass the host-mapped signalling port and, in CI, a loopback TURN relay
         # so ICE relay candidates bypass Azure's same-IP UDP hairpin restriction.
         browser.get(
@@ -131,11 +166,14 @@ class TestWebRTCStream:
             except Exception:
                 console_logs = []
             stdout, stderr = _container.get_logs()
+            console_text = "\n".join(
+                f"    [{e['level']}] {e['message']}" for e in console_logs
+            ) or "    (no browser console output)"
             pytest.fail(
                 f"WebRTC video did not start playing within 60 s.\n"
                 f"  video state    : {video_state}\n"
                 f"  page status    : {status_text!r}\n"
-                f"  browser console: {console_logs}\n"
+                f"  browser console:\n{console_text}\n"
                 f"  container stdout:\n{stdout.decode(errors='replace')}\n"
                 f"  container stderr:\n{stderr.decode(errors='replace')}"
             )

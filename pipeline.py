@@ -96,23 +96,43 @@ def main():
     ws = pipeline.get_by_name('ws')
 
     # Configure TURN on every webrtcbin instance that webrtcsink creates.
-    # webrtcsink 0.13.x has no webrtcbin-ready signal; use deep-element-added
-    # on the pipeline to catch each webrtcbin as it is created, then call the
-    # add-turn-server action signal directly on the webrtcbin element.
+    # webrtcsink 0.13.x has no webrtcbin-ready signal.
+    #
+    # Strategy: connect deep-element-added on BOTH the pipeline AND webrtcsink
+    # so we catch webrtcbin regardless of where in the bin hierarchy it appears.
+    # add-turn-server must be called before webrtcbin starts create-offer/ICE.
     if TURN:
-        def on_deep_element_added(pipeline_, bin_, element):
+        def _configure_turn(element):
             factory = element.get_factory()
-            if factory and factory.get_name() == 'webrtcbin':
-                print('[pipeline] webrtcbin created, configuring TURN')
+            fname = factory.get_name() if factory else '(no factory)'
+            print(f'[pipeline] element-added: {fname}', flush=True)
+            if fname == 'webrtcbin':
+                print('[pipeline] webrtcbin found — calling add-turn-server', flush=True)
                 try:
                     ok = element.emit('add-turn-server', TURN)
-                    print(f'[pipeline] add-turn-server: {"OK" if ok else "FAILED"}')
+                    print(f'[pipeline] add-turn-server: {"OK" if ok else "FAILED"}',
+                          flush=True)
                 except Exception as exc:
                     print(f'[pipeline] WARNING: add-turn-server failed: {exc}',
-                          file=sys.stderr)
+                          file=sys.stderr, flush=True)
+
+        def on_deep_element_added(bin_, sub_bin, element):
+            _configure_turn(element)
+
+        def on_element_added(bin_, element):
+            _configure_turn(element)
+            # If the added element is itself a bin, subscribe directly so
+            # we catch sub-elements even if deep-element-added doesn't propagate.
+            if isinstance(element, Gst.Bin):
+                element.connect('element-added', on_element_added)
+                element.connect('deep-element-added', on_deep_element_added)
 
         pipeline.connect('deep-element-added', on_deep_element_added)
-        print('[pipeline] Listening for webrtcbin creation to configure TURN')
+        if ws:
+            ws.connect('element-added', on_element_added)
+            ws.connect('deep-element-added', on_deep_element_added)
+        print('[pipeline] Listening for webrtcbin creation to configure TURN',
+              flush=True)
 
     loop = GLib.MainLoop()
     bus  = pipeline.get_bus()

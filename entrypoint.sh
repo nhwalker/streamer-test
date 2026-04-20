@@ -93,7 +93,7 @@ echo ""
 # pipeline.py is a Python wrapper around the same gst-launch pipeline that
 # also connects the webrtcbin-ready signal to configure a TURN server per
 # consumer — webrtcsink 0.13.x does not expose a turn-server property.
-python3 /usr/local/bin/pipeline.py &
+python3 -u /usr/local/bin/pipeline.py &
 PIPPID=$!
 
 # Wait for all background jobs.  Returns when every job has exited, or when
