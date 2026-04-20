@@ -127,7 +127,6 @@ jobs:
       - name: Run integration tests
         env:
           TEST_IMAGE: streamer-test:ci
-          GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
           WEBRTC_TURN_SERVER: "turn:127.0.0.1:3478"
           WEBRTC_TURN_USER: "ci"
           WEBRTC_TURN_CRED: "ci"

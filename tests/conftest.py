@@ -39,8 +39,9 @@ XVFB_GEOMETRY = "1280x720x24"
 HTTP_PORT = 8080
 WS_PORT = 8443
 
-# Optional TURN server config (set in CI to work around Azure hairpin UDP issues).
-GST_TURN_SERVER = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
+# Optional browser-side TURN config (set in CI to work around Azure hairpin UDP).
+# webrtcsink 0.13.x has no turn-server property, so TURN is Chrome-side only:
+# Chrome allocates a relay at 127.0.0.1:PORT; GStreamer (host network) can reach it.
 WEBRTC_TURN_SERVER = os.environ.get("WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_USER = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED = os.environ.get("WEBRTC_TURN_CRED", "")
@@ -99,12 +100,9 @@ def _container(xvfb_display):
         # Match Xvfb geometry to avoid unnecessary scaling overhead.
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")
-        # Pass TURN server so GStreamer webrtcsink generates relay candidates on
-        # 127.0.0.1 — required on Azure VMs where same-IP UDP hairpin is blocked.
-        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         # Host networking: container shares the host network namespace so
-        # both GStreamer and Chrome can reach the loopback TURN relay.
+        # GStreamer can reach Chrome's loopback TURN relay at 127.0.0.1.
         .with_kwargs(network_mode="host")
     )
     with container:

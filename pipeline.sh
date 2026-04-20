@@ -10,8 +10,6 @@
 #   STREAM_BITRATE_KBPS   target bitrate in kbps          (2000)
 #   SIGNALLING_PORT       port of the signalling server   (8443)
 #   GST_WEBRTC_STUN_SERVER optional STUN URI              ("")
-#   GST_WEBRTC_TURN_SERVER optional TURN URI              ("")
-#                           Format: turn://user:pass@host:port
 #
 # ── Wayland/PipeWire swap ─────────────────────────────────────────────────────
 # When migrating from X11 to Wayland, replace the ximagesrc block with:
@@ -53,10 +51,9 @@ if [ -n "${GST_WEBRTC_STUN_SERVER:-}" ]; then
     STUN_PROP="stun-server=${GST_WEBRTC_STUN_SERVER}"
 fi
 
-TURN_PROP=""
-if [ -n "${GST_WEBRTC_TURN_SERVER:-}" ]; then
-    TURN_PROP="turn-server=${GST_WEBRTC_TURN_SERVER}"
-fi
+# NOTE: webrtcsink 0.13.x does not have a turn-server property.
+# TURN relay is configured browser-side via ?turn_uri/turn_user/turn_cred URL params.
+
 
 # ── GStreamer caps strings ────────────────────────────────────────────────────
 RATE_CAPS="video/x-raw,framerate=${STREAM_FRAMERATE}/1"
@@ -69,7 +66,6 @@ echo "  Resolution : ${STREAM_WIDTH}x${STREAM_HEIGHT} @ ${STREAM_FRAMERATE} fps"
 echo "  Codec      : ${VIDEO_CAPS} @ ${STREAM_BITRATE_KBPS} kbps"
 echo "  Signalling : ws://127.0.0.1:${SIGNALLING_PORT}"
 [ -n "${STUN_PROP}" ] && echo "  STUN       : ${GST_WEBRTC_STUN_SERVER}"
-[ -n "${TURN_PROP}" ] && echo "  TURN       : ${GST_WEBRTC_TURN_SERVER}"
 
 # ── Launch pipeline ───────────────────────────────────────────────────────────
 # -e  : send EOS on interrupt so the pipeline shuts down cleanly
@@ -95,5 +91,4 @@ exec gst-launch-1.0 -e \
     ! webrtcsink name=ws \
         "signaller::uri=ws://127.0.0.1:${SIGNALLING_PORT}" \
         "video-caps=${VIDEO_CAPS}" \
-        ${STUN_PROP} \
-        ${TURN_PROP}
+        ${STUN_PROP}
