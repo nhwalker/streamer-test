@@ -96,23 +96,23 @@ def main():
     ws = pipeline.get_by_name('ws')
 
     # Configure TURN on every webrtcbin instance that webrtcsink creates.
-    # The add-turn-server action signal is on webrtcbin (gst-plugins-bad),
-    # not on webrtcsink (gst-plugins-rs), so we hook it via webrtcbin-ready.
-    if TURN and ws:
-        def on_webrtcbin_ready(_, peer_id, webrtcbin):
-            print(f'[pipeline] webrtcbin ready for {peer_id}, configuring TURN')
-            try:
-                ok = webrtcbin.emit('add-turn-server', TURN)
-                print(f'[pipeline] add-turn-server: {"OK" if ok else "FAILED"}')
-            except Exception as exc:
-                print(f'[pipeline] WARNING: add-turn-server failed: {exc}',
-                      file=sys.stderr)
+    # webrtcsink 0.13.x has no webrtcbin-ready signal; use deep-element-added
+    # on the pipeline to catch each webrtcbin as it is created, then call the
+    # add-turn-server action signal directly on the webrtcbin element.
+    if TURN:
+        def on_deep_element_added(pipeline_, bin_, element):
+            factory = element.get_factory()
+            if factory and factory.get_name() == 'webrtcbin':
+                print('[pipeline] webrtcbin created, configuring TURN')
+                try:
+                    ok = element.emit('add-turn-server', TURN)
+                    print(f'[pipeline] add-turn-server: {"OK" if ok else "FAILED"}')
+                except Exception as exc:
+                    print(f'[pipeline] WARNING: add-turn-server failed: {exc}',
+                          file=sys.stderr)
 
-        try:
-            ws.connect('webrtcbin-ready', on_webrtcbin_ready)
-        except Exception as exc:
-            print(f'[pipeline] WARNING: webrtcbin-ready signal unavailable: {exc}',
-                  file=sys.stderr)
+        pipeline.connect('deep-element-added', on_deep_element_added)
+        print('[pipeline] Listening for webrtcbin creation to configure TURN')
 
     loop = GLib.MainLoop()
     bus  = pipeline.get_bus()

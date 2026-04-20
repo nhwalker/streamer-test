@@ -80,7 +80,8 @@
 
     const api = new GstWebRTCAPI({
       signalingServerUrl: sigUrl,
-      iceServers,
+      // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
+      webrtcConfig: { iceServers },
     });
 
     api.registerProducersListener({
