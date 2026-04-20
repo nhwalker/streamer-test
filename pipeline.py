@@ -12,7 +12,6 @@ Environment variables:
   STREAM_WIDTH           capture width                  (1920)
   STREAM_HEIGHT          capture height                 (1080)
   STREAM_FRAMERATE       frames per second              (30)
-  STREAM_BITRATE_KBPS    target bitrate in kbps         (2000)
   SIGNALLING_PORT        signalling server port         (8443)
   GST_WEBRTC_STUN_SERVER optional STUN URI             ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI             ("")
@@ -52,10 +51,8 @@ def main():
               'Use vp9, vp8, h264, or h265.', file=sys.stderr)
         sys.exit(1)
 
-    caps       = CODEC_CAPS[CODEC]
-    sig_uri    = f'ws://127.0.0.1:{SIG_PORT}'
-    kbps       = int(os.environ.get('STREAM_BITRATE_KBPS', '2000'))
-    bitrate_bps = kbps * 1000
+    caps    = CODEC_CAPS[CODEC]
+    sig_uri = f'ws://127.0.0.1:{SIG_PORT}'
 
     if Gst.ElementFactory.find('nvh264enc'):
         print('[pipeline] NVIDIA NVENC detected: hardware encoding available')
@@ -65,7 +62,7 @@ def main():
     print('[pipeline] Starting capture:')
     print(f'  Display    : {DISPLAY}')
     print(f'  Resolution : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
-    print(f'  Codec      : {caps} @ {kbps} kbps')
+    print(f'  Codec      : {caps}')
     print(f'  Signalling : {sig_uri}')
     if STUN:
         print(f'  STUN       : {STUN}')
@@ -82,8 +79,7 @@ def main():
         f'! queue '
         f'! webrtcsink name=ws '
         f'signaller::uri={sig_uri} '
-        f'video-caps={caps} '
-        f'target-bitrate={bitrate_bps}'
+        f'video-caps={caps}'
     )
     if STUN:
         desc += f' stun-server={STUN}'

@@ -392,7 +392,6 @@ All settings are environment variables passed to `docker run -e`:
 | `STREAM_WIDTH` | `1920` | Capture width in pixels |
 | `STREAM_HEIGHT` | `1080` | Capture height in pixels |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
-| `STREAM_BITRATE_KBPS` | `2000` | Target encode bitrate (kilobits/s) |
 | `SIGNALLING_HOST` | `0.0.0.0` | Network interface for the signalling server |
 | `SIGNALLING_PORT` | `8443` | Port for the WebSocket signalling server |
 | `WEB_PORT` | `8080` | Port for the HTTP page server |
@@ -400,7 +399,7 @@ All settings are environment variables passed to `docker run -e`:
 
 \* H.264 and H.265 use NVENC hardware encoding when a GPU is available (`--gpus all`). Without a GPU, H.264 needs a software encoder (add EPEL + `gstreamer1-plugins-ugly` + `x264` to the runtime stage). H.265 WebRTC is supported in Chrome/Edge but not Firefox.
 
-### Example: lower-bandwidth 720p stream
+### Example: 720p stream
 
 ```bash
 docker run --rm --network=host \
@@ -408,7 +407,6 @@ docker run --rm --network=host \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -e STREAM_WIDTH=1280 \
   -e STREAM_HEIGHT=720 \
-  -e STREAM_BITRATE_KBPS=1000 \
   x11-webrtc-streamer
 ```
 
@@ -438,7 +436,7 @@ Then open `http://<server-ip>:8080?stun=stun.l.google.com:19302` in the browser 
 docker run --rm x11-webrtc-streamer gst-inspect-1.0 webrtcsink
 ```
 
-Expected: a long property list including `video-caps`, `signaller`, `target-bitrate`.
+Expected: a long property list including `video-caps` and `signaller`.
 
 **2 — Smoke test without X11 (synthetic video):**
 
