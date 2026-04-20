@@ -48,6 +48,77 @@ WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
+# xlogo from x11-apps is a tiny long-running X11 client that actively redraws
+# itself on every Expose event.  Using -bg and -fg both set to the same hex
+# red paints the entire window red (the logo glyph is invisible against a
+# same-colored background).  We use xlogo rather than "xsetroot -solid" or a
+# Tk window because Xvfb does not enable backing store by default — any
+# client that paints once and then sits idle has its pixels fall out of the
+# framebuffer, leaving ximagesrc to capture black.  xlogo's continuous
+# redraw keeps the pixels live.
+
+
+def _assert_xvfb_is_red(display, xvfb_proc, red_window_proc):
+    """
+    Confirm the Xvfb root window's center pixel is red before yielding
+    control to the container.  Uses xwd (x11-utils) to dump the framebuffer
+    and ImageMagick's "convert" to read the sample pixel, because both are
+    already available in CI and neither depends on a Python X11 binding.
+
+    Raises RuntimeError with the observed color on mismatch so the failure
+    surfaces at fixture-setup time (clearly a host painting problem) rather
+    than inside the browser-driven WebRTC test (which is ambiguous).
+    """
+    width, height = (int(x) for x in XVFB_GEOMETRY.split("x")[:2])
+    cx, cy = width // 2, height // 2
+
+    try:
+        xwd = subprocess.run(
+            ["xwd", "-display", display, "-root", "-silent"],
+            check=True, timeout=5,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
+        _cleanup_procs(red_window_proc, xvfb_proc)
+        raise RuntimeError(
+            f"xwd failed on {display}: {exc}. "
+            "Install x11-utils on the test host."
+        ) from exc
+
+    try:
+        pixel = subprocess.run(
+            ["convert", "xwd:-", "-format", f"%[pixel:p{{{cx},{cy}}}]", "info:"],
+            check=True, timeout=5, input=xwd.stdout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
+        _cleanup_procs(red_window_proc, xvfb_proc)
+        raise RuntimeError(
+            f"ImageMagick 'convert' failed reading xwd output: {exc}. "
+            "Install imagemagick on the test host."
+        ) from exc
+
+    sample = pixel.stdout.decode(errors="replace").strip()
+    # "convert" emits e.g. "srgb(255,0,0)" or "red" depending on version.
+    if "255,0,0" not in sample and sample.lower() not in {"red", "#ff0000"}:
+        _cleanup_procs(red_window_proc, xvfb_proc)
+        raise RuntimeError(
+            f"Xvfb framebuffer is not red at ({cx},{cy}); got {sample!r}. "
+            "The red-window helper is not painting the display — "
+            "the WebRTC test would fail with an all-black stream."
+        )
+
+
+def _cleanup_procs(*procs):
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
 @pytest.fixture(scope="session")
 def xvfb_display():
     """
@@ -56,6 +127,12 @@ def xvfb_display():
     Polls for the X11 socket before yielding so the container's
     entrypoint X11 pre-flight check (ximagesrc num-buffers=1) cannot
     race ahead of Xvfb being ready.
+
+    Also launches a borderless full-screen xlogo painted #ff0000 on
+    the display, so pixels captured by the container's ximagesrc are a
+    known color.  The WebRTC test then asserts the decoded frame is red,
+    which distinguishes "stream is live" from "stream carries actual
+    display content".
     """
     proc = subprocess.Popen(
         ["Xvfb", XVFB_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
@@ -73,7 +150,49 @@ def xvfb_display():
         proc.terminate()
         raise RuntimeError(f"Xvfb socket {socket_path} did not appear within 5 s")
 
+    # XVFB_GEOMETRY is "WxHxD" — strip the depth for the xlogo -geometry arg.
+    width_height = "x".join(XVFB_GEOMETRY.split("x")[:2]) + "+0+0"
+    red_window = subprocess.Popen(
+        [
+            "xlogo",
+            "-display", XVFB_DISPLAY,
+            "-geometry", width_height,
+            "-bg", "#ff0000",
+            "-fg", "#ff0000",
+            "-bw", "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Give xlogo a moment to map and paint before the container starts
+    # probing ximagesrc.  If xlogo failed to launch (e.g. x11-apps missing),
+    # surface the stderr immediately rather than letting the WebRTC test
+    # fail far downstream with an opaque "frame is not red" message.
+    time.sleep(1.0)
+    if red_window.poll() is not None:
+        _, stderr = red_window.communicate(timeout=2)
+        proc.terminate()
+        raise RuntimeError(
+            f"xlogo red-window helper exited early (rc={red_window.returncode}). "
+            f"stderr: {stderr.decode(errors='replace')!r}. "
+            "Install x11-apps on the test host."
+        )
+
+    # Host-side verification: dump the Xvfb framebuffer with xwd and parse a
+    # sample pixel with ImageMagick's "convert".  This isolates painting
+    # failures on the test host from capture/encode failures in the
+    # container — a useful split because the two surface identically at the
+    # browser end (all-black frame).
+    _assert_xvfb_is_red(XVFB_DISPLAY, proc, red_window)
+
     yield XVFB_DISPLAY
+
+    red_window.terminate()
+    try:
+        red_window.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        red_window.kill()
 
     proc.terminate()
     try:
@@ -104,7 +223,11 @@ def _container(xvfb_display):
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         # Host networking so GStreamer can reach coturn on 127.0.0.1.
-        .with_kwargs(network_mode="host")
+        # Host IPC namespace so ximagesrc's MIT-SHM requests can attach to
+        # SysV shared-memory segments created by the host Xvfb — without
+        # this, ximagesrc silently captures all-zero frames even though the
+        # X connection itself succeeds.
+        .with_kwargs(network_mode="host", ipc_mode="host")
     )
     with container:
         yield container

@@ -183,3 +183,92 @@ class TestWebRTCStream:
                 f"  container stdout:\n{stdout.decode(errors='replace')}\n"
                 f"  container stderr:\n{stderr.decode(errors='replace')}"
             )
+
+        # Sample decoded pixels from the <video> to prove the stream carries
+        # the red Xvfb root, not a black/empty placeholder.  Chroma subsampling
+        # and YUV<->RGB rounding in the codec shift pure red a few units, so
+        # thresholds allow ~20 % slack rather than requiring exactly (255,0,0).
+        #
+        # Poll with a wait loop because video.currentTime can advance on the
+        # first RTP packet before readyState reaches HAVE_CURRENT_DATA (2),
+        # and drawImage() on a video without a current frame leaves the canvas
+        # at its initial transparent-black state (returning avg RGB = 0,0,0
+        # with no exception).  The loop waits for readyState >= 2 and for the
+        # drawn canvas to contain non-zero pixels.
+        capture_script = """
+            const v = document.querySelector('video');
+            if (!v || !v.videoWidth || !v.videoHeight) {
+                return {stage: 'no-video-size',
+                        readyState: v ? v.readyState : -1};
+            }
+            if (v.readyState < 2) {
+                return {stage: 'not-ready',
+                        readyState: v.readyState,
+                        currentTime: v.currentTime};
+            }
+            const c = document.createElement('canvas');
+            c.width = v.videoWidth;
+            c.height = v.videoHeight;
+            const ctx = c.getContext('2d');
+            try {
+                ctx.drawImage(v, 0, 0, c.width, c.height);
+            } catch (e) {
+                return {stage: 'drawImage-error', error: String(e),
+                        readyState: v.readyState};
+            }
+            let data;
+            try {
+                data = ctx.getImageData(0, 0, c.width, c.height).data;
+            } catch (e) {
+                return {stage: 'getImageData-error', error: String(e)};
+            }
+            // Sample the first pixel and a center pixel separately so we can
+            // distinguish "drawImage didn't run" (canvas alpha = 0 everywhere)
+            // from "stream is genuinely solid black" (alpha = 255) in the
+            // failure message — the root-cause shape is very different.
+            const centerIdx = (Math.floor(c.height / 2) * c.width +
+                               Math.floor(c.width / 2)) * 4;
+            let r = 0, g = 0, b = 0, a = 0;
+            const n = data.length / 4;
+            for (let i = 0; i < data.length; i += 4) {
+                r += data[i]; g += data[i + 1];
+                b += data[i + 2]; a += data[i + 3];
+            }
+            return {
+                stage: 'ok',
+                width: c.width, height: c.height,
+                avgR: r / n, avgG: g / n, avgB: b / n, avgA: a / n,
+                firstPixel:  [data[0], data[1], data[2], data[3]],
+                centerPixel: [data[centerIdx], data[centerIdx + 1],
+                              data[centerIdx + 2], data[centerIdx + 3]],
+                readyState: v.readyState,
+                currentTime: v.currentTime,
+            };
+        """
+
+        def frame_is_red(stats):
+            return (
+                stats is not None
+                and stats.get("stage") == "ok"
+                and stats.get("avgR", 0) > 200
+                and stats.get("avgG", 255) < 60
+                and stats.get("avgB", 255) < 60
+            )
+
+        last_stats = {}
+
+        def red_frame_available(driver):
+            stats = driver.execute_script(capture_script)
+            last_stats.clear()
+            last_stats.update(stats or {})
+            return stats if frame_is_red(stats) else False
+
+        try:
+            WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(
+                red_frame_available
+            )
+        except Exception:
+            pytest.fail(
+                "Decoded WebRTC frame is not red.  Expected R>200, G<60, B<60 "
+                f"from the red Xvfb root. Last sample: {last_stats}"
+            )
