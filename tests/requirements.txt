@@ -1,0 +1,6 @@
+pytest>=8.0
+testcontainers>=4.8
+selenium>=4.20
+webdriver-manager>=4.0
+requests>=2.31
+websockets>=12.0

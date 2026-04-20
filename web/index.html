@@ -44,30 +44,54 @@
   <p id="status">Connecting to signalling server…</p>
   <video id="stream" autoplay playsinline></video>
 
-  <script type="module">
-    /**
-     * Desktop stream viewer
-     *
-     * Query parameters:
-     *   ?signalling=ws://host:8443   Override the signalling server URL.
-     *                                Defaults to ws://<this page's hostname>:8443
-     *   ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
-     *                                  browser and container are on different hosts.
-     *
-     * NOTE: The import path below references the gstwebrtc-api JS bundle built
-     * from gst-plugins-rs and served alongside this page.  If the filename in
-     * /var/www/html/gstwebrtc-api/ is different from gstwebrtc-api.js (check
-     * `ls` in the container after first build), update the import path.
-     *
-     * Production: replace the Python HTTP server with nginx/CDN and adjust the
-     * signalling URL via the ?signalling= query parameter.
-     */
-    import GstWebRTCAPI from './gstwebrtc-api/gstwebrtc-api.js';
+  <!--
+    The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
+    so it must be loaded as a classic script before the inline script runs.
 
-    const params  = new URLSearchParams(window.location.search);
-    const sigUrl  = params.get('signalling') ??
-                    `ws://${window.location.hostname}:8443`;
-    const stunUrl = params.get('stun');
+    Query parameters:
+      ?signalling=ws://host:8443   Override the signalling server URL.
+                                   Defaults to ws://<this page's hostname>:8443
+      ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
+                                     browser and container are on different hosts.
+  -->
+  <!--
+    GStreamer's webrtcbin uses ssrc-level MSID (a=ssrc:... msid:...) rather than
+    the Unified-Plan m-line-level attribute (a=msid:).  Chrome's Unified-Plan
+    RTCPeerConnection therefore fires ontrack with event.streams = [].
+    gstwebrtc-api checks event.streams[0] and silently returns when it's absent,
+    leaving video.srcObject unset even though the connection is fully established.
+
+    This shim patches RTCPeerConnection BEFORE gstwebrtc-api loads so that every
+    consumer peer connection also has a track listener that creates a MediaStream
+    directly from event.track when event.streams is empty.
+  -->
+  <script>
+    (function () {
+      var _OrigRPC = window.RTCPeerConnection;
+      function PatchedRPC(cfg) {
+        var pc = new _OrigRPC(cfg);
+        pc.addEventListener('track', function (e) {
+          var vid = document.getElementById('stream');
+          if (!vid || vid.srcObject) return;
+          vid.srcObject = (e.streams && e.streams.length > 0)
+            ? e.streams[0]
+            : new MediaStream([e.track]);
+        });
+        return pc;
+      }
+      PatchedRPC.prototype = _OrigRPC.prototype;
+      window.RTCPeerConnection = PatchedRPC;
+    })();
+  </script>
+  <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
+  <script>
+    const params   = new URLSearchParams(window.location.search);
+    const sigUrl   = params.get('signalling') ??
+                     `ws://${window.location.hostname}:8443`;
+    const stunUrl  = params.get('stun');
+    const turnUri  = params.get('turn_uri');
+    const turnUser = params.get('turn_user');
+    const turnCred = params.get('turn_cred');
 
     const video  = document.getElementById('stream');
     const status = document.getElementById('status');
@@ -79,18 +103,17 @@
 
     setStatus(`Connecting to ${sigUrl} …`);
 
-    // iceServers: empty means rely on direct host-network ICE candidates
-    // (works fine with --network=host or same-machine access).
-    // Set GST_WEBRTC_STUN_SERVER on the container side AND pass ?stun= on the
-    // browser side when crossing network boundaries.
-    const iceServers = stunUrl ? [{ urls: `stun:${stunUrl}` }] : [];
+    const iceServers = [];
+    if (stunUrl) iceServers.push({ urls: `stun:${stunUrl}` });
+    if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
 
     const api = new GstWebRTCAPI({
       signalingServerUrl: sigUrl,
-      iceServers,
+      // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
+      webrtcConfig: { iceServers },
     });
 
-    api.registerConsumerListener({
+    api.registerProducersListener({
       producerAdded(producer) {
         setStatus(`Producer found (${producer.id}) — starting stream…`);
 

@@ -89,9 +89,44 @@ RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
     && rm -rf /src/target /root/.cargo/registry /root/.rustup
 
 # ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
+# The rollup config may emit a code-split bundle (multiple .js files) or a
+# single self-contained file depending on the version.  Copy the entire output
+# directory so companion chunks are always available alongside the entry point.
 WORKDIR /src/net/webrtc/gstwebrtc-api
-RUN npm install && npm run build \
-    && echo "=== gstwebrtc-api dist ===" && ls -la dist/
+RUN npm install && npm run build && \
+    echo "=== all non-node_modules files after npm run build ===" && \
+    find /src/net/webrtc -not -path "*/node_modules/*" -type f | sort && \
+    OUTPUT_DIR="" && \
+    for candidate in dist build output out; do \
+        if [ -d "/src/net/webrtc/gstwebrtc-api/${candidate}" ]; then \
+            OUTPUT_DIR="/src/net/webrtc/gstwebrtc-api/${candidate}"; \
+            break; \
+        fi; \
+    done && \
+    if [ -z "${OUTPUT_DIR}" ]; then \
+        echo "ERROR: could not find dist/, build/, output/, or out/ directory" && exit 1; \
+    fi && \
+    echo "=== output directory: ${OUTPUT_DIR} ===" && \
+    ls -la "${OUTPUT_DIR}" && \
+    mkdir -p /opt/gstwebrtc-api && \
+    cp -r "${OUTPUT_DIR}/." /opt/gstwebrtc-api/ && \
+    echo "=== files in /opt/gstwebrtc-api ===" && \
+    ls -la /opt/gstwebrtc-api && \
+    ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "gstwebrtc-api*.js" \
+                 -not -name "*.js.map" 2>/dev/null | sort | head -1) && \
+    if [ -z "${ENTRY}" ]; then \
+        ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "*.js" \
+                     -not -name "*.js.map" 2>/dev/null | sort | head -1); \
+    fi && \
+    if [ -z "${ENTRY}" ]; then \
+        echo "ERROR: no JS entry point found in ${OUTPUT_DIR}" && exit 1; \
+    fi && \
+    if [ "$(basename "${ENTRY}")" != "gstwebrtc-api.js" ]; then \
+        ln -s "$(basename "${ENTRY}")" /opt/gstwebrtc-api/gstwebrtc-api.js && \
+        echo "Symlinked: $(basename "${ENTRY}") -> gstwebrtc-api.js"; \
+    else \
+        echo "Entry point: ${ENTRY}"; \
+    fi
 
 # ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
 # nvcodec provides NVIDIA hardware encoders (nvh264enc, nvh265enc) via NVENC
@@ -158,6 +193,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # Application runtime
         python3 \
         netcat-openbsd \
+        # Python GStreamer bindings — used by pipeline.py for TURN configuration
+        python3-gst-1.0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy all compiled GStreamer Rust plugins into the local plugin directory.
@@ -172,14 +209,16 @@ RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 COPY --from=builder /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
 RUN chmod +x /usr/local/bin/gst-webrtc-signalling-server
 
-# Copy the gstwebrtc-api browser-side JS library.
-COPY --from=builder /src/net/webrtc/gstwebrtc-api/dist/ /var/www/html/gstwebrtc-api/
+# Copy the gstwebrtc-api browser-side JS library (normalised to a stable name
+# by step G in the builder regardless of rollup's output filename).
+COPY --from=builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 
 # Copy web page and startup scripts.
 COPY web/index.html  /var/www/html/index.html
 COPY entrypoint.sh   /usr/local/bin/entrypoint.sh
 COPY pipeline.sh     /usr/local/bin/pipeline.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.sh
+COPY pipeline.py     /usr/local/bin/pipeline.py
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.sh /usr/local/bin/pipeline.py
 
 # ── Environment defaults (all overridable at runtime via -e) ──────────────────
 # GST_PLUGIN_PATH          : where GStreamer finds the Rust + nvcodec plugins
@@ -199,6 +238,7 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     SIGNALLING_PORT=8443 \
     WEB_PORT=8080 \
     GST_WEBRTC_STUN_SERVER="" \
+    GST_WEBRTC_TURN_SERVER="" \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=video,compute
 

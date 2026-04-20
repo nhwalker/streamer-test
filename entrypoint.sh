@@ -1,9 +1,13 @@
 #!/bin/bash
-# entrypoint.sh — starts three services in order, then hands off to the pipeline
+# entrypoint.sh — starts three services in order, then watches over all of them
 #
 #  1. gst-webrtc-signalling-server  (background, WebSocket :SIGNALLING_PORT)
 #  2. python3 -m http.server        (background, HTTP :WEB_PORT, serves web/)
-#  3. pipeline.sh                   (foreground via exec, GStreamer capture loop)
+#  3. pipeline.sh                   (background, GStreamer capture loop)
+#
+# All three run as background jobs so a GStreamer pipeline crash does not kill
+# the HTTP or signalling servers.  The main process waits for all jobs and
+# handles SIGTERM/SIGINT cleanly.
 #
 # All env vars have defaults set in the Dockerfile ENV block.
 set -euo pipefail
@@ -42,9 +46,11 @@ gst-webrtc-signalling-server \
     --host "${SIGNALLING_HOST}" \
     --port "${SIGNALLING_PORT}" &
 SIGPID=$!
+PIPPID=""
 
-# Clean up background processes on exit/interrupt
-trap 'echo "[entrypoint] Shutting down..."; kill "${SIGPID}" 2>/dev/null; exit' \
+# Kill all tracked background processes on exit/interrupt.
+# PIPPID may be empty until the pipeline block runs, so guard the kill.
+trap 'echo "[entrypoint] Shutting down..."; kill "${SIGPID}" 2>/dev/null; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; exit' \
      EXIT INT TERM
 
 # Readiness probe — wait up to 2 s for the signalling server to accept connections
@@ -66,6 +72,7 @@ echo "[entrypoint] Signalling server ready."
 # ── Web server ────────────────────────────────────────────────────────────────
 # Serves /var/www/html/ which contains index.html and gstwebrtc-api/.
 # Replace with nginx/CDN in production.
+echo "[entrypoint] gstwebrtc-api files: $(ls /var/www/html/gstwebrtc-api/ 2>/dev/null | tr '\n' ' ')"
 echo "[entrypoint] Starting web server on port ${WEB_PORT} ..."
 python3 -m http.server --directory /var/www/html "${WEB_PORT}" &
 
@@ -82,5 +89,13 @@ echo "│  Same host?  http://localhost:${WEB_PORT}           "
 echo "└─────────────────────────────────────────────────────┘"
 echo ""
 
-# ── GStreamer pipeline (replaces this shell; signals propagate cleanly) ───────
-exec /usr/local/bin/pipeline.sh
+# ── GStreamer pipeline ────────────────────────────────────────────────────────
+# pipeline.py is a Python wrapper around the same gst-launch pipeline that
+# also connects the webrtcbin-ready signal to configure a TURN server per
+# consumer — webrtcsink 0.13.x does not expose a turn-server property.
+python3 -u /usr/local/bin/pipeline.py &
+PIPPID=$!
+
+# Wait for all background jobs.  Returns when every job has exited, or when
+# the trap fires on SIGTERM/SIGINT and calls exit.
+wait

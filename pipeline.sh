@@ -51,6 +51,10 @@ if [ -n "${GST_WEBRTC_STUN_SERVER:-}" ]; then
     STUN_PROP="stun-server=${GST_WEBRTC_STUN_SERVER}"
 fi
 
+# NOTE: webrtcsink 0.13.x does not have a turn-server property.
+# TURN relay is configured browser-side via ?turn_uri/turn_user/turn_cred URL params.
+
+
 # ── GStreamer caps strings ────────────────────────────────────────────────────
 RATE_CAPS="video/x-raw,framerate=${STREAM_FRAMERATE}/1"
 SIZE_CAPS="video/x-raw,width=${STREAM_WIDTH},height=${STREAM_HEIGHT}"
@@ -76,9 +80,6 @@ echo "  Signalling : ws://127.0.0.1:${SIGNALLING_PORT}"
 # webrtcsink properties:
 #   signaller::uri   points at the standalone signalling server started by entrypoint.sh
 #   video-caps       constrains codec selection during SDP negotiation
-#   target-bitrate   initial / fixed bitrate (bits/s) when congestion-control=disabled
-#   congestion-control=disabled  use a fixed bitrate rather than GCC adaptive control;
-#                                remove this line to re-enable adaptive bitrate
 exec gst-launch-1.0 -e \
     ximagesrc display-name="${DISPLAY}" use-damage=false \
     ! videorate \
@@ -86,9 +87,8 @@ exec gst-launch-1.0 -e \
     ! videoscale \
     ! "${SIZE_CAPS}" \
     ! videoconvert \
+    ! queue \
     ! webrtcsink name=ws \
         "signaller::uri=ws://127.0.0.1:${SIGNALLING_PORT}" \
         "video-caps=${VIDEO_CAPS}" \
-        "target-bitrate=${BITRATE}" \
-        congestion-control=disabled \
         ${STUN_PROP}
