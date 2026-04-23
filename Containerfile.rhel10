@@ -51,7 +51,7 @@ RUN dnf install -y \
         gcc gcc-c++ make \
         pkgconf-pkg-config \
         git curl ca-certificates \
-        meson ninja-build \
+        meson ninja-build cmake \
         python3 \
         # GStreamer development headers (core + all plugin sets)
         gstreamer1-devel \
@@ -70,10 +70,19 @@ RUN dnf install -y \
         # RHEL10's gstreamer1-plugins-bad-free is compiled without it because
         # libsrtp is not in the base RHEL10 repos, so webrtcbin silently fails.
         libsrtp-devel \
-        # usrsctp — required by GStreamer's sctp plugin (WebRTC data channels);
-        # webrtcbin hard-depends on sctp when built from source with -Dwebrtc=enabled.
-        usrsctp-devel \
     && dnf clean all
+
+# ── A2: Build usrsctp from source ────────────────────────────────────────────
+# usrsctp is not packaged in EPEL10 or Rocky 10.  Build it as a static library
+# so the sctp plugin DSO links it in; no shared library needed at runtime.
+RUN git clone --depth 1 https://github.com/sctplab/usrsctp.git /usrsctp-src \
+    && cmake -S /usrsctp-src -B /usrsctp-src/build \
+             -DCMAKE_INSTALL_PREFIX=/usr \
+             -Dsctp_build_shared_lib=OFF \
+             -Dsctp_werror=OFF \
+    && cmake --build /usrsctp-src/build --parallel 2 \
+    && cmake --install /usrsctp-src/build \
+    && rm -rf /usrsctp-src
 
 # ── B: Rust toolchain ────────────────────────────────────────────────────────
 # Rustup gives us the latest stable, sidestepping any MSRV gap between RHEL10's
@@ -259,7 +268,6 @@ RUN dnf install -y \
         openssl-libs \
         libnice \
         libsrtp \
-        usrsctp \
         libsodium \
         zvbi \
         libwebp \
