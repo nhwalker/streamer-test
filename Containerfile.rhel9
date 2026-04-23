@@ -1,13 +1,11 @@
 # ─── Build Stage ─────────────────────────────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
 
-# ── Repos: CRB + EPEL9 ────────────────────────────────────────────────────────
-# ubi-9-codeready-builder is pre-configured in UBI9 but disabled; it carries
-# devel packages missing from the base AppStream (e.g. gtk4-devel).
+# ── Repos: EPEL9 ─────────────────────────────────────────────────────────────
+# UBI9 ships with the CodeReady Builder subset repo already enabled, providing
+# devel packages not in the base AppStream (e.g. gtk4-devel).
 # EPEL9 supplies additional libraries: dav1d, libsodium, zvbi, …
-RUN dnf install -y dnf-plugins-core \
-    && dnf config-manager --enable ubi-9-codeready-builder \
-    && dnf install -y \
+RUN dnf install -y \
         https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
     && dnf clean all
 
@@ -156,12 +154,11 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/ubi:latest
 
-# ── Repos: CRB + EPEL9 + RPM Fusion Free ─────────────────────────────────────
+# ── Repos: EPEL9 + RPM Fusion Free ───────────────────────────────────────────
+# UBI9's CodeReady Builder repo is already enabled in the base image.
 # RPM Fusion Free provides gstreamer1-plugins-ugly (x264, mp3) and
 # gstreamer1-plugin-libav (FFmpeg codec suite), unavailable in RHEL9/EPEL.
-RUN dnf install -y dnf-plugins-core \
-    && dnf config-manager --enable ubi-9-codeready-builder \
-    && dnf install -y \
+RUN dnf install -y \
         https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
         https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm \
     && dnf clean all
