@@ -1,12 +1,14 @@
 # ─── Build Stage ─────────────────────────────────────────────────────────────
-FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
+# AlmaLinux 9 is binary-compatible with RHEL9 and carries the full package set
+# (AppStream + CRB + EPEL) without a subscription.  Only compiled artifacts are
+# copied to the UBI9 runtime image, so the final deployed image is still UBI9.
+FROM almalinux:9 AS builder
 
-# ── Repos: EPEL9 ─────────────────────────────────────────────────────────────
-# UBI9 ships with the CodeReady Builder subset repo already enabled, providing
-# devel packages not in the base AppStream (e.g. gtk4-devel).
-# EPEL9 supplies additional libraries: dav1d, libsodium, zvbi, …
-RUN dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+# ── Repos: CRB + EPEL9 ────────────────────────────────────────────────────────
+# CRB (CodeReady Builder) carries devel packages absent from the base AppStream
+# (e.g. gtk4-devel).  EPEL9 adds further libraries: dav1d, libsodium, zvbi, …
+RUN dnf install -y epel-release \
+    && dnf config-manager --enable crb \
     && dnf clean all
 
 # ── A: OS build dependencies ─────────────────────────────────────────────────
