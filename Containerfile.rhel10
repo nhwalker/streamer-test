@@ -6,8 +6,8 @@ FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 # Rocky Linux 10 mirrors the full RHEL10 package set (BaseOS, AppStream, CRB)
 # and is added here at priority=100 so UBI-provided packages always win; Rocky
 # only fills in packages absent from the UBI repos (e.g. *-devel headers, gtk4).
-# EPEL10 supplies libraries not in RHEL10 or Rocky CRB: libnice, dav1d,
-# libsodium, zvbi, …
+# EPEL10 supplies libraries not in RHEL10 or Rocky CRB: libnice,
+# libsodium, zvbi, … (dav1d is not yet in EPEL10; its Rust plugin is skipped).
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && printf '%s\n' \
         '[rocky10-baseos]' \
@@ -58,7 +58,6 @@ RUN dnf install -y \
         # Optional library deps — each enables additional Rust plugin packages
         openssl-devel \
         libnice-devel \
-        dav1d-devel \
         libsodium-devel \
         zvbi-devel \
         libwebp-devel \
@@ -186,7 +185,7 @@ FROM registry.access.redhat.com/ubi10/ubi:latest
 
 # ── Repos: Rocky Linux 10 supplement + EPEL10 + RPM Fusion Free ─────────────
 # Same Rocky 10 supplement as the builder (priority=100, UBI repos win at 99).
-# EPEL10 provides libnice, dav1d, libsodium, zvbi (not in RHEL10/Rocky CRB).
+# EPEL10 provides libnice, libsodium, zvbi (not in RHEL10/Rocky CRB).
 # RPM Fusion Free for EL10 provides gstreamer1-plugins-ugly (x264, mp3) and
 # gstreamer1-plugin-libav (FFmpeg codec suite), unavailable in RHEL10/Rocky.
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
@@ -236,7 +235,6 @@ RUN dnf install -y \
         # Runtime libs required by the compiled GStreamer Rust plugins
         openssl-libs \
         libnice \
-        dav1d \
         libsodium \
         zvbi \
         libwebp \
