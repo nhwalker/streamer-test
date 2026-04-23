@@ -70,6 +70,9 @@ RUN dnf install -y \
         # RHEL10's gstreamer1-plugins-bad-free is compiled without it because
         # libsrtp is not in the base RHEL10 repos, so webrtcbin silently fails.
         libsrtp-devel \
+        # usrsctp — required by GStreamer's sctp plugin (WebRTC data channels);
+        # webrtcbin hard-depends on sctp when built from source with -Dwebrtc=enabled.
+        usrsctp-devel \
     && dnf clean all
 
 # ── B: Rust toolchain ────────────────────────────────────────────────────────
@@ -188,6 +191,7 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            -Dnvcodec=enabled \
            -Dwebrtc=enabled \
            -Ddtls=enabled \
+           -Dsctp=enabled \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
     && echo "=== nvcodec + webrtcbin artifacts ===" \
@@ -255,6 +259,7 @@ RUN dnf install -y \
         openssl-libs \
         libnice \
         libsrtp \
+        usrsctp \
         libsodium \
         zvbi \
         libwebp \
