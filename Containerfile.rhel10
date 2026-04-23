@@ -288,17 +288,32 @@ COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/loc
 COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 
-# Replace the system webrtcbin/dtls/sctp/srtp plugins with our source-built
-# versions.  RHEL10's gstreamer1-plugins-bad-free was compiled without libnice
-# (EPEL10-only), so the webrtcbin plugin has #ifdef HAVE_NICE guards that
-# prevent ICE backend creation entirely — gst_webrtc_nice_new() is never
-# called.  Our meson build was compiled WITH EPEL10 libnice, so ICE works.
-# We also replace the companion lib so runtime symbol resolution is consistent.
+# Replace system webrtcbin/dtls/sctp/srtp plugins and companion libs with our
+# meson-built versions.
+#
+# Why plugins:   RHEL10's gstreamer1-plugins-bad-free was compiled without
+#                libnice (EPEL10-only), so its webrtcbin has #ifdef HAVE_NICE
+#                guards and never calls gst_webrtc_nice_new().  Our build has
+#                ICE support.
+#
+# Why libgstwebrtc-1.0.so*:
+#                Our webrtcbin plugin links against this companion lib.  We
+#                must provide our version (with libnice ICE impl) so symbol
+#                resolution is consistent.
+#
+# Why libgstsctp-1.0.so*:
+#                Our webrtcbin plugin was compiled with SCTP data channel
+#                support and links against libgstsctp-1.0.so.0.  RHEL10's
+#                gstreamer1-plugins-bad-free was built without usrsctp, so its
+#                libgstsctp-1.0.so.0 either doesn't exist or is missing the
+#                gst_sctp_association_* symbols our plugin needs.  Copying our
+#                version (with usrsctp statically linked in) satisfies the dep.
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so   /usr/lib64/gstreamer-1.0/libgstdtls.so
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so   /usr/lib64/gstreamer-1.0/libgstsctp.so
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so   /usr/lib64/gstreamer-1.0/libgstsrtp.so
 COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so* /usr/lib64/
+COPY --from=builder /opt/gst-nvcodec/lib/libgstsctp-1.0.so*   /usr/lib64/
 RUN ldconfig
 
 # Copy the WebRTC signalling server binary.
