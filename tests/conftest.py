@@ -29,8 +29,19 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Allow CI to override the image name; default matches the docker build step.
+# Allow CI to override the image(s) under test.
+# TEST_IMAGES (comma-separated) takes precedence; falls back to TEST_IMAGE for
+# single-image runs.  The container_image fixture is parametrized over this
+# list so every test runs against each image in sequence.
 TEST_IMAGE = os.environ.get("TEST_IMAGE", "streamer-test:ci")
+
+
+def _get_test_images():
+    images_env = os.environ.get("TEST_IMAGES", "").strip()
+    if images_env:
+        return [img.strip() for img in images_env.split(",") if img.strip()]
+    return [TEST_IMAGE]
+
 
 XVFB_DISPLAY = ":99"
 XVFB_GEOMETRY = "1280x720x24"
@@ -201,8 +212,14 @@ def xvfb_display():
         proc.kill()
 
 
+@pytest.fixture(scope="session", params=_get_test_images())
+def container_image(request):
+    """Docker image under test; parametrized over TEST_IMAGES or TEST_IMAGE."""
+    return request.param
+
+
 @pytest.fixture(scope="session")
-def _container(xvfb_display):
+def _container(xvfb_display, container_image):
     """
     Raw DockerContainer object, kept alive for the whole test session.
 
@@ -210,12 +227,15 @@ def _container(xvfb_display):
     both use 127.0.0.1 ICE candidates, eliminating Docker-bridge ICE
     connectivity failures in CI.
 
+    Parametrized through container_image so the full test suite runs once
+    per image when multiple images are listed in TEST_IMAGES.
+
     Exposed separately from streaming_container so tests that need to
     inspect container logs on failure can request this fixture directly
     without changing the streaming_container API.
     """
     container = (
-        DockerContainer(TEST_IMAGE)
+        DockerContainer(container_image)
         .with_env("DISPLAY", xvfb_display)
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")

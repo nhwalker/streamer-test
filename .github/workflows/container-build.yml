@@ -18,6 +18,19 @@ jobs:
       contents: read
       packages: write
 
+    strategy:
+      matrix:
+        variant: [ubuntu, rhel9]
+        include:
+          - variant: ubuntu
+            containerfile: Containerfile
+            artifact: container-image-ubuntu
+            ci_tag: streamer-test:ci-ubuntu
+          - variant: rhel9
+            containerfile: Containerfile.rhel9
+            artifact: container-image-rhel9
+            ci_tag: streamer-test:ci-rhel9
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +40,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-${{ matrix.variant }},onlatest=true
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -49,19 +64,19 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Containerfile
+          file: ${{ matrix.containerfile }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           push: ${{ github.event_name != 'pull_request' }}
-          outputs: type=docker,dest=/tmp/streamer-test.tar
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/streamer-test-${{ matrix.variant }}.tar
+          cache-from: type=gha,scope=buildcache-${{ matrix.variant }}
+          cache-to: type=gha,scope=buildcache-${{ matrix.variant }},mode=max
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: container-image
-          path: /tmp/streamer-test.tar
+          name: ${{ matrix.artifact }}
+          path: /tmp/streamer-test-${{ matrix.variant }}.tar
           retention-days: 1
 
   test:
@@ -93,16 +108,22 @@ jobs:
       - name: Install Python test dependencies
         run: pip install -r tests/requirements.txt
 
-      - name: Download image artifact
+      - name: Download image artifacts
         uses: actions/download-artifact@v4
         with:
-          name: container-image
-          path: /tmp
+          pattern: container-image-*
+          path: /tmp/artifacts
+          merge-multiple: false
 
-      - name: Load image into Docker
+      - name: Load images into Docker
         run: |
-          IMAGE=$(docker load -i /tmp/streamer-test.tar | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${IMAGE}" streamer-test:ci
+          IMAGE=$(docker load -i /tmp/artifacts/container-image-ubuntu/streamer-test-ubuntu.tar \
+                  | grep "Loaded image:" | head -1 | awk '{print $NF}')
+          docker tag "${IMAGE}" streamer-test:ci-ubuntu
+
+          IMAGE=$(docker load -i /tmp/artifacts/container-image-rhel9/streamer-test-rhel9.tar \
+                  | grep "Loaded image:" | head -1 | awk '{print $NF}')
+          docker tag "${IMAGE}" streamer-test:ci-rhel9
 
       - name: Start local TURN relay
         run: |
@@ -130,7 +151,9 @@ jobs:
 
       - name: Run integration tests
         env:
-          TEST_IMAGE: streamer-test:ci
+          # Comma-separated list: conftest.py parametrizes the container fixture
+          # over every image so each test runs against both containers in sequence.
+          TEST_IMAGES: "streamer-test:ci-ubuntu,streamer-test:ci-rhel9"
           # GStreamer side: pipeline.py passes this to webrtcbin via add-turn-server
           GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
           # Browser side: index.html reads these from URL params
