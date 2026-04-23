@@ -243,7 +243,7 @@ RUN dnf install -y \
         python3 \
         nmap-ncat \
         # Python GStreamer bindings — used by pipeline.py for TURN configuration
-        python3-gobject3 \
+        python3-gobject \
     && dnf clean all
 
 # Copy all compiled GStreamer Rust plugins into the local plugin directory.
