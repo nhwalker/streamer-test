@@ -6,6 +6,8 @@ FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 # Rocky Linux 10 mirrors the full RHEL10 package set (BaseOS, AppStream, CRB)
 # and is added here at priority=100 so UBI-provided packages always win; Rocky
 # only fills in packages absent from the UBI repos (e.g. *-devel headers, gtk4).
+# EPEL10 supplies libraries not in RHEL10 or Rocky CRB: libnice, dav1d,
+# libsodium, zvbi, …
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && printf '%s\n' \
         '[rocky10-baseos]' \
@@ -31,7 +33,10 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
         'priority=100' \
-        > /etc/yum.repos.d/rocky10-supplement.repo
+        > /etc/yum.repos.d/rocky10-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+    && dnf clean all
 
 # ── A: OS build dependencies ─────────────────────────────────────────────────
 # GStreamer dev headers, optional library deps for as many gst-plugins-rs
@@ -179,8 +184,9 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
 FROM registry.access.redhat.com/ubi10/ubi:latest
 
-# ── Repos: Rocky Linux 10 supplement + RPM Fusion Free ───────────────────────
+# ── Repos: Rocky Linux 10 supplement + EPEL10 + RPM Fusion Free ─────────────
 # Same Rocky 10 supplement as the builder (priority=100, UBI repos win at 99).
+# EPEL10 provides libnice, dav1d, libsodium, zvbi (not in RHEL10/Rocky CRB).
 # RPM Fusion Free for EL10 provides gstreamer1-plugins-ugly (x264, mp3) and
 # gstreamer1-plugin-libav (FFmpeg codec suite), unavailable in RHEL10/Rocky.
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
@@ -210,6 +216,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'priority=100' \
         > /etc/yum.repos.d/rocky10-supplement.repo \
     && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
         https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
     && dnf clean all
 
