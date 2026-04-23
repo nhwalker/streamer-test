@@ -283,23 +283,24 @@ RUN dnf install -y \
 # Copy all compiled GStreamer Rust plugins into the local plugin directory.
 COPY --from=builder /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 
-# Copy the nvcodec + webrtcbin/dtls/sctp/srtp plugins.
-# Only copy libgstcuda-1.0.so* from the top-level lib dir; do NOT copy other
-# libgst*.so* (libgstwebrtc-1.0, libgstbadbase-1.0, etc.) because those were
-# compiled with -Dauto_features=disabled and may be missing symbols that the
-# Rust plugins (built against the system full-feature versions) expect.  Our
-# custom plugin .so files link against the system companion libs, which are the
-# same GStreamer version and fully ABI-compatible.
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
+# nvcodec: no system equivalent — goes to the custom plugin dir.
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
 COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig \
-    # Remove the system-installed webrtcbin/dtls/sctp/srtp plugins so GStreamer
-    # cannot accidentally load the RHEL10 versions compiled without libsrtp2.
-    && rm -f \
-        /usr/lib64/gstreamer-1.0/libgstwebrtc.so \
-        /usr/lib64/gstreamer-1.0/libgstdtls.so \
-        /usr/lib64/gstreamer-1.0/libgstsctp.so \
-        /usr/lib64/gstreamer-1.0/libgstsrtp.so
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
+
+# Replace the system dtls/sctp/srtp plugins with our source-built versions that
+# link against libsrtp2.  These are placed directly into the system plugin dir
+# so they are picked up by the system webrtcbin unconditionally.
+#
+# The system webrtcbin plugin is intentionally NOT replaced.  It was compiled
+# against the same system headers as the Rust webrtcsink (gst-plugins-rs), so
+# it is ABI-compatible and does not hang during negotiation.  webrtcbin itself
+# does not call libsrtp directly; it delegates to dtlssrtpenc (dtls plugin) and
+# srtpenc/srtpdec (srtp plugin) via gst_element_factory_make at runtime — so
+# replacing only those two sub-plugins is sufficient to enable DTLS-SRTP.
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so /usr/lib64/gstreamer-1.0/libgstdtls.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so /usr/lib64/gstreamer-1.0/libgstsctp.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so /usr/lib64/gstreamer-1.0/libgstsrtp.so
 
 # Copy the WebRTC signalling server binary.
 COPY --from=builder /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
