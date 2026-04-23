@@ -66,6 +66,10 @@ RUN dnf install -y \
         zvbi-devel \
         libwebp-devel \
         gtk4-devel \
+        # libsrtp2 — required to build a functional webrtcbin (DTLS-SRTP);
+        # RHEL10's gstreamer1-plugins-bad-free is compiled without it because
+        # libsrtp is not in the base RHEL10 repos, so webrtcbin silently fails.
+        libsrtp-devel \
     && dnf clean all
 
 # ── B: Rust toolchain ────────────────────────────────────────────────────────
@@ -162,14 +166,18 @@ RUN npm install && npm run build && \
         echo "Entry point: ${ENTRY}"; \
     fi
 
-# ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
-# nvcodec provides NVIDIA hardware encoders (nvh264enc, nvh265enc) via NVENC
-# and decoders via NVDEC.  It uses dlopen for all NVIDIA libs, so it compiles
-# without the NVIDIA SDK.  At runtime, nvidia-container-toolkit injects the
-# driver libs when the container is started with --gpus.
+# ── H: Build nvcodec + webrtcbin from the GStreamer monorepo ─────────────────
+# nvcodec: NVIDIA hardware encoders (nvh264enc, nvh265enc via NVENC/NVDEC).
+#   Uses dlopen for all NVIDIA libs; nvidia-container-toolkit injects them at
+#   runtime when the container is started with --gpus.
+# webrtcbin: RHEL10's gstreamer1-plugins-bad-free is compiled without libsrtp2
+#   (libsrtp is not in the base RHEL10 repos so Red Hat builds it disabled).
+#   Without DTLS-SRTP, webrtcbin cannot complete ICE negotiation and webrtcsink
+#   silently drops every incoming session.  Building from source with
+#   -Dwebrtc=enabled ensures libnice + libsrtp2 are linked in.
 WORKDIR /
 RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
-    && echo "=== Building nvcodec plugin for GStreamer ${GST_VER} ===" \
+    && echo "=== Building nvcodec + webrtcbin for GStreamer ${GST_VER} ===" \
     && git clone --depth 1 --branch "${GST_VER}" \
            https://gitlab.freedesktop.org/gstreamer/gstreamer.git /gst-src \
     && cd /gst-src/subprojects/gst-plugins-bad \
@@ -178,9 +186,10 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            --libdir=lib \
            -Dauto_features=disabled \
            -Dnvcodec=enabled \
+           -Dwebrtc=enabled \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
-    && echo "=== nvcodec artifacts ===" \
+    && echo "=== nvcodec + webrtcbin artifacts ===" \
     && find /opt/gst-nvcodec -name "*.so*" | sort
 
 
@@ -230,7 +239,8 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
 # ── GStreamer core + all available plugin packages ────────────────────────────
 # gstreamer1-plugins-base   : alsa, ogg, vorbis, theora, opus, playback, ...
 # gstreamer1-plugins-good   : alaw/mulaw, flac, jpeg, png, rtp, v4l2, ...
-# gstreamer1-plugins-bad-free : webrtcbin, dashdemux, hls, mxf, vaapi, ...
+# gstreamer1-plugins-bad-free : dashdemux, hls, mxf, vaapi, ... (webrtcbin
+#                               replaced by the source-built version from step H)
 # gstreamer1-plugins-ugly   : x264, mp3, aac (RPM Fusion Free)
 # gstreamer1-plugin-libav   : full FFmpeg codec suite (RPM Fusion Free)
 RUN dnf install -y \
@@ -243,6 +253,7 @@ RUN dnf install -y \
         # Runtime libs required by the compiled GStreamer Rust plugins
         openssl-libs \
         libnice \
+        libsrtp \
         libsodium \
         zvbi \
         libwebp \
