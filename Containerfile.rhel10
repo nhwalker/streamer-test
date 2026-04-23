@@ -268,6 +268,12 @@ RUN dnf install -y \
         # Runtime libs required by the compiled GStreamer Rust plugins
         openssl-libs \
         libnice \
+        # libnice-gstreamer1 (EPEL10) provides /usr/lib64/gstreamer-1.0/
+        # libgstnice.so, which registers the `nicesrc` and `nicesink` elements.
+        # webrtcbin's _have_nice_elements() refuses to create any sink pad if
+        # those elements are not in the GStreamer registry — without this
+        # package webrtcsink fails with "Failed to request pad from webrtcbin".
+        libnice-gstreamer1 \
         libsrtp \
         libsodium \
         zvbi \
