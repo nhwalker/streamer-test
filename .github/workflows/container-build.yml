@@ -20,16 +20,16 @@ jobs:
 
     strategy:
       matrix:
-        variant: [ubuntu, rhel9]
+        variant: [ubuntu, rhel10]
         include:
           - variant: ubuntu
             containerfile: Containerfile
             artifact: container-image-ubuntu
             ci_tag: streamer-test:ci-ubuntu
-          - variant: rhel9
-            containerfile: Containerfile.rhel9
-            artifact: container-image-rhel9
-            ci_tag: streamer-test:ci-rhel9
+          - variant: rhel10
+            containerfile: Containerfile.rhel10
+            artifact: container-image-rhel10
+            ci_tag: streamer-test:ci-rhel10
 
     steps:
       - name: Checkout
@@ -121,9 +121,9 @@ jobs:
                   | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${IMAGE}" streamer-test:ci-ubuntu
 
-          IMAGE=$(docker load -i /tmp/artifacts/container-image-rhel9/streamer-test-rhel9.tar \
+          IMAGE=$(docker load -i /tmp/artifacts/container-image-rhel10/streamer-test-rhel10.tar \
                   | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${IMAGE}" streamer-test:ci-rhel9
+          docker tag "${IMAGE}" streamer-test:ci-rhel10
 
       - name: Start local TURN relay
         run: |
@@ -153,7 +153,7 @@ jobs:
         env:
           # Comma-separated list: conftest.py parametrizes the container fixture
           # over every image so each test runs against both containers in sequence.
-          TEST_IMAGES: "streamer-test:ci-ubuntu,streamer-test:ci-rhel9"
+          TEST_IMAGES: "streamer-test:ci-ubuntu,streamer-test:ci-rhel10"
           # GStreamer side: pipeline.py passes this to webrtcbin via add-turn-server
           GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
           # Browser side: index.html reads these from URL params
