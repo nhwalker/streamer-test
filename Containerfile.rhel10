@@ -187,6 +187,7 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            -Dauto_features=disabled \
            -Dnvcodec=enabled \
            -Dwebrtc=enabled \
+           -Ddtls=enabled \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
     && echo "=== nvcodec + webrtcbin artifacts ===" \
