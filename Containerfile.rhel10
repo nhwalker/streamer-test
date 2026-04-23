@@ -9,6 +9,7 @@ FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 # EPEL10 supplies libraries not in RHEL10 or Rocky CRB: libnice,
 # libsodium, zvbi, … (dav1d is not yet in EPEL10; its Rust plugin is skipped).
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
     && printf '%s\n' \
         '[rocky10-baseos]' \
         'name=Rocky Linux 10 - BaseOS' \
@@ -16,6 +17,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
         'priority=100' \
         '' \
         '[rocky10-appstream]' \
@@ -24,6 +26,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
         'priority=100' \
         '' \
         '[rocky10-crb]' \
@@ -32,6 +35,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
         'priority=100' \
         > /etc/yum.repos.d/rocky10-supplement.repo \
     && dnf install -y \
@@ -189,6 +193,7 @@ FROM registry.access.redhat.com/ubi10/ubi:latest
 # RPM Fusion Free for EL10 provides gstreamer1-plugins-ugly (x264, mp3) and
 # gstreamer1-plugin-libav (FFmpeg codec suite), unavailable in RHEL10/Rocky.
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
     && printf '%s\n' \
         '[rocky10-baseos]' \
         'name=Rocky Linux 10 - BaseOS' \
@@ -196,6 +201,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
         'priority=100' \
         '' \
         '[rocky10-appstream]' \
@@ -204,6 +210,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
         'priority=100' \
         '' \
         '[rocky10-crb]' \
@@ -212,6 +219,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
         'priority=100' \
         > /etc/yum.repos.d/rocky10-supplement.repo \
     && dnf install -y \
