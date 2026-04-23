@@ -302,6 +302,12 @@ COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so /usr/lib64/
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so /usr/lib64/gstreamer-1.0/libgstsctp.so
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so /usr/lib64/gstreamer-1.0/libgstsrtp.so
 
+# Overwrite the system libgstwebrtc-1.0.so.0 with our meson-built version which
+# was compiled against EPEL10 libnice.  The RHEL10 package omits libnice (EPEL10-
+# only), so gst_webrtc_ice_new() returns NULL and webrtcbin has no ICE backend.
+COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so* /usr/lib64/
+RUN ldconfig
+
 # Copy the WebRTC signalling server binary.
 COPY --from=builder /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
 RUN chmod +x /usr/local/bin/gst-webrtc-signalling-server
