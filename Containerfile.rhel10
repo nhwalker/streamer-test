@@ -199,6 +199,7 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            -Dauto_features=disabled \
            -Dnvcodec=enabled \
            -Dwebrtc=enabled \
+           -Dwebrtcnice=enabled \
            -Ddtls=enabled \
            -Dsctp=enabled \
            -Dsrtp=enabled \
@@ -308,10 +309,11 @@ RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 #                libgstsctp-1.0.so.0 either doesn't exist or is missing the
 #                gst_sctp_association_* symbols our plugin needs.  Copying our
 #                version (with usrsctp statically linked in) satisfies the dep.
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so   /usr/lib64/gstreamer-1.0/libgstdtls.so
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so   /usr/lib64/gstreamer-1.0/libgstsctp.so
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so   /usr/lib64/gstreamer-1.0/libgstsrtp.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so     /usr/lib64/gstreamer-1.0/libgstwebrtc.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtcnice.so /usr/lib64/gstreamer-1.0/libgstwebrtcnice.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so       /usr/lib64/gstreamer-1.0/libgstdtls.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so       /usr/lib64/gstreamer-1.0/libgstsctp.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so       /usr/lib64/gstreamer-1.0/libgstsrtp.so
 COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so* /usr/lib64/
 COPY --from=builder /opt/gst-nvcodec/lib/libgstsctp-1.0.so*   /usr/lib64/
 RUN ldconfig
