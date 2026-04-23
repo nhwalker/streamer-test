@@ -283,15 +283,18 @@ RUN dnf install -y \
 # Copy all compiled GStreamer Rust plugins into the local plugin directory.
 COPY --from=builder /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 
-# Copy the nvcodec + webrtcbin/dtls/sctp/srtp plugins and all companion shared
-# libraries from the meson build (libgstcuda-1.0, libgstwebrtc-1.0, etc.).
+# Copy the nvcodec + webrtcbin/dtls/sctp/srtp plugins.
+# Only copy libgstcuda-1.0.so* from the top-level lib dir; do NOT copy other
+# libgst*.so* (libgstwebrtc-1.0, libgstbadbase-1.0, etc.) because those were
+# compiled with -Dauto_features=disabled and may be missing symbols that the
+# Rust plugins (built against the system full-feature versions) expect.  Our
+# custom plugin .so files link against the system companion libs, which are the
+# same GStreamer version and fully ABI-compatible.
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
-COPY --from=builder /opt/gst-nvcodec/lib/libgst*.so* /usr/local/lib/
+COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig \
     # Remove the system-installed webrtcbin/dtls/sctp/srtp plugins so GStreamer
-    # cannot accidentally load the RHEL10 versions that were compiled without
-    # libsrtp2.  Our custom-built replacements in /usr/local/lib/gstreamer-1.0/
-    # have full DTLS-SRTP support.
+    # cannot accidentally load the RHEL10 versions compiled without libsrtp2.
     && rm -f \
         /usr/lib64/gstreamer-1.0/libgstwebrtc.so \
         /usr/lib64/gstreamer-1.0/libgstdtls.so \
