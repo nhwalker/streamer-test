@@ -199,7 +199,6 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            -Dauto_features=disabled \
            -Dnvcodec=enabled \
            -Dwebrtc=enabled \
-           -Dwebrtcnice=enabled \
            -Ddtls=enabled \
            -Dsctp=enabled \
            -Dsrtp=enabled \
