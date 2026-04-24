@@ -42,7 +42,7 @@
 </head>
 <body>
   <p id="status">Connecting to signalling server…</p>
-  <video id="stream" autoplay playsinline></video>
+  <video id="stream" autoplay playsinline muted></video>
 
   <!--
     The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
@@ -76,9 +76,11 @@
           vid.srcObject = (e.streams && e.streams.length > 0)
             ? e.streams[0]
             : new MediaStream([e.track]);
-          // Chrome sometimes does not honor the `autoplay` attribute when
-          // srcObject is assigned outside a user-gesture turn, leaving the
-          // video paused even though frames are decoding.  Force it.
+          // Chrome's autoplay policy rejects play() without a user gesture
+          // unless the element is muted.  The stream has no audio track so
+          // muting is harmless; belt-and-suspenders in case the attribute
+          // was stripped or overridden.
+          vid.muted = true;
           var p = vid.play();
           if (p && typeof p.catch === 'function') {
             p.catch(function (err) {
