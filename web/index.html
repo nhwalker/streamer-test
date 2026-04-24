@@ -76,6 +76,15 @@
           vid.srcObject = (e.streams && e.streams.length > 0)
             ? e.streams[0]
             : new MediaStream([e.track]);
+          // Chrome sometimes does not honor the `autoplay` attribute when
+          // srcObject is assigned outside a user-gesture turn, leaving the
+          // video paused even though frames are decoding.  Force it.
+          var p = vid.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(function (err) {
+              console.warn('[stream] video.play() rejected:', err);
+            });
+          }
         });
         return pc;
       }
@@ -134,9 +143,13 @@
           video.srcObject = null;
         });
 
-        video.addEventListener('playing', () => {
-          status.className = 'hidden';
-        }, { once: true });
+        const hideBanner = () => { status.className = 'hidden'; };
+        if (!video.paused && video.videoWidth > 0) {
+          hideBanner();
+        } else {
+          video.addEventListener('playing', hideBanner, { once: true });
+          video.addEventListener('loadeddata', hideBanner, { once: true });
+        }
 
         session.connect();
       },
