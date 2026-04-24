@@ -42,7 +42,7 @@
 </head>
 <body>
   <p id="status">Connecting to signalling server…</p>
-  <video id="stream" autoplay playsinline></video>
+  <video id="stream" autoplay playsinline muted></video>
 
   <!--
     The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
@@ -76,6 +76,17 @@
           vid.srcObject = (e.streams && e.streams.length > 0)
             ? e.streams[0]
             : new MediaStream([e.track]);
+          // Chrome's autoplay policy rejects play() without a user gesture
+          // unless the element is muted.  The stream has no audio track so
+          // muting is harmless; belt-and-suspenders in case the attribute
+          // was stripped or overridden.
+          vid.muted = true;
+          var p = vid.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(function (err) {
+              console.warn('[stream] video.play() rejected:', err);
+            });
+          }
         });
         return pc;
       }
@@ -134,9 +145,13 @@
           video.srcObject = null;
         });
 
-        video.addEventListener('playing', () => {
-          status.className = 'hidden';
-        }, { once: true });
+        const hideBanner = () => { status.className = 'hidden'; };
+        if (!video.paused && video.videoWidth > 0) {
+          hideBanner();
+        } else {
+          video.addEventListener('playing', hideBanner, { once: true });
+          video.addEventListener('loadeddata', hideBanner, { once: true });
+        }
 
         session.connect();
       },
