@@ -2,7 +2,7 @@
 """
 pipeline.py -- desktop-stream-service: SRT ingress -> tee -> archive + WebRTC.
 
-srtsrc mode=caller -> tsdemux -> h264parse -> tee
+srtsrc mode=caller -> typefind -> h264parse -> tee
   tee. -> splitmuxsink mp4mux                    (archive, H.264 passthrough)
   tee. -> <nvh264dec|avdec_h264> -> webrtcsink   (decode once, per-peer encode)
 
@@ -104,13 +104,13 @@ def main():
 
     desc = (
         f'srtsrc uri="{srt_uri}" name=srtsrc '
-        # NOTE: srtsrc.caps is set programmatically below.  Using a
-        # capsfilter (! video/x-h264,... !) instead would fail with
-        # "Filter caps do not completely specify the output format"
-        # because video/x-h264 template caps include unfixed width,
-        # height, and framerate ranges that h264parse only fills in
-        # after it parses the SPS -- capsfilter rejects unfixed caps,
-        # but a property assignment doesn't go through that check.
+        # srtsrc has no `caps` property in this gst-plugins-bad build, and
+        # h264parse's sink pad refuses ANY caps, so we use typefind to
+        # auto-detect the H.264 byte-stream from the data and emit the
+        # right caps downstream.  GStreamer's H.264 typefinder recognises
+        # Annex-B NAL units and yields video/x-h264,stream-format=byte-
+        # stream once enough bytes have flowed.
+        f'! typefind '
         f'! queue '
         f'! h264parse config-interval=1 '
         f'! tee name=t '
@@ -130,18 +130,6 @@ def main():
         print(f'[service] ERROR: Failed to parse pipeline: {exc}',
               file=sys.stderr)
         sys.exit(1)
-
-    # srtsrc default caps are 'application/x-rtp', which doesn't match
-    # h264parse's sink pad.  Override to declare the bytestream we're
-    # actually carrying.  Set programmatically rather than via a
-    # capsfilter so the unfixed width/height/framerate ranges in the
-    # H.264 caps template don't trip capsfilter's fixed-caps check.
-    pipeline.get_by_name('srtsrc').set_property(
-        'caps',
-        Gst.Caps.from_string(
-            'video/x-h264,stream-format=byte-stream,alignment=au'
-        ),
-    )
 
     # Set video-caps on webrtcsink as a proper GstCaps object (Gst.Caps
     # handles the ; separator cleanly; gst-launch string escaping doesn't).
