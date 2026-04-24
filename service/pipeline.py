@@ -104,8 +104,10 @@ def main():
 
     desc = (
         f'srtsrc uri="{srt_uri}" '
-        f'! queue '
-        f'! tsdemux '
+        # Declare the byte-stream caps on srtsrc's output so h264parse can
+        # pick up the H.264 Annex-B NAL units directly.  Matches the caps
+        # the caster's srtsink was fed.
+        f'! video/x-h264,stream-format=byte-stream,alignment=au '
         f'! queue '
         f'! h264parse config-interval=1 '
         f'! tee name=t '
@@ -165,9 +167,21 @@ def main():
             if dbg:
                 print(f'[service] debug: {dbg}', file=sys.stderr)
             loop.quit()
+        elif t == Gst.MessageType.STATE_CHANGED and msg.src is pipeline:
+            # Only log top-level pipeline state transitions; element-level
+            # changes are too noisy.  Confirms we actually reach PLAYING.
+            old, new, _ = msg.parse_state_changed()
+            print(f'[service] pipeline state: {old.value_nick} -> '
+                  f'{new.value_nick}', flush=True)
 
     bus.connect('message', on_message)
-    pipeline.set_state(Gst.State.PLAYING)
+    ret = pipeline.set_state(Gst.State.PLAYING)
+    print(f'[service] set_state(PLAYING) returned: {ret.value_nick}',
+          flush=True)
+    if ret == Gst.StateChangeReturn.FAILURE:
+        print('[service] ERROR: pipeline failed to enter PLAYING state',
+              file=sys.stderr)
+        sys.exit(1)
 
     def on_signal(sig, _frame):
         print(f'[service] Signal {sig} received, sending EOS')

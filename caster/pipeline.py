@@ -89,7 +89,11 @@ def main():
         f'! videoconvert '
         f'! {encoder} '
         f'! h264parse config-interval=1 '
-        f'! mpegtsmux '
+        # Force Annex-B byte-stream with AU alignment going into srtsink so
+        # the receiver can demux it with h264parse alone (no mpegtsmux +
+        # tsdemux dance, which introduces a dynamic-pad link that fails
+        # silently when tsdemux never exposes a video pad).
+        f'! video/x-h264,stream-format=byte-stream,alignment=au '
         f'! srtsink uri="{srt_uri}" wait-for-connection=false'
     )
 
@@ -115,9 +119,19 @@ def main():
             if dbg:
                 print(f'[caster] debug: {dbg}', file=sys.stderr)
             loop.quit()
+        elif t == Gst.MessageType.STATE_CHANGED and msg.src is pipeline:
+            old, new, _ = msg.parse_state_changed()
+            print(f'[caster] pipeline state: {old.value_nick} -> '
+                  f'{new.value_nick}', flush=True)
 
     bus.connect('message', on_message)
-    pipeline.set_state(Gst.State.PLAYING)
+    ret = pipeline.set_state(Gst.State.PLAYING)
+    print(f'[caster] set_state(PLAYING) returned: {ret.value_nick}',
+          flush=True)
+    if ret == Gst.StateChangeReturn.FAILURE:
+        print('[caster] ERROR: pipeline failed to enter PLAYING state',
+              file=sys.stderr)
+        sys.exit(1)
 
     def on_signal(sig, _frame):
         print(f'[caster] Signal {sig} received, sending EOS')

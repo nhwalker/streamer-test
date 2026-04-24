@@ -84,7 +84,8 @@ class TestServiceAvailability:
 class TestWebRTCStream:
     """Browser-driven test that verifies live video playback over WebRTC."""
 
-    def test_webrtc_video_plays(self, streaming_container, _service, browser, turn_params):
+    def test_webrtc_video_plays(self, streaming_container, _caster, _service,
+                                browser, turn_params):
         """
         Headless Chrome loads the streaming page and receives a WebRTC stream.
 
@@ -175,7 +176,8 @@ class TestWebRTCStream:
                 console_logs = browser.get_log("browser")
             except Exception:
                 console_logs = []
-            stdout, stderr = _service.get_logs()
+            service_out, service_err = _service.get_logs()
+            caster_out,  caster_err  = _caster.get_logs()
             console_text = "\n".join(
                 f"    [{e['level']}] {e['message']}" for e in console_logs
             ) or "    (no browser console output)"
@@ -184,8 +186,10 @@ class TestWebRTCStream:
                 f"  video state    : {video_state}\n"
                 f"  page status    : {status_text!r}\n"
                 f"  browser console:\n{console_text}\n"
-                f"  container stdout:\n{stdout.decode(errors='replace')}\n"
-                f"  container stderr:\n{stderr.decode(errors='replace')}"
+                f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
+                f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
+                f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
+                f"===== service stderr =====\n{service_err.decode(errors='replace')}"
             )
 
         # Sample decoded pixels from the <video> to prove the stream carries

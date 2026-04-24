@@ -35,24 +35,29 @@ class TestArchive:
     """Verifies that SRT → h264parse → tee → mp4mux → splitmuxsink works."""
 
     def test_first_segment_appears(self, streaming_container, archive_dir,
-                                   _service):
+                                   _caster, _service):
         """
         At least one stream-NNNNN.mp4 file shows up in the archive volume
         within a generous timeout of the service coming up.
 
         streaming_container is depended on to force the service (and caster)
         fixtures to initialise.  archive_dir is the host tmp path mounted
-        into the service container as /archive.
+        into the service container as /archive.  _caster is requested so
+        its logs can surface in failure output (helps debug "stream never
+        arrived" vs "muxer never wrote").
         """
         first = _wait_for_first_segment(archive_dir, timeout=30.0)
         if first is None:
-            stdout, stderr = _service.get_logs()
+            service_out, service_err = _service.get_logs()
+            caster_out, caster_err   = _caster.get_logs()
             listing = os.listdir(archive_dir) if os.path.isdir(archive_dir) else []
             pytest.fail(
                 f"No stream-*.mp4 appeared in {archive_dir} within 30 s.\n"
                 f"Directory listing: {listing}\n"
-                f"Service stdout:\n{stdout.decode(errors='replace')}\n"
-                f"Service stderr:\n{stderr.decode(errors='replace')}"
+                f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
+                f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
+                f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
+                f"===== service stderr =====\n{service_err.decode(errors='replace')}"
             )
 
     def test_segment_is_valid_mp4(self, streaming_container, archive_dir):
