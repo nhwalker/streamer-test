@@ -60,6 +60,7 @@ RUN dnf install -y \
         libwebp-devel \
         gtk4-devel \
         libsrtp-devel \
+        srt-devel \
     && dnf clean all
 
 # ── A2: Build usrsctp from source (static lib) ───────────────────────────────
@@ -164,6 +165,7 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            -Ddtls=enabled \
            -Dsctp=enabled \
            -Dsrtp=enabled \
+           -Dsrt=enabled \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
     && find /opt/gst-nvcodec -name "*.so*" | sort
@@ -211,11 +213,16 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && dnf clean all
 
 # ── GStreamer runtime packages ──────────────────────────────────────────────
-# gstreamer1-plugins-bad-free : srtsrc, tsdemux, mp4mux, splitmuxsink,
-#                               webrtcbin (overwritten below by source build)
-# gstreamer1-plugins-ugly     : x264enc (software H.264 encode for VP9-is-not-
-#                               picked WebRTC peers when no GPU is available)
+# gstreamer1-plugins-bad-free : tsdemux, mp4mux, splitmuxsink, webrtcbin
+#                               (webrtcbin is overwritten below by the
+#                               source-built version; srt is NOT in
+#                               bad-free because libsrt is EPEL-only, so
+#                               srtsrc comes from the source-built plugin)
+# gstreamer1-plugins-ugly     : x264enc (software H.264 encode for H264
+#                               WebRTC peers when no GPU is available)
 # gstreamer1-plugin-libav     : avdec_h264 (software H.264 decode fallback)
+# srt-libs                    : libsrt runtime, required by source-built
+#                               libgstsrt.so
 RUN dnf install -y \
         gstreamer1 \
         gstreamer1-plugins-base \
@@ -223,6 +230,7 @@ RUN dnf install -y \
         gstreamer1-plugins-bad-free \
         gstreamer1-plugins-ugly \
         gstreamer1-plugin-libav \
+        srt-libs \
         openssl-libs \
         libnice \
         libnice-gstreamer1 \
@@ -242,6 +250,9 @@ COPY --from=builder /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 # nvcodec + its companion libgstcuda.
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
 COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
+
+# srt plugin (no RHEL10 package at all; fills in srtsrc / srtsink).
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrt.so /usr/local/lib/gstreamer-1.0/
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 
 # Replace RHEL10's webrtcbin/dtls/sctp/srtp with our libsrtp2+libnice build.

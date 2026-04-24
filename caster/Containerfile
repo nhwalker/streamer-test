@@ -42,7 +42,11 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
     && dnf clean all
 
-# ── Build dependencies for the nvcodec meson build ───────────────────────────
+# ── Build dependencies for the nvcodec + srt meson build ────────────────────
+# libsrt-devel is in EPEL10 only (not RHEL10 base or Rocky CRB), which is
+# why the packaged gstreamer1-plugins-bad-free has no srtsink -- Red Hat
+# builds bad-free without libsrt since it's not in their base repos.  We
+# add it here so the source-built srt plugin can link against it.
 RUN dnf install -y \
         gcc gcc-c++ make \
         pkgconf-pkg-config \
@@ -52,15 +56,16 @@ RUN dnf install -y \
         gstreamer1-devel \
         gstreamer1-plugins-base-devel \
         gstreamer1-plugins-bad-free-devel \
+        srt-devel \
     && dnf clean all
 
-# ── Build nvcodec from the GStreamer monorepo at the matching version ────────
-# nvcodec provides nvh264enc (hardware H.264 encode via NVENC).  The plugin
-# uses dlopen for libcuda/libnvidia-encode, so it loads at runtime only when
-# nvidia-container-toolkit injects the driver libs (--gpus all).  Without a
-# GPU the plugin is silently skipped and pipeline.py falls back to x264enc.
+# ── Build nvcodec + srt from the GStreamer monorepo at the matching version ─
+# nvcodec  : nvh264enc/nvh264dec (dlopen'd at runtime; silently skipped when
+#            no GPU is present, so pipeline.py falls back to x264enc).
+# srt      : srtsink (listener mode).  Not in RHEL10's packaged bad-free
+#            because libsrt is EPEL-only -- we rebuild it with libsrt linked.
 RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
-    && echo "=== Building nvcodec for GStreamer ${GST_VER} ===" \
+    && echo "=== Building nvcodec + srt for GStreamer ${GST_VER} ===" \
     && git clone --depth 1 --branch "${GST_VER}" \
            https://gitlab.freedesktop.org/gstreamer/gstreamer.git /gst-src \
     && cd /gst-src/subprojects/gst-plugins-bad \
@@ -69,6 +74,7 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            --libdir=lib \
            -Dauto_features=disabled \
            -Dnvcodec=enabled \
+           -Dsrt=enabled \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
     && find /opt/gst-nvcodec -name "*.so*" | sort
@@ -114,6 +120,7 @@ RUN dnf install -y \
         gstreamer1-plugins-good \
         gstreamer1-plugins-bad-free \
         gstreamer1-plugins-ugly \
+        srt-libs \
         python3 \
         python3-gobject \
     && dnf clean all
@@ -121,6 +128,9 @@ RUN dnf install -y \
 # ── nvcodec plugin + its companion libgstcuda ───────────────────────────────
 COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
 COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
+
+# ── srt plugin (built from source alongside nvcodec) ────────────────────────
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrt.so /usr/local/lib/gstreamer-1.0/
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 
 # ── Application ─────────────────────────────────────────────────────────────
