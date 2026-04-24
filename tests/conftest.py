@@ -3,15 +3,18 @@ pytest fixtures for the streamer-test container integration suite.
 
 Fixture dependency graph:
 
-    xvfb_display (session)
-         │
-         ▼
-    _container (session)  ──► yields raw DockerContainer
-         │
+    xvfb_display (session)                          archive_dir (session)
+         │                                                 │
+         ▼                                                 │
+    _caster (session)  ── runs caster container            │
+         │  SRT listener on :9000 against Xvfb             │
+         ▼                                                 ▼
+    _service (session)  ── runs service container; dials caster,
+         │                  mounts archive_dir as /archive
          ▼
     streaming_container (session)  ──► yields (http_port, ws_port)
          │
-         ▼  (tests request both streaming_container and browser)
+         ▼  (tests request streaming_container and browser)
     browser (function)
 """
 import os
@@ -29,36 +32,28 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Allow CI to override the image(s) under test.
-# TEST_IMAGES (comma-separated) takes precedence; falls back to TEST_IMAGE for
-# single-image runs.  The container_image fixture is parametrized over this
-# list so every test runs against each image in sequence.
-TEST_IMAGE = os.environ.get("TEST_IMAGE", "streamer-test:ci")
-
-
-def _get_test_images():
-    images_env = os.environ.get("TEST_IMAGES", "").strip()
-    if images_env:
-        return [img.strip() for img in images_env.split(",") if img.strip()]
-    return [TEST_IMAGE]
-
+# Two images now (caster + service).  CI builds each separately and tags
+# them as below; local runs can override via env.
+CASTER_IMAGE  = os.environ.get("CASTER_IMAGE",  "desktop-caster:ci")
+SERVICE_IMAGE = os.environ.get("SERVICE_IMAGE", "desktop-stream-service:ci")
 
 XVFB_DISPLAY = ":99"
 XVFB_GEOMETRY = "1280x720x24"
 
-# Fixed ports used when the container runs with host networking.
+# Fixed ports for host networking.  SRT is UDP, HTTP/WS are TCP.
+SRT_PORT  = 9000
 HTTP_PORT = 8080
-WS_PORT = 8443
+WS_PORT   = 8443
 
 # Optional TURN config for both sides (set in CI to bypass Azure hairpin UDP).
-# GStreamer uses it via webrtcbin-ready in pipeline.py (format: turn://u:p@h:p).
-# Chrome uses it via ?turn_uri URL param (format: turn:h:p with separate u/p).
 GST_TURN_SERVER    = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_SERVER = os.environ.get("WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
+# ── Xvfb + red window (unchanged from single-container era) ─────────────────
+#
 # xlogo from x11-apps is a tiny long-running X11 client that actively redraws
 # itself on every Expose event.  Using -bg and -fg both set to the same hex
 # red paints the entire window red (the logo glyph is invisible against a
@@ -70,16 +65,7 @@ WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
 def _assert_xvfb_is_red(display, xvfb_proc, red_window_proc):
-    """
-    Confirm the Xvfb root window's center pixel is red before yielding
-    control to the container.  Uses xwd (x11-utils) to dump the framebuffer
-    and ImageMagick's "convert" to read the sample pixel, because both are
-    already available in CI and neither depends on a Python X11 binding.
-
-    Raises RuntimeError with the observed color on mismatch so the failure
-    surfaces at fixture-setup time (clearly a host painting problem) rather
-    than inside the browser-driven WebRTC test (which is ambiguous).
-    """
+    """Confirm the Xvfb root window's center pixel is red before yielding."""
     width, height = (int(x) for x in XVFB_GEOMETRY.split("x")[:2])
     cx, cy = width // 2, height // 2
 
@@ -112,7 +98,6 @@ def _assert_xvfb_is_red(display, xvfb_proc, red_window_proc):
         ) from exc
 
     sample = pixel.stdout.decode(errors="replace").strip()
-    # "convert" emits e.g. "srgb(255,0,0)" or "red" depending on version.
     if "255,0,0" not in sample and sample.lower() not in {"red", "#ff0000"}:
         _cleanup_procs(red_window_proc, xvfb_proc)
         raise RuntimeError(
@@ -132,19 +117,7 @@ def _cleanup_procs(*procs):
 
 @pytest.fixture(scope="session")
 def xvfb_display():
-    """
-    Start Xvfb on display :99 before any test runs.
-
-    Polls for the X11 socket before yielding so the container's
-    entrypoint X11 pre-flight check (ximagesrc num-buffers=1) cannot
-    race ahead of Xvfb being ready.
-
-    Also launches a borderless full-screen xlogo painted #ff0000 on
-    the display, so pixels captured by the container's ximagesrc are a
-    known color.  The WebRTC test then asserts the decoded frame is red,
-    which distinguishes "stream is live" from "stream carries actual
-    display content".
-    """
+    """Start Xvfb + red xlogo before any test runs.  See module docstring."""
     proc = subprocess.Popen(
         ["Xvfb", XVFB_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
         stdout=subprocess.DEVNULL,
@@ -161,7 +134,6 @@ def xvfb_display():
         proc.terminate()
         raise RuntimeError(f"Xvfb socket {socket_path} did not appear within 5 s")
 
-    # XVFB_GEOMETRY is "WxHxD" — strip the depth for the xlogo -geometry arg.
     width_height = "x".join(XVFB_GEOMETRY.split("x")[:2]) + "+0+0"
     red_window = subprocess.Popen(
         [
@@ -176,10 +148,6 @@ def xvfb_display():
         stderr=subprocess.PIPE,
     )
 
-    # Give xlogo a moment to map and paint before the container starts
-    # probing ximagesrc.  If xlogo failed to launch (e.g. x11-apps missing),
-    # surface the stderr immediately rather than letting the WebRTC test
-    # fail far downstream with an opaque "frame is not red" message.
     time.sleep(1.0)
     if red_window.poll() is not None:
         _, stderr = red_window.communicate(timeout=2)
@@ -190,11 +158,6 @@ def xvfb_display():
             "Install x11-apps on the test host."
         )
 
-    # Host-side verification: dump the Xvfb framebuffer with xwd and parse a
-    # sample pixel with ImageMagick's "convert".  This isolates painting
-    # failures on the test host from capture/encode failures in the
-    # container — a useful split because the two surface identically at the
-    # browser end (all-black frame).
     _assert_xvfb_is_red(XVFB_DISPLAY, proc, red_window)
 
     yield XVFB_DISPLAY
@@ -212,66 +175,89 @@ def xvfb_display():
         proc.kill()
 
 
-@pytest.fixture(scope="session", params=_get_test_images())
-def container_image(request):
-    """Docker image under test; parametrized over TEST_IMAGES or TEST_IMAGE."""
-    return request.param
-
-
 @pytest.fixture(scope="session")
-def _container(xvfb_display, container_image):
+def archive_dir(tmp_path_factory):
+    """Host directory mounted into the service container as /archive."""
+    path = tmp_path_factory.mktemp("archive")
+    # Relax perms so the service container (running as root inside) can
+    # write to the host-created directory regardless of the tmp umask.
+    os.chmod(path, 0o777)
+    return str(path)
+
+
+# ── Caster ──────────────────────────────────────────────────────────────────
+@pytest.fixture(scope="session")
+def _caster(xvfb_display):
     """
-    Raw DockerContainer object, kept alive for the whole test session.
+    The caster container: X11 capture → H.264 → SRT listener on :SRT_PORT.
 
-    Runs with host networking so the GStreamer pipeline and headless Chrome
-    both use 127.0.0.1 ICE candidates, eliminating Docker-bridge ICE
-    connectivity failures in CI.
-
-    Parametrized through container_image so the full test suite runs once
-    per image when multiple images are listed in TEST_IMAGES.
-
-    Exposed separately from streaming_container so tests that need to
-    inspect container logs on failure can request this fixture directly
-    without changing the streaming_container API.
+    Runs with host networking so the service container (also host-networked)
+    can reach it at 127.0.0.1, and with host IPC so ximagesrc's MIT-SHM
+    attach can reach the host Xvfb's SysV shared-memory segment (otherwise
+    ximagesrc captures all-zero frames despite a successful X connection).
     """
     container = (
-        DockerContainer(container_image)
+        DockerContainer(CASTER_IMAGE)
         .with_env("DISPLAY", xvfb_display)
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")
-        # pipeline.py reads this and calls add-turn-server on each webrtcbin.
-        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
+        .with_env("SRT_PORT", str(SRT_PORT))
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
-        # Host networking so GStreamer can reach coturn on 127.0.0.1.
-        # Host IPC namespace so ximagesrc's MIT-SHM requests can attach to
-        # SysV shared-memory segments created by the host Xvfb — without
-        # this, ximagesrc silently captures all-zero frames even though the
-        # X connection itself succeeds.
         .with_kwargs(network_mode="host", ipc_mode="host")
+    )
+    with container:
+        # The caster logs "Starting capture:" after Gst.parse_launch succeeds
+        # but before set_state(PLAYING) returns, so srtsink isn't bound yet
+        # when this line appears.  Wait for the log, then give GStreamer a
+        # couple of seconds to complete the state transition and bind the
+        # UDP socket.  Service-side srtsrc also retries in caller mode, so
+        # the timing is belt-and-suspenders.
+        wait_for_logs(container, "Starting capture", timeout=30)
+        time.sleep(2.0)
+        yield container
+
+
+# ── Service ─────────────────────────────────────────────────────────────────
+@pytest.fixture(scope="session")
+def _service(_caster, archive_dir):
+    """
+    The service container: SRT caller → tee → MP4 archive + webrtcsink.
+
+    Depends on _caster so the caster is up and listening before the service
+    tries to dial it (srtsrc in caller mode retries, but failing fast makes
+    test failures clearer).
+    """
+    container = (
+        DockerContainer(SERVICE_IMAGE)
+        .with_env("DESKTOP_HOST", "127.0.0.1")
+        .with_env("DESKTOP_PORT", str(SRT_PORT))
+        # 20-second segments so test runs produce at least one complete
+        # segment well inside the test timeout budget; production default
+        # is 600 s.  Keep it an integer so splitmuxsink math is clean.
+        .with_env("ARCHIVE_SEGMENT_SEC", "20")
+        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
+        .with_volume_mapping(archive_dir, "/archive", "rw")
+        .with_kwargs(network_mode="host")
     )
     with container:
         yield container
 
 
+# ── streaming_container (compat shim, same return shape as before) ─────────
 @pytest.fixture(scope="session")
-def streaming_container(_container):
+def streaming_container(_service):
     """
-    Wait until HTTP and WebSocket services are reachable, then yield
-    (http_port, ws_port).
+    Wait until the service container's HTTP + WebSocket are reachable,
+    then yield (http_port, ws_port).
 
     With host networking the container's ports are the host's ports
-    directly — no dynamic mapping is needed.
+    directly — no dynamic mapping needed.
     """
     http_port = HTTP_PORT
     ws_port = WS_PORT
 
-    # The web server log line is the last thing entrypoint.sh prints
-    # before handing off to pipeline.py, so it confirms both the
-    # signalling server and HTTP server are up.
-    wait_for_logs(_container, "web server on port", timeout=60)
+    wait_for_logs(_service, "web server on port", timeout=60)
 
-    # Secondary HTTP poll closes the window between the log line
-    # appearing and Python's http.server actually calling listen().
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         try:
@@ -282,7 +268,7 @@ def streaming_container(_container):
             pass
         time.sleep(0.25)
     else:
-        stdout, stderr = _container.get_logs()
+        stdout, stderr = _service.get_logs()
         raise RuntimeError(
             f"HTTP server on :{http_port} did not respond within 10 s.\n"
             f"Container stdout:\n{stdout.decode()}\n"
@@ -294,12 +280,7 @@ def streaming_container(_container):
 
 @pytest.fixture(scope="session")
 def turn_params():
-    """
-    URL query string fragment to configure a TURN relay for the WebRTC test.
-
-    Returns "&turn_uri=...&turn_user=...&turn_cred=..." when WEBRTC_TURN_SERVER
-    is set in the environment (CI only), or "" for local runs without coturn.
-    """
+    """URL query fragment to configure a TURN relay for the browser."""
     from urllib.parse import urlencode
 
     if not WEBRTC_TURN_SERVER:
@@ -313,22 +294,7 @@ def turn_params():
 
 @pytest.fixture(scope="function")
 def browser():
-    """
-    Headless Chrome WebDriver configured for WebRTC receive.
-
-    --use-fake-ui-for-media-stream  auto-grants media permissions so the
-                                    gstwebrtc-api JS can call getUserMedia
-                                    without a prompt blocking the test.
-    --autoplay-policy=no-user-gesture-required  allows <video> autoplay
-                                    without a user click, which headless
-                                    Chrome otherwise blocks.
-    --disable-features=WebRtcHideLocalIpsWithMdns
-                                    expose real IP addresses in ICE
-                                    candidates instead of mDNS hostnames,
-                                    required for loopback ICE to work.
-    goog:loggingPrefs browser=ALL   captures JS console output so failures
-                                    include browser-side error messages.
-    """
+    """Headless Chrome WebDriver configured for WebRTC receive."""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -336,9 +302,6 @@ def browser():
     options.add_argument("--autoplay-policy=no-user-gesture-required")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
-    # Allow loopback (127.x.x.x) as ICE host and relay candidates.
-    # Required when coturn relays via --relay-ip=127.0.0.1; without this flag
-    # Chrome silently drops relay candidates on loopback addresses.
     options.add_argument("--allow-loopback-for-peer-connection")
     options.set_capability("goog:loggingPrefs", {"browser": "ALL"})
 
