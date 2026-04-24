@@ -1,43 +1,92 @@
 # ─── Build Stage ─────────────────────────────────────────────────────────────
-FROM ubuntu:24.04 AS builder
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 
-ARG DEBIAN_FRONTEND=noninteractive
-
-# Enable universe + multiverse so all GStreamer dev packages are reachable.
-# Handles both the new DEB822 format (ubuntu.sources) and the legacy format.
-RUN sed -i \
-        's/Components: main restricted$/Components: main restricted universe multiverse/' \
-        /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || \
-    sed -i \
-        's/main restricted$/main restricted universe multiverse/' \
-        /etc/apt/sources.list
+# ── Repos: Rocky Linux 10 supplement at lower priority ───────────────────────
+# UBI10 repos carry a curated subset of RHEL10 and default to dnf priority 99.
+# Rocky Linux 10 mirrors the full RHEL10 package set (BaseOS, AppStream, CRB)
+# and is added here at priority=100 so UBI-provided packages always win; Rocky
+# only fills in packages absent from the UBI repos (e.g. *-devel headers, gtk4).
+# EPEL10 supplies libraries not in RHEL10 or Rocky CRB: libnice,
+# libsodium, zvbi, … (dav1d is not yet in EPEL10; its Rust plugin is skipped).
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && printf '%s\n' \
+        '[rocky10-baseos]' \
+        'name=Rocky Linux 10 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-appstream]' \
+        'name=Rocky Linux 10 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-crb]' \
+        'name=Rocky Linux 10 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky10-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+    && dnf clean all
 
 # ── A: OS build dependencies ─────────────────────────────────────────────────
 # GStreamer dev headers, optional library deps for as many gst-plugins-rs
-# packages as Ubuntu 24.04 apt can satisfy, plus Node.js for the JS bundle.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config git curl ca-certificates \
-        meson ninja-build python3 \
+# packages as RHEL10 + Rocky CRB can satisfy, plus Node.js for the JS bundle.
+# libcsound64-devel is not available in RHEL10; the Rust plugin that requires
+# it will be silently skipped by the tolerated-failure build loop in step E.
+RUN dnf install -y \
+        gcc gcc-c++ make \
+        pkgconf-pkg-config \
+        git curl ca-certificates \
+        meson ninja-build cmake \
+        python3 \
         # GStreamer development headers (core + all plugin sets)
-        libgstreamer1.0-dev \
-        libgstreamer-plugins-base1.0-dev \
-        libgstreamer-plugins-bad1.0-dev \
+        gstreamer1-devel \
+        gstreamer1-plugins-base-devel \
+        gstreamer1-plugins-bad-free-devel \
         # Node.js — builds the gstwebrtc-api browser-side JS library
         nodejs npm \
         # Optional library deps — each enables additional Rust plugin packages
-        libssl-dev \
-        libnice-dev \
-        libdav1d-dev \
-        libsodium-dev \
-        libzvbi-dev \
-        libwebp-dev \
-        libgtk-4-dev \
-        libcsound64-dev \
-    && rm -rf /var/lib/apt/lists/*
+        openssl-devel \
+        libnice-devel \
+        libsodium-devel \
+        zvbi-devel \
+        libwebp-devel \
+        gtk4-devel \
+        # libsrtp2 — required to build a functional webrtcbin (DTLS-SRTP);
+        # RHEL10's gstreamer1-plugins-bad-free is compiled without it because
+        # libsrtp is not in the base RHEL10 repos, so webrtcbin silently fails.
+        libsrtp-devel \
+    && dnf clean all
+
+# ── A2: Build usrsctp from source ────────────────────────────────────────────
+# usrsctp is not packaged in EPEL10 or Rocky 10.  Build it as a static library
+# so the sctp plugin DSO links it in; no shared library needed at runtime.
+RUN git clone --depth 1 https://github.com/sctplab/usrsctp.git /usrsctp-src \
+    && cmake -S /usrsctp-src -B /usrsctp-src/build \
+             -DCMAKE_INSTALL_PREFIX=/usr \
+             -Dsctp_build_shared_lib=OFF \
+             -Dsctp_werror=OFF \
+    && cmake --build /usrsctp-src/build --parallel 2 \
+    && cmake --install /usrsctp-src/build \
+    && rm -rf /usrsctp-src
 
 # ── B: Rust toolchain ────────────────────────────────────────────────────────
-# Rustup gives us the latest stable, sidestepping any MSRV gap between Ubuntu
-# 24.04's packaged Rust and gst-plugins-rs's minimum supported Rust version.
+# Rustup gives us the latest stable, sidestepping any MSRV gap between RHEL10's
+# packaged Rust and gst-plugins-rs's minimum supported Rust version.
 # cargo-c is built from crates.io to match the installed cargo version.
 RUN curl -sSf https://sh.rustup.rs | \
         sh -s -- -y --default-toolchain stable --no-modify-path \
@@ -45,8 +94,9 @@ RUN curl -sSf https://sh.rustup.rs | \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ── C: Clone gst-plugins-rs ──────────────────────────────────────────────────
-# Tag series 0.13.x requires GStreamer >= 1.24 — matches Ubuntu 24.04 packages.
-# Bump to 0.14.x once Ubuntu ships GStreamer >= 1.26.
+# Tag series 0.13.x requires GStreamer >= 1.24 — matches RHEL10/UBI10 packages
+# (RHEL10 ships GStreamer 1.24.x).
+# Bump to 0.14.x once RHEL10 ships GStreamer >= 1.26.
 ARG GST_PLUGINS_RS_TAG=0.13.3
 RUN git clone --depth 1 --branch "${GST_PLUGINS_RS_TAG}" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git /src
@@ -58,8 +108,8 @@ RUN cargo fetch
 
 # ── E: Build and install every GStreamer Rust plugin ─────────────────────────
 # Iterates over all cdylib targets in the workspace and installs each one,
-# printing SKIP for any that fail (e.g. gst-plugin-skia, which requires a
-# pre-built Skia library not available in Ubuntu 24.04 apt).
+# printing SKIP for any that fail (e.g. gst-plugin-csound, gst-plugin-skia,
+# which require native libraries not available in RHEL10).
 # --jobs 2 prevents OOM on build agents with < 8 GB RAM.
 RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c \
     'import sys,json;d=json.load(sys.stdin);print(" ".join(p["name"] for p in d["packages"] if any("cdylib" in t.get("crate_types",[]) for t in p["targets"])))') \
@@ -128,14 +178,18 @@ RUN npm install && npm run build && \
         echo "Entry point: ${ENTRY}"; \
     fi
 
-# ── H: Build the nvcodec GStreamer plugin from the GStreamer monorepo ─────────
-# nvcodec provides NVIDIA hardware encoders (nvh264enc, nvh265enc) via NVENC
-# and decoders via NVDEC.  It uses dlopen for all NVIDIA libs, so it compiles
-# without the NVIDIA SDK.  At runtime, nvidia-container-toolkit injects the
-# driver libs when the container is started with --gpus.
+# ── H: Build nvcodec + webrtcbin from the GStreamer monorepo ─────────────────
+# nvcodec: NVIDIA hardware encoders (nvh264enc, nvh265enc via NVENC/NVDEC).
+#   Uses dlopen for all NVIDIA libs; nvidia-container-toolkit injects them at
+#   runtime when the container is started with --gpus.
+# webrtcbin: RHEL10's gstreamer1-plugins-bad-free is compiled without libsrtp2
+#   (libsrtp is not in the base RHEL10 repos so Red Hat builds it disabled).
+#   Without DTLS-SRTP, webrtcbin cannot complete ICE negotiation and webrtcsink
+#   silently drops every incoming session.  Building from source with
+#   -Dwebrtc=enabled ensures libnice + libsrtp2 are linked in.
 WORKDIR /
 RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
-    && echo "=== Building nvcodec plugin for GStreamer ${GST_VER} ===" \
+    && echo "=== Building nvcodec + webrtcbin for GStreamer ${GST_VER} ===" \
     && git clone --depth 1 --branch "${GST_VER}" \
            https://gitlab.freedesktop.org/gstreamer/gstreamer.git /gst-src \
     && cd /gst-src/subprojects/gst-plugins-bad \
@@ -144,66 +198,134 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
            --libdir=lib \
            -Dauto_features=disabled \
            -Dnvcodec=enabled \
+           -Dwebrtc=enabled \
+           -Ddtls=enabled \
+           -Dsctp=enabled \
+           -Dsrtp=enabled \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
-    && echo "=== nvcodec artifacts ===" \
+    && echo "=== nvcodec + webrtcbin artifacts ===" \
     && find /opt/gst-nvcodec -name "*.so*" | sort
 
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
-FROM ubuntu:24.04
+FROM registry.access.redhat.com/ubi10/ubi:latest
 
-ARG DEBIAN_FRONTEND=noninteractive
+# ── Repos: Rocky Linux 10 supplement + EPEL10 + RPM Fusion Free ─────────────
+# Same Rocky 10 supplement as the builder (priority=100, UBI repos win at 99).
+# EPEL10 provides libnice, libsodium, zvbi (not in RHEL10/Rocky CRB).
+# RPM Fusion Free for EL10 provides gstreamer1-plugins-ugly (x264, mp3) and
+# gstreamer1-plugin-libav (FFmpeg codec suite), unavailable in RHEL10/Rocky.
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && printf '%s\n' \
+        '[rocky10-baseos]' \
+        'name=Rocky Linux 10 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-appstream]' \
+        'name=Rocky Linux 10 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-crb]' \
+        'name=Rocky Linux 10 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky10-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
+    && dnf clean all
 
-# Enable universe + multiverse for plugins-ugly, libav, etc.
-RUN sed -i \
-        's/Components: main restricted$/Components: main restricted universe multiverse/' \
-        /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || \
-    sed -i \
-        's/main restricted$/main restricted universe multiverse/' \
-        /etc/apt/sources.list
-
-# ── GStreamer core + all official plugin packages ─────────────────────────────
-# gstreamer1.0-plugins-base   : alsa, ogg, vorbis, theora, opus, playback, ...
-# gstreamer1.0-plugins-good   : alaw/mulaw, flac, jpeg, png, rtp, v4l2, ...
-# gstreamer1.0-plugins-bad    : webrtcbin, dashdemux, hls, mxf, vaapi, ...
-# gstreamer1.0-plugins-ugly   : x264, mp3, aac (clear of patent concerns)
-# gstreamer1.0-libav           : full FFmpeg codec suite
-# gstreamer1.0-nice            : libnice ICE/STUN/TURN for WebRTC
-# libgstrtspserver-1.0-0       : GStreamer RTSP server library
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gstreamer1.0-tools \
-        libgstreamer1.0-0 \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-plugins-ugly \
-        gstreamer1.0-libav \
-        gstreamer1.0-nice \
-        libgstrtspserver-1.0-0 \
+# ── GStreamer core + all available plugin packages ────────────────────────────
+# gstreamer1-plugins-base   : alsa, ogg, vorbis, theora, opus, playback, ...
+# gstreamer1-plugins-good   : alaw/mulaw, flac, jpeg, png, rtp, v4l2, ...
+# gstreamer1-plugins-bad-free : dashdemux, hls, mxf, vaapi, ... (webrtcbin
+#                               replaced by the source-built version from step H)
+# gstreamer1-plugins-ugly   : x264, mp3, aac (RPM Fusion Free)
+# gstreamer1-plugin-libav   : full FFmpeg codec suite (RPM Fusion Free)
+RUN dnf install -y \
+        gstreamer1 \
+        gstreamer1-plugins-base \
+        gstreamer1-plugins-good \
+        gstreamer1-plugins-bad-free \
+        gstreamer1-plugins-ugly \
+        gstreamer1-plugin-libav \
         # Runtime libs required by the compiled GStreamer Rust plugins
-        libssl3 \
-        libnice10 \
-        libdav1d7 \
-        libsodium23 \
-        libzvbi0t64 \
-        libwebp7 \
-        libgtk-4-1 \
-        libcsound64-6.0 \
+        openssl-libs \
+        libnice \
+        # libnice-gstreamer1 (EPEL10) provides /usr/lib64/gstreamer-1.0/
+        # libgstnice.so, which registers the `nicesrc` and `nicesink` elements.
+        # webrtcbin's _have_nice_elements() refuses to create any sink pad if
+        # those elements are not in the GStreamer registry — without this
+        # package webrtcsink fails with "Failed to request pad from webrtcbin".
+        libnice-gstreamer1 \
+        libsrtp \
+        libsodium \
+        zvbi \
+        libwebp \
+        gtk4 \
         # Application runtime
         python3 \
-        netcat-openbsd \
+        nmap-ncat \
         # Python GStreamer bindings — used by pipeline.py for TURN configuration
-        python3-gst-1.0 \
-    && rm -rf /var/lib/apt/lists/*
+        python3-gobject \
+    && dnf clean all
 
 # Copy all compiled GStreamer Rust plugins into the local plugin directory.
 COPY --from=builder /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 
-# Copy the nvcodec plugin and its libgstcuda helper library.
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
+# nvcodec: no system equivalent — goes to the custom plugin dir.
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
 COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
+
+# Replace system webrtcbin/dtls/sctp/srtp plugins and companion libs with our
+# meson-built versions.
+#
+# Why plugins:   RHEL10's gstreamer1-plugins-bad-free is compiled without
+#                libsrtp2 (not in RHEL10 base), so its webrtcbin cannot
+#                complete DTLS-SRTP negotiation.  Our build enables all deps.
+#
+# Why libgstwebrtc-1.0.so* + libgstwebrtcnice-1.0.so*:
+#                GStreamer 1.22+ builds the libnice ICE backend as a separate
+#                companion library (libgstwebrtcnice-1.0.so) via
+#                gst-libs/gst/webrtc/nice/.  RHEL10's package was built without
+#                libnice (EPEL10-only), so this library is absent.  Without it,
+#                webrtcbin has no ICE backend and on-negotiation-needed never
+#                fires → no SDP offer → 60 s hang.  We copy both our
+#                libgstwebrtc-1.0.so and libgstwebrtcnice-1.0.so so all symbols
+#                resolve against a consistent, libnice-enabled build.
+#
+# Why libgstsctp-1.0.so*:
+#                Our webrtcbin plugin was compiled with SCTP data channel
+#                support and links against libgstsctp-1.0.so.0.  RHEL10's
+#                gstreamer1-plugins-bad-free was built without usrsctp, so its
+#                libgstsctp-1.0.so.0 either doesn't exist or is missing the
+#                gst_sctp_association_* symbols our plugin needs.  Copying our
+#                version (with usrsctp statically linked in) satisfies the dep.
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so  /usr/lib64/gstreamer-1.0/libgstdtls.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so  /usr/lib64/gstreamer-1.0/libgstsctp.so
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so  /usr/lib64/gstreamer-1.0/libgstsrtp.so
+COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so*      /usr/lib64/
+COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtcnice-1.0.so*  /usr/lib64/
+COPY --from=builder /opt/gst-nvcodec/lib/libgstsctp-1.0.so*        /usr/lib64/
+RUN ldconfig
 
 # Copy the WebRTC signalling server binary.
 COPY --from=builder /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
