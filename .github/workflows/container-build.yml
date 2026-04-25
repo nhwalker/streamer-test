@@ -52,7 +52,7 @@ jobs:
           tags: ${{ steps.base-meta.outputs.tags }}
           labels: ${{ steps.base-meta.outputs.labels }}
           push: ${{ github.event_name != 'pull_request' }}
-          outputs: type=docker,dest=/tmp/streamer-base.tar
+          outputs: type=oci,dest=/tmp/streamer-base.tar
           cache-from: type=gha,scope=base-buildcache
           cache-to: type=gha,scope=base-buildcache,mode=max
 
@@ -97,12 +97,11 @@ jobs:
           name: base-image
           path: /tmp/artifacts/base
 
-      - name: Load base image into Docker
+      - name: Extract base OCI layout
         run: |
-          LOADED=$(docker load -i /tmp/artifacts/base/streamer-base.tar \
-                   | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${LOADED}" streamer-base:latest
-          docker images | grep streamer-base
+          mkdir -p /tmp/base-oci
+          tar -xf /tmp/artifacts/base/streamer-base.tar -C /tmp/base-oci
+          ls /tmp/base-oci
 
       - name: Extract metadata
         id: meta
@@ -133,7 +132,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Containerfile
           build-contexts: |
-            streamer-base=docker-image://streamer-base:latest
+            streamer-base=oci-layout:///tmp/base-oci
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           push: ${{ github.event_name != 'pull_request' }}
