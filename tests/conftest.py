@@ -200,22 +200,31 @@ def _caster(xvfb_display):
 
 
 # ── Caster peer ID ───────────────────────────────────────────────────────────
+_UUID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE,
+)
+
+
 @pytest.fixture(scope="session")
 def caster_peer_id(_caster):
     """Extract the caster's randomly-assigned signalling peer ID from its logs."""
     wait_for_logs(_caster, "registered as a producer", timeout=15)
     stdout, _ = _caster.get_logs()
-    m = re.search(
-        r'registered as a producer \[peer_id=([^\]]+)\]',
-        stdout.decode(errors='replace'),
+    log_text = stdout.decode(errors='replace')
+    for line in log_text.splitlines():
+        if 'registered as a producer' in line:
+            m = _UUID_RE.search(line)
+            if m:
+                peer_id = m.group(0)
+                print(f'[conftest] caster peer_id = {peer_id}', flush=True)
+                return peer_id
+    raise RuntimeError(
+        f"Could not find a UUID on the 'registered as a producer' line in caster logs.\n"
+        f"Relevant caster log lines:\n"
+        + '\n'.join(l for l in log_text.splitlines()
+                    if 'producer' in l or 'peer' in l)
     )
-    if not m:
-        raise RuntimeError(
-            "Could not find 'registered as a producer [peer_id=...]' in caster logs"
-        )
-    peer_id = m.group(1)
-    print(f'[conftest] caster peer_id = {peer_id}', flush=True)
-    return peer_id
 
 
 # ── Service ──────────────────────────────────────────────────────────────────
