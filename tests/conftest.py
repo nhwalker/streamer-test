@@ -289,6 +289,39 @@ def turn_params():
     })
 
 
+def _wait_for_first_segment(archive_dir, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        first = min(
+            (f for f in os.listdir(archive_dir)
+             if f.startswith("stream-") and f.endswith(".mkv")),
+            default=None,
+        )
+        if first:
+            return os.path.join(archive_dir, first)
+        time.sleep(0.5)
+    return None
+
+
+@pytest.fixture(scope="session")
+def first_segment(streaming_container, archive_dir, _caster, _service):
+    """Path to the first .mkv archive segment, waiting up to 30 s."""
+    path = _wait_for_first_segment(archive_dir, timeout=30.0)
+    if path is None:
+        service_out, service_err = _service.get_logs()
+        caster_out, caster_err   = _caster.get_logs()
+        listing = os.listdir(archive_dir) if os.path.isdir(archive_dir) else []
+        raise RuntimeError(
+            f"No stream-*.mkv appeared in {archive_dir} within 30 s.\n"
+            f"Directory listing: {listing}\n"
+            f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
+            f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
+            f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
+            f"===== service stderr =====\n{service_err.decode(errors='replace')}"
+        )
+    return path
+
+
 @pytest.fixture(scope="function")
 def browser():
     """Headless Chrome WebDriver configured for WebRTC receive."""

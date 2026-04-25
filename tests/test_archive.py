@@ -18,50 +18,19 @@ import pytest
 EBML_MAGIC = b"\x1a\x45\xdf\xa3"
 
 
-def _wait_for_first_segment(archive_dir, timeout=30.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        files = sorted(
-            f for f in os.listdir(archive_dir)
-            if f.startswith("stream-") and f.endswith(".mkv")
-        )
-        if files:
-            return os.path.join(archive_dir, files[0])
-        time.sleep(0.5)
-    return None
-
-
 class TestArchive:
-    """Verifies SRT → h264parse → tee → matroskamux → splitmuxsink."""
+    """Verifies RTP → h264parse → tee → matroskamux → splitmuxsink."""
 
-    def test_first_segment_appears(self, streaming_container, archive_dir,
-                                   _caster, _service):
+    def test_first_segment_appears(self, first_segment):
         """
         At least one stream-NNNNN.mkv file shows up in the archive volume
         within a generous timeout of the service coming up.
 
-        streaming_container is depended on to force the service (and caster)
-        fixtures to initialise.  archive_dir is the host tmp path mounted
-        into the service container as /archive.  _caster is requested so
-        its logs can surface in failure output (helps debug "stream never
-        arrived" vs "muxer never wrote").
+        The first_segment fixture waits and surfaces container logs on failure.
         """
-        first = _wait_for_first_segment(archive_dir, timeout=30.0)
-        if first is None:
-            service_out, service_err = _service.get_logs()
-            caster_out, caster_err   = _caster.get_logs()
-            listing = os.listdir(archive_dir) if os.path.isdir(archive_dir) else []
-            pytest.fail(
-                f"No stream-*.mkv appeared in {archive_dir} within 30 s.\n"
-                f"Directory listing: {listing}\n"
-                f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
-                f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
-                f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
-                f"===== service stderr =====\n{service_err.decode(errors='replace')}"
-            )
+        assert os.path.isfile(first_segment)
 
-    def test_segment_is_valid_matroska(self, streaming_container, archive_dir,
-                                       _service):
+    def test_segment_is_valid_matroska(self, first_segment, _service):
         """
         The first segment starts with the EBML magic 1A 45 DF A3.
 
@@ -69,8 +38,7 @@ class TestArchive:
         as the first cluster is flushed -- no need to wait for the segment
         boundary to rotate.
         """
-        first = _wait_for_first_segment(archive_dir, timeout=30.0)
-        assert first is not None, "expected at least one .mkv file"
+        first = first_segment
 
         # Allow up to 10 s for the EBML header to land on disk.  In practice
         # matroskamux flushes the header within milliseconds of the first
@@ -97,15 +65,14 @@ class TestArchive:
                 f"===== service stderr =====\n{service_err.decode(errors='replace')}"
             )
 
-    def test_segment_has_content(self, streaming_container, archive_dir):
+    def test_segment_has_content(self, first_segment):
         """
         The first segment grows past the EBML+SegmentInfo header size.
         A fresh matroskamux file that never got any real frame data is
         under ~1 KB (just EBML + SegmentInfo headers).  Real streamed
         content hits tens of KB within a second or two at 1280x720.
         """
-        first = _wait_for_first_segment(archive_dir, timeout=30.0)
-        assert first is not None, "expected at least one .mkv file"
+        first = first_segment
 
         deadline = time.monotonic() + 15.0
         size = 0

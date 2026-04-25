@@ -37,21 +37,22 @@ DISPLAY      = os.environ.get('DISPLAY', ':0')
 WIDTH        = os.environ.get('STREAM_WIDTH', '1920')
 HEIGHT       = os.environ.get('STREAM_HEIGHT', '1080')
 FRAMERATE    = os.environ.get('STREAM_FRAMERATE', '30')
-BITRATE      = os.environ.get('STREAM_BITRATE', '6000')
-MIN_BITRATE  = os.environ.get('MIN_BITRATE', '1000')
+BITRATE      = int(os.environ.get('STREAM_BITRATE', '6000'))
+MIN_BITRATE  = int(os.environ.get('MIN_BITRATE', '1000'))
 SERVICE_HOST = os.environ.get('SERVICE_HOST', '')
-RTP_PORT     = os.environ.get('RTP_PORT', '5000')
+RTP_PORT     = int(os.environ.get('RTP_PORT', '5000'))
+RTCP_SR      = RTP_PORT + 1
+RTCP_RR      = RTP_PORT + 2
 
 
-def build_encoder():
+def build_encoder(framerate, min_bitrate, bitrate):
     """Return a gst-launch encoder fragment; encoder is named 'enc'."""
     # 1-second GOP keeps splitmuxsink segment boundaries tight on the service.
-    gop = FRAMERATE
     if Gst.ElementFactory.find('nvh264enc'):
         print('[caster] NVIDIA NVENC detected: using nvh264enc', flush=True)
         return (
             f'nvh264enc name=enc preset=low-latency-hq rc-mode=vbr-hq '
-            f'bitrate={MIN_BITRATE} max-bitrate={BITRATE} gop-size={gop}'
+            f'bitrate={min_bitrate} max-bitrate={bitrate} gop-size={framerate}'
         )
     print('[caster] NVIDIA NVENC not detected: using x264enc (software)',
           flush=True)
@@ -59,26 +60,31 @@ def build_encoder():
     # are logged but may not take effect until the pipeline restarts.
     return (
         f'x264enc name=enc tune=zerolatency speed-preset=ultrafast '
-        f'bitrate={BITRATE} key-int-max={gop}'
+        f'bitrate={bitrate} key-int-max={framerate}'
     )
 
 
-def connect_rtcp_feedback(rtpbin, encoder):
+def connect_rtcp_feedback(rtpbin, encoder, min_bitrate, max_bitrate):
     """Wire RTCP Receiver Reports to encoder bitrate adjustments."""
-    current = [int(BITRATE)]
+    current_bitrate = max_bitrate
 
     def on_ssrc_active(session, ssrc):
+        nonlocal current_bitrate
         src = session.emit('get-source-by-ssrc', ssrc)
         if src is None:
             return
         stats = src.get_property('stats')
         lost = stats.get_int('rb-fractionlost')[1]   # 0–255 (255 = 100 % loss)
         if lost > 12:          # > ~5 % loss: back off fast
-            current[0] = max(int(MIN_BITRATE), int(current[0] * 0.75))
-        elif lost == 0:        # clean path: probe up slowly
-            current[0] = min(int(BITRATE), int(current[0] * 1.05))
-        encoder.set_property('bitrate', current[0])
-        print(f'[caster] RTCP: loss={lost}/255 → bitrate={current[0]} kbps',
+            new_bitrate = max(min_bitrate, int(current_bitrate * 0.75))
+        elif lost == 0 and current_bitrate < max_bitrate:  # clean path: probe up slowly
+            new_bitrate = min(max_bitrate, int(current_bitrate * 1.05))
+        else:
+            new_bitrate = current_bitrate
+        if new_bitrate != current_bitrate:
+            current_bitrate = new_bitrate
+            encoder.set_property('bitrate', current_bitrate)
+        print(f'[caster] RTCP: loss={lost}/255 → bitrate={current_bitrate} kbps',
               flush=True)
 
     def on_new_ssrc(rb, session_id, ssrc):
@@ -96,19 +102,15 @@ def main():
 
     Gst.init(None)
 
-    encoder_str = build_encoder()
-
-    rtp_port = int(RTP_PORT)
-    rtcp_sr  = rtp_port + 1   # caster sends SR here  (service listens)
-    rtcp_rr  = rtp_port + 2   # caster listens for RR (service sends)
+    encoder_str = build_encoder(FRAMERATE, MIN_BITRATE, BITRATE)
 
     print('[caster] Starting capture:', flush=True)
     print(f'  Display       : {DISPLAY}')
     print(f'  Resolution    : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
     print(f'  Bitrate range : {MIN_BITRATE}–{BITRATE} kbps')
-    print(f'  Service RTP   : rtp://{SERVICE_HOST}:{rtp_port}')
-    print(f'  RTCP SR→      : udp://{SERVICE_HOST}:{rtcp_sr}')
-    print(f'  RTCP RR←      : udp://0.0.0.0:{rtcp_rr}')
+    print(f'  Service RTP   : rtp://{SERVICE_HOST}:{RTP_PORT}')
+    print(f'  RTCP SR→      : udp://{SERVICE_HOST}:{RTCP_SR}')
+    print(f'  RTCP RR←      : udp://0.0.0.0:{RTCP_RR}')
 
     desc = (
         f'ximagesrc display-name={DISPLAY} use-damage=false '
@@ -124,10 +126,10 @@ def main():
         f'rtpbin name=rtpbin '
         f'rtpbin.send_rtp_src_0 '
         f'  ! queue max-size-time=200000000 leaky=downstream '
-        f'  ! udpsink host={SERVICE_HOST} port={rtp_port} '
+        f'  ! udpsink host={SERVICE_HOST} port={RTP_PORT} '
         f'rtpbin.send_rtcp_src_0 '
-        f'  ! udpsink host={SERVICE_HOST} port={rtcp_sr} sync=false async=false '
-        f'udpsrc port={rtcp_rr} caps="application/x-rtcp" '
+        f'  ! udpsink host={SERVICE_HOST} port={RTCP_SR} sync=false async=false '
+        f'udpsrc port={RTCP_RR} caps="application/x-rtcp" '
         f'  ! rtpbin.recv_rtcp_sink_0'
     )
 
@@ -140,7 +142,7 @@ def main():
 
     encoder  = pipeline.get_by_name('enc')
     rtpbin_e = pipeline.get_by_name('rtpbin')
-    connect_rtcp_feedback(rtpbin_e, encoder)
+    connect_rtcp_feedback(rtpbin_e, encoder, MIN_BITRATE, BITRATE)
 
     loop = GLib.MainLoop()
     bus = pipeline.get_bus()
