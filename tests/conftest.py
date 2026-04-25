@@ -399,9 +399,9 @@ def xvfb_two_tone():
     """
     Xvfb on TWO_TONE_DISPLAY with top half red, bottom half blue.
 
-    xsetroot paints the root window blue (permanent background).
-    xlogo covers the top CROP_HEIGHT rows with a continuously-redrawn red
-    window — needed because Xvfb has no backing store by default.
+    Two xlogo windows continuously repaint each half — needed because Xvfb
+    has no backing store by default. Red covers the top CROP_HEIGHT rows;
+    blue covers the bottom CROP_HEIGHT rows.
     """
     xvfb_proc = subprocess.Popen(
         ["Xvfb", TWO_TONE_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
@@ -419,12 +419,6 @@ def xvfb_two_tone():
         xvfb_proc.terminate()
         raise RuntimeError(f"Two-tone Xvfb socket {socket_path} did not appear within 5 s")
 
-    # Paint root window blue — this persists without a redrawing client.
-    subprocess.run(
-        ["xsetroot", "-display", TWO_TONE_DISPLAY, "-solid", "#0000ff"],
-        check=True, timeout=5,
-    )
-
     # Cover the top half with a continuously-redrawn red xlogo window.
     top_geometry = f"{STREAM_WIDTH}x{CROP_HEIGHT}+0+0"
     red_top = subprocess.Popen(
@@ -440,14 +434,30 @@ def xvfb_two_tone():
         stderr=subprocess.PIPE,
     )
 
+    # Cover the bottom half with a continuously-redrawn blue xlogo window.
+    bot_geometry = f"{STREAM_WIDTH}x{CROP_HEIGHT}+0+{CROP_HEIGHT}"
+    blue_bottom = subprocess.Popen(
+        [
+            "xlogo",
+            "-display", TWO_TONE_DISPLAY,
+            "-geometry", bot_geometry,
+            "-bg", "#0000ff",
+            "-fg", "#0000ff",
+            "-bw", "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
     time.sleep(1.0)
-    if red_top.poll() is not None:
-        _, stderr = red_top.communicate(timeout=2)
-        xvfb_proc.terminate()
-        raise RuntimeError(
-            f"Two-tone xlogo exited early (rc={red_top.returncode}). "
-            f"stderr: {stderr.decode(errors='replace')!r}"
-        )
+    for name, proc in (("red_top", red_top), ("blue_bottom", blue_bottom)):
+        if proc.poll() is not None:
+            _, stderr = proc.communicate(timeout=2)
+            _cleanup_procs(red_top, blue_bottom, xvfb_proc)
+            raise RuntimeError(
+                f"Two-tone xlogo ({name}) exited early (rc={proc.returncode}). "
+                f"stderr: {stderr.decode(errors='replace')!r}"
+            )
 
     # Verify both halves have the expected colours.
     cx = STREAM_WIDTH // 2
@@ -455,16 +465,16 @@ def xvfb_two_tone():
         top_pixel = _sample_pixel(TWO_TONE_DISPLAY, cx, CROP_HEIGHT // 2)
         bot_pixel = _sample_pixel(TWO_TONE_DISPLAY, cx, CROP_HEIGHT + CROP_HEIGHT // 2)
     except Exception as exc:
-        _cleanup_procs(red_top, xvfb_proc)
+        _cleanup_procs(red_top, blue_bottom, xvfb_proc)
         raise RuntimeError(f"Two-tone Xvfb pixel sampling failed: {exc}") from exc
 
     if "255,0,0" not in top_pixel and top_pixel.lower() not in {"red", "#ff0000"}:
-        _cleanup_procs(red_top, xvfb_proc)
+        _cleanup_procs(red_top, blue_bottom, xvfb_proc)
         raise RuntimeError(
             f"Two-tone Xvfb top half is not red at ({cx},{CROP_HEIGHT // 2}); got {top_pixel!r}"
         )
     if "0,0,255" not in bot_pixel and bot_pixel.lower() not in {"blue", "#0000ff"}:
-        _cleanup_procs(red_top, xvfb_proc)
+        _cleanup_procs(red_top, blue_bottom, xvfb_proc)
         raise RuntimeError(
             f"Two-tone Xvfb bottom half is not blue at ({cx},{CROP_HEIGHT + CROP_HEIGHT // 2}); "
             f"got {bot_pixel!r}"
@@ -472,17 +482,7 @@ def xvfb_two_tone():
 
     yield TWO_TONE_DISPLAY
 
-    red_top.terminate()
-    try:
-        red_top.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        red_top.kill()
-
-    xvfb_proc.terminate()
-    try:
-        xvfb_proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        xvfb_proc.kill()
+    _cleanup_procs(red_top, blue_bottom, xvfb_proc)
 
 
 @pytest.fixture(scope="session")
