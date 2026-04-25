@@ -7,9 +7,9 @@ Fixture dependency graph:
          │                                                 │
          ▼                                                 │
     _caster (session)  ── runs caster container            │
-         │  RTP push to service on :RTP_PORT against Xvfb  │
-         ▼                                                 ▼
-    _service (session)  ── runs service container; receives RTP,
+         │  webrtcsink published to caster's signalling    │
+         ▼  server on CASTER_SIGNALLING_PORT               ▼
+    _service (session)  ── runs service container; webrtcsrc dials caster,
          │                  mounts archive_dir as /archive
          ▼
     streaming_container (session)  ──► yields (http_port, ws_port)
@@ -32,37 +32,26 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-# Two images now (caster + service).  CI builds each separately and tags
-# them as below; local runs can override via env.
 CASTER_IMAGE  = os.environ.get("CASTER_IMAGE",  "desktop-caster:ci")
 SERVICE_IMAGE = os.environ.get("SERVICE_IMAGE", "desktop-stream-service:ci")
 
-XVFB_DISPLAY = ":99"
+XVFB_DISPLAY  = ":99"
 XVFB_GEOMETRY = "1280x720x24"
 
-# Fixed ports for host networking.  RTP/RTCP are UDP, HTTP/WS are TCP.
-RTP_PORT  = 5000
-HTTP_PORT = 8080
-WS_PORT   = 8443
+# The caster's signalling server port must not collide with the service's
+# signalling server (both run on the test host via host networking).
+CASTER_SIGNALLING_PORT  = 8445   # caster exposes this; service's webrtcsrc dials it
+SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling
+HTTP_PORT               = 8080
 
-# Optional TURN config for both sides (set in CI to bypass Azure hairpin UDP).
+# Optional TURN config for both sides.
 GST_TURN_SERVER    = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_SERVER = os.environ.get("WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
-# ── Xvfb + red window (unchanged from single-container era) ─────────────────
-#
-# xlogo from x11-apps is a tiny long-running X11 client that actively redraws
-# itself on every Expose event.  Using -bg and -fg both set to the same hex
-# red paints the entire window red (the logo glyph is invisible against a
-# same-colored background).  We use xlogo rather than "xsetroot -solid" or a
-# Tk window because Xvfb does not enable backing store by default — any
-# client that paints once and then sits idle has its pixels fall out of the
-# framebuffer, leaving ximagesrc to capture black.  xlogo's continuous
-# redraw keeps the pixels live.
-
+# ── Xvfb + red window ────────────────────────────────────────────────────────
 
 def _assert_xvfb_is_red(display, xvfb_proc, red_window_proc):
     """Confirm the Xvfb root window's center pixel is red before yielding."""
@@ -117,7 +106,7 @@ def _cleanup_procs(*procs):
 
 @pytest.fixture(scope="session")
 def xvfb_display():
-    """Start Xvfb + red xlogo before any test runs.  See module docstring."""
+    """Start Xvfb + red xlogo before any test runs."""
     proc = subprocess.Popen(
         ["Xvfb", XVFB_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
         stdout=subprocess.DEVNULL,
@@ -179,58 +168,50 @@ def xvfb_display():
 def archive_dir(tmp_path_factory):
     """Host directory mounted into the service container as /archive."""
     path = tmp_path_factory.mktemp("archive")
-    # Relax perms so the service container (running as root inside) can
-    # write to the host-created directory regardless of the tmp umask.
     os.chmod(path, 0o777)
     return str(path)
 
 
-# ── Caster ──────────────────────────────────────────────────────────────────
+# ── Caster ───────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def _caster(xvfb_display):
     """
-    The caster container: X11 capture → H.264 → RTP push to SERVICE_HOST:RTP_PORT.
+    The caster container: X11 capture → webrtcsink (publishes to its own
+    signalling server on CASTER_SIGNALLING_PORT).
 
-    Runs with host networking so the service container (also host-networked)
-    can receive RTP at 127.0.0.1, and with host IPC so ximagesrc's MIT-SHM
-    attach can reach the host Xvfb's SysV shared-memory segment (otherwise
-    ximagesrc captures all-zero frames despite a successful X connection).
+    Must start before the service so the signalling server is ready when
+    webrtcsrc on the service tries to connect.
     """
     container = (
         DockerContainer(CASTER_IMAGE)
         .with_env("DISPLAY", xvfb_display)
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")
-        .with_env("SERVICE_HOST", "127.0.0.1")
-        .with_env("RTP_PORT", str(RTP_PORT))
+        .with_env("SIGNALLING_PORT", str(CASTER_SIGNALLING_PORT))
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         .with_kwargs(network_mode="host", ipc_mode="host")
     )
     with container:
-        # The caster logs "Starting capture:" once the pipeline is parsed.
-        # Give GStreamer a couple of seconds to reach PLAYING so that RTP
-        # datagrams are flowing before the service starts.
-        wait_for_logs(container, "Starting capture", timeout=30)
-        time.sleep(2.0)
+        # Wait until the caster's signalling server is confirmed ready.
+        wait_for_logs(container, "Signalling server ready", timeout=30)
+        time.sleep(1.0)   # give webrtcsink time to register as producer
         yield container
 
 
-# ── Service ─────────────────────────────────────────────────────────────────
+# ── Service ──────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def _service(_caster, archive_dir):
     """
-    The service container: RTP → tee → Matroska archive + webrtcsink.
+    The service container: webrtcsrc dials caster → tee → archive + webrtcsink.
 
-    Depends on _caster so the caster is already pushing RTP before the
-    service pipeline starts listening on the UDP port.
+    Depends on _caster so the caster's signalling server is up before
+    webrtcsrc attempts to connect.
     """
     container = (
         DockerContainer(SERVICE_IMAGE)
-        .with_env("DESKTOP_HOST", "127.0.0.1")   # RTCP RR feedback destination
-        .with_env("RTP_PORT", str(RTP_PORT))
-        # 20-second segments so test runs produce at least one complete
-        # segment well inside the test timeout budget; production default
-        # is 600 s.  Keep it an integer so splitmuxsink math is clean.
+        .with_env("CASTER_HOST", "127.0.0.1")
+        .with_env("CASTER_SIGNALLING_PORT", str(CASTER_SIGNALLING_PORT))
+        .with_env("SIGNALLING_PORT", str(SERVICE_SIGNALLING_PORT))
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping(archive_dir, "/archive", "rw")
@@ -240,18 +221,15 @@ def _service(_caster, archive_dir):
         yield container
 
 
-# ── streaming_container (compat shim, same return shape as before) ─────────
+# ── streaming_container ───────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def streaming_container(_service):
     """
-    Wait until the service container's HTTP + WebSocket are reachable,
+    Wait until the service's HTTP + WebSocket endpoints are reachable,
     then yield (http_port, ws_port).
-
-    With host networking the container's ports are the host's ports
-    directly — no dynamic mapping needed.
     """
     http_port = HTTP_PORT
-    ws_port = WS_PORT
+    ws_port   = SERVICE_SIGNALLING_PORT
 
     wait_for_logs(_service, "web server on port", timeout=60)
 

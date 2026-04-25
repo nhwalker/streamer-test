@@ -2,20 +2,20 @@
 # entrypoint.sh -- desktop-stream-service bootstrap.
 #
 # Starts three services in order and waits on all of them:
-#   1. gst-webrtc-signalling-server  (background, :SIGNALLING_PORT)
+#   1. gst-webrtc-signalling-server  (background, :SIGNALLING_PORT, for browser clients)
 #   2. python3 -m http.server        (background, :WEB_PORT, serves /var/www/html)
-#   3. pipeline.py                   (background, RTP -> tee -> archive + WebRTC)
+#   3. pipeline.py                   (background, connects to caster + serves browsers)
 set -euo pipefail
 
-# ── Config sanity ────────────────────────────────────────────────────────────
-if [ -z "${DESKTOP_HOST:-}" ]; then
-    echo "[service] WARNING: DESKTOP_HOST not set; RTCP bitrate feedback to caster disabled."
+# ── Config sanity ─────────────────────────────────────────────────────────────
+if [ -z "${CASTER_HOST:-}" ]; then
+    echo "[service] ERROR: CASTER_HOST is required (IP/hostname of the caster)"
+    exit 1
 fi
 
 mkdir -p "${ARCHIVE_DIR}"
 
 # ── GPU pre-flight ────────────────────────────────────────────────────────────
-# nvidia-container-toolkit injects nvidia-smi when --gpus is passed.
 if command -v nvidia-smi &>/dev/null; then
     echo "[service] NVIDIA GPU detected:"
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null \
@@ -24,7 +24,7 @@ else
     echo "[service] No NVIDIA GPU detected (software decode + encode will be used)."
 fi
 
-# ── Signalling server ────────────────────────────────────────────────────────
+# ── Signalling server (for browser WebRTC clients) ───────────────────────────
 echo "[service] Starting signalling server on ${SIGNALLING_HOST}:${SIGNALLING_PORT} ..."
 gst-webrtc-signalling-server \
     --host "${SIGNALLING_HOST}" \
@@ -35,7 +35,6 @@ PIPPID=""
 trap 'echo "[service] Shutting down..."; kill "${SIGPID}" 2>/dev/null; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; exit' \
      EXIT INT TERM
 
-# Readiness probe -- wait up to 2 s for the signalling server.
 READY=0
 for i in $(seq 1 20); do
     if nc -z 127.0.0.1 "${SIGNALLING_PORT}" 2>/dev/null; then
@@ -62,7 +61,7 @@ echo "│  Desktop Stream Service ready                       │"
 echo "│                                                     │"
 echo "│  Web page  : http://${HOST_IP}:${WEB_PORT}          "
 echo "│  Signalling: ws://${HOST_IP}:${SIGNALLING_PORT}     "
-echo "│  Caster    : rtp://${DESKTOP_HOST:-unknown}:${RTP_PORT} (RTCP feedback)  "
+echo "│  Caster    : ws://${CASTER_HOST}:${CASTER_SIGNALLING_PORT} (ingest)  "
 echo "│  Archive   : ${ARCHIVE_DIR}                         "
 echo "└─────────────────────────────────────────────────────┘"
 echo ""
