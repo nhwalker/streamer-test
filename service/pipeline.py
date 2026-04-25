@@ -47,7 +47,9 @@ gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
 
 DESKTOP_HOST        = os.environ.get('DESKTOP_HOST', '')
-RTP_PORT            = os.environ.get('RTP_PORT', '5000')
+RTP_PORT            = int(os.environ.get('RTP_PORT', '5000'))
+RTCP_SR             = RTP_PORT + 1
+RTCP_RR             = RTP_PORT + 2
 
 ARCHIVE_DIR         = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
@@ -89,17 +91,13 @@ def main():
     segment_ns = ARCHIVE_SEGMENT_SEC * Gst.SECOND
     archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mkv')
 
-    rtp_port = int(RTP_PORT)
-    rtcp_sr  = rtp_port + 1   # service listens for SR from caster
-    rtcp_rr  = rtp_port + 2   # service sends RR back to caster
-
     print('[service] Starting stream service:', flush=True)
-    print(f'  Caster RTP    : rtp://0.0.0.0:{rtp_port} (listening)')
+    print(f'  Caster RTP    : rtp://0.0.0.0:{RTP_PORT} (listening)')
     print(f'  Archive       : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Signalling    : {sig_uri}')
     print(f'  WebRTC codecs : {WEBRTC_VIDEO_CAPS}')
     if DESKTOP_HOST:
-        print(f'  RTCP RR→      : udp://{DESKTOP_HOST}:{rtcp_rr}')
+        print(f'  RTCP RR→      : udp://{DESKTOP_HOST}:{RTCP_RR}')
     if STUN:
         print(f'  STUN          : {STUN}')
     if TURN:
@@ -143,16 +141,16 @@ def main():
         'application/x-rtp,media=video,payload=96,'
         'clock-rate=90000,encoding-name=H264'
     )
-    udpsrc_rtp.set_property('port', rtp_port)
+    udpsrc_rtp.set_property('port', RTP_PORT)
     udpsrc_rtp.set_property('caps', rtp_caps)
 
     rtcp_caps = Gst.Caps.from_string('application/x-rtcp')
-    udpsrc_rtcp.set_property('port', rtcp_sr)
+    udpsrc_rtcp.set_property('port', RTCP_SR)
     udpsrc_rtcp.set_property('caps', rtcp_caps)
 
     if DESKTOP_HOST:
         udpsink_rtcp.set_property('host', DESKTOP_HOST)
-        udpsink_rtcp.set_property('port', rtcp_rr)
+        udpsink_rtcp.set_property('port', RTCP_RR)
         udpsink_rtcp.set_property('sync', False)
         udpsink_rtcp.set_property('async', False)
 
@@ -198,13 +196,14 @@ def main():
     vconvert.link(ws)
 
     # ── rtpbin emits recv_rtp_src_0_0 when the first RTP packet arrives.
+    _depay_sink = depay.get_static_pad('sink')
+
     def on_pad_added(_, pad):
         if not pad.get_name().startswith('recv_rtp_src_'):
             return
-        sink = depay.get_static_pad('sink')
-        if sink.is_linked():
+        if _depay_sink.is_linked():
             return
-        ret = pad.link(sink)
+        ret = pad.link(_depay_sink)
         if ret != Gst.PadLinkReturn.OK:
             print(f'[service] ERROR: rtpbin pad link failed: {ret}',
                   file=sys.stderr)
@@ -217,16 +216,17 @@ def main():
     if TURN:
         def on_deep_element_added(_bin, _sub_bin, element):
             factory = element.get_factory()
-            if factory and factory.get_name() == 'webrtcbin':
-                print('[service] webrtcbin found -- calling add-turn-server',
-                      flush=True)
-                try:
-                    ok = element.emit('add-turn-server', TURN)
-                    print(f'[service] add-turn-server: '
-                          f'{"OK" if ok else "FAILED"}', flush=True)
-                except Exception as exc:
-                    print(f'[service] WARNING: add-turn-server failed: {exc}',
-                          file=sys.stderr, flush=True)
+            if not factory or factory.get_name() != 'webrtcbin':
+                return
+            print('[service] webrtcbin found -- calling add-turn-server',
+                  flush=True)
+            try:
+                ok = element.emit('add-turn-server', TURN)
+                print(f'[service] add-turn-server: '
+                      f'{"OK" if ok else "FAILED"}', flush=True)
+            except Exception as exc:
+                print(f'[service] WARNING: add-turn-server failed: {exc}',
+                      file=sys.stderr, flush=True)
 
         pipeline.connect('deep-element-added', on_deep_element_added)
 
