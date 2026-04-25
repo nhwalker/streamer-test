@@ -28,13 +28,14 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
 
-DISPLAY    = os.environ.get('DISPLAY', ':0')
-WIDTH      = os.environ.get('STREAM_WIDTH', '1920')
-HEIGHT     = os.environ.get('STREAM_HEIGHT', '1080')
-FRAMERATE  = os.environ.get('STREAM_FRAMERATE', '30')
-SIG_PORT   = os.environ.get('SIGNALLING_PORT', '8443')
-STUN       = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
-TURN       = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
+DISPLAY      = os.environ.get('DISPLAY', ':0')
+WIDTH        = os.environ.get('STREAM_WIDTH', '1920')
+HEIGHT       = os.environ.get('STREAM_HEIGHT', '1080')
+FRAMERATE    = os.environ.get('STREAM_FRAMERATE', '30')
+SIG_PORT     = os.environ.get('SIGNALLING_PORT', '8443')
+STUN         = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
+TURN         = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
+CASTER_PEER_ID = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 
 
 def main():
@@ -70,6 +71,7 @@ def main():
 
     ws = pipeline.get_by_name('ws')
     ws.get_property('signaller').set_property('uri', sig_uri)
+    ws.get_property('signaller').set_property('our-peer-id', CASTER_PEER_ID)
     if STUN:
         ws.set_property('stun-server', STUN)
 

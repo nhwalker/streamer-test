@@ -41,6 +41,7 @@ from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_versi
 
 CASTER_HOST           = os.environ.get('CASTER_HOST', '')
 CASTER_SIG_PORT       = os.environ.get('CASTER_SIGNALLING_PORT', '8443')
+CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
@@ -129,6 +130,7 @@ def main():
 
     # ── Configure webrtcsrc (connects to caster's signalling server)
     wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
+    wsrc.set_property('producer-peer-id', CASTER_PEER_ID)
 
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
