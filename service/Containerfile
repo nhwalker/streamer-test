@@ -213,11 +213,12 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && dnf clean all
 
 # ── GStreamer runtime packages ──────────────────────────────────────────────
-# gstreamer1-plugins-bad-free : tsdemux, mp4mux, splitmuxsink, webrtcbin
-#                               (webrtcbin is overwritten below by the
-#                               source-built version; srt is NOT in
+# gstreamer1-plugins-good     : matroskamux + splitmuxsink (archive),
+#                               typefind, h264parse, videoconvert
+# gstreamer1-plugins-bad-free : webrtcbin (overwritten below by source-built
+#                               libsrtp2/libnice version); srt is NOT in
 #                               bad-free because libsrt is EPEL-only, so
-#                               srtsrc comes from the source-built plugin)
+#                               srtsrc comes from the source-built plugin
 # gstreamer1-plugins-ugly     : x264enc (software H.264 encode for H264
 #                               WebRTC peers when no GPU is available)
 # gstreamer1-plugin-libav     : avdec_h264 (software H.264 decode fallback)

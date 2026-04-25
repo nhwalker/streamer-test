@@ -2,9 +2,9 @@
 Archive tests for the desktop-stream-service container.
 
 The service container tees the incoming H.264 bitstream so that one branch
-writes to rotating MP4 segments via splitmuxsink + mp4mux.  These tests
-confirm the archive branch works end-to-end without relying on any
-external tooling (ffprobe etc.).
+writes to rotating Matroska (.mkv) segments via splitmuxsink + matroskamux.
+These tests confirm the archive branch works end-to-end without relying on
+any external tooling (ffprobe etc.).
 """
 import os
 import time
@@ -12,10 +12,10 @@ import time
 import pytest
 
 
-# MP4 files begin with a size-prefixed "ftyp" box.  The second 4 bytes of
-# any valid MP4 are the ASCII letters 'ftyp'.  We check this rather than a
-# full container parse to keep the test self-contained (no ffmpeg needed).
-MP4_FTYP_MAGIC = b"ftyp"
+# Every Matroska/EBML file starts with the EBML element header
+# 0x1A 0x45 0xDF 0xA3.  We check this rather than a full container parse
+# so the test stays self-contained (no ffmpeg dependency).
+EBML_MAGIC = b"\x1a\x45\xdf\xa3"
 
 
 def _wait_for_first_segment(archive_dir, timeout=30.0):
@@ -23,7 +23,7 @@ def _wait_for_first_segment(archive_dir, timeout=30.0):
     while time.monotonic() < deadline:
         files = sorted(
             f for f in os.listdir(archive_dir)
-            if f.startswith("stream-") and f.endswith(".mp4")
+            if f.startswith("stream-") and f.endswith(".mkv")
         )
         if files:
             return os.path.join(archive_dir, files[0])
@@ -32,12 +32,12 @@ def _wait_for_first_segment(archive_dir, timeout=30.0):
 
 
 class TestArchive:
-    """Verifies that SRT → h264parse → tee → mp4mux → splitmuxsink works."""
+    """Verifies SRT → h264parse → tee → matroskamux → splitmuxsink."""
 
     def test_first_segment_appears(self, streaming_container, archive_dir,
                                    _caster, _service):
         """
-        At least one stream-NNNNN.mp4 file shows up in the archive volume
+        At least one stream-NNNNN.mkv file shows up in the archive volume
         within a generous timeout of the service coming up.
 
         streaming_container is depended on to force the service (and caster)
@@ -52,7 +52,7 @@ class TestArchive:
             caster_out, caster_err   = _caster.get_logs()
             listing = os.listdir(archive_dir) if os.path.isdir(archive_dir) else []
             pytest.fail(
-                f"No stream-*.mp4 appeared in {archive_dir} within 30 s.\n"
+                f"No stream-*.mkv appeared in {archive_dir} within 30 s.\n"
                 f"Directory listing: {listing}\n"
                 f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
                 f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
@@ -60,47 +60,53 @@ class TestArchive:
                 f"===== service stderr =====\n{service_err.decode(errors='replace')}"
             )
 
-    def test_segment_is_valid_mp4(self, streaming_container, archive_dir):
+    def test_segment_is_valid_matroska(self, streaming_container, archive_dir,
+                                       _service):
         """
-        The first segment contains a valid MP4 'ftyp' atom at bytes 4–8.
+        The first segment starts with the EBML magic 1A 45 DF A3.
 
-        A single streamed keyframe + header is enough for splitmuxsink to
-        emit a well-formed file, so this runs well inside the session
-        timeout even though production segments are 10 min.
+        Matroska is streaming-by-default, so the file is readable as soon
+        as the first cluster is flushed -- no need to wait for the segment
+        boundary to rotate.
         """
         first = _wait_for_first_segment(archive_dir, timeout=30.0)
-        assert first is not None, "expected at least one .mp4 file"
+        assert first is not None, "expected at least one .mkv file"
 
-        # splitmuxsink writes the file progressively; wait briefly for the
-        # ftyp/moov to be flushed to disk before reading.
+        # Allow up to 10 s for the EBML header to land on disk.  In practice
+        # matroskamux flushes the header within milliseconds of the first
+        # buffer arriving, well before the first keyframe propagates through
+        # the rest of the pipeline.
         deadline = time.monotonic() + 10.0
         header = b""
         while time.monotonic() < deadline:
             try:
                 with open(first, "rb") as fh:
-                    header = fh.read(12)
+                    header = fh.read(4)
             except FileNotFoundError:
                 header = b""
-            if len(header) >= 8 and MP4_FTYP_MAGIC in header:
+            if header == EBML_MAGIC:
                 break
             time.sleep(0.5)
 
-        assert MP4_FTYP_MAGIC in header, (
-            f"Expected MP4 'ftyp' magic in first 12 bytes of {first}, "
-            f"got {header!r}"
-        )
+        if header != EBML_MAGIC:
+            service_out, service_err = _service.get_logs()
+            pytest.fail(
+                f"Expected EBML magic {EBML_MAGIC.hex()} at the start of "
+                f"{first}, got {header.hex()!r} ({len(header)} bytes).\n"
+                f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
+                f"===== service stderr =====\n{service_err.decode(errors='replace')}"
+            )
 
     def test_segment_has_content(self, streaming_container, archive_dir):
         """
-        The first segment grows past the empty-header size.  A fresh
-        splitmuxsink MP4 that never got any real frame data is under ~1 KB
-        (just ftyp + placeholder).  Real streamed content hits tens of KB
-        within a second or two at 1280x720.
+        The first segment grows past the EBML+SegmentInfo header size.
+        A fresh matroskamux file that never got any real frame data is
+        under ~1 KB (just EBML + SegmentInfo headers).  Real streamed
+        content hits tens of KB within a second or two at 1280x720.
         """
         first = _wait_for_first_segment(archive_dir, timeout=30.0)
-        assert first is not None, "expected at least one .mp4 file"
+        assert first is not None, "expected at least one .mkv file"
 
-        # Give splitmuxsink a few seconds to accumulate real frames.
         deadline = time.monotonic() + 15.0
         size = 0
         while time.monotonic() < deadline:

@@ -3,14 +3,18 @@
 pipeline.py -- desktop-stream-service: SRT ingress -> tee -> archive + WebRTC.
 
 srtsrc mode=caller -> typefind -> h264parse -> tee
-  tee. -> splitmuxsink mp4mux                    (archive, H.264 passthrough)
+  tee. -> splitmuxsink matroskamux               (archive, H.264 passthrough)
   tee. -> <nvh264dec|avdec_h264> -> webrtcsink   (decode once, per-peer encode)
 
 The tee sits before the decoder so the archive branch never decodes or
-re-encodes -- MP4 files are the caster's H.264 bytes muxed directly into
-segmented .mp4 files.  The WebRTC branch decodes once; webrtcsink then
-re-encodes per peer for adaptive bitrate, preferring nvh264enc by plugin
-rank when a GPU is present.
+re-encodes -- .mkv files are the caster's H.264 bytes muxed directly
+into segmented Matroska containers.  Matroska is streaming-by-default
+(no buffer-until-EOS like mp4mux), so the on-disk file is always
+readable and a kill -9 mid-segment loses at most one cluster.
+
+The WebRTC branch decodes once; webrtcsink then re-encodes per peer for
+adaptive bitrate, preferring nvh264enc by plugin rank when a GPU is
+present.
 
 Environment variables:
   DESKTOP_HOST           caster hostname (required)
@@ -18,7 +22,7 @@ Environment variables:
   SRT_LATENCY            SRT buffer in ms                      (40)
   SRT_PASSPHRASE         optional AES key (must match caster)  ("")
 
-  ARCHIVE_DIR            output dir for MP4 segments           (/archive)
+  ARCHIVE_DIR            output dir for .mkv segments          (/archive)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds           (600)
 
   SIGNALLING_PORT        signalling server port                (8443)
@@ -84,7 +88,7 @@ def main():
     sig_uri   = f'ws://127.0.0.1:{SIG_PORT}'
     # splitmuxsink max-size-time is in nanoseconds.
     segment_ns = ARCHIVE_SEGMENT_SEC * Gst.SECOND
-    archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mp4')
+    archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mkv')
 
     print('[service] Starting stream service:', flush=True)
     print(f'  Caster        : srt://{DESKTOP_HOST}:{DESKTOP_PORT} (caller)')
@@ -115,12 +119,11 @@ def main():
         f'! h264parse config-interval=1 '
         f'! tee name=t '
         f't. ! queue '
-        # No muxer-factory= here: we attach a pre-configured mp4mux instance
-        # via the `muxer` property below so we can set fragment-duration on
-        # it directly (the prior muxer-properties approach silently produced
-        # a 0-byte file -- we couldn't tell whether the property was applied
-        # or whether mp4mux ignored it).
-        f'   ! splitmuxsink name=archive '
+        # matroskamux is streaming-by-default: writes EBML headers and
+        # cluster data continuously as buffers arrive, so the on-disk
+        # file is always readable mid-segment.  No fragment-duration to
+        # tune, no buffer-until-EOS surprise.
+        f'   ! splitmuxsink name=archive muxer-factory=matroskamux '
         f'     location="{archive_pattern}" '
         f'     max-size-time={segment_ns} '
         f't. ! queue '
@@ -141,30 +144,6 @@ def main():
     ws = pipeline.get_by_name('ws')
     ws.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
 
-    # Enable fragmented MP4 on the archive muxer.  Non-fragmented mp4mux
-    # buffers ftyp/moov until EOS, which leaves in-progress segment files
-    # unreadable (0 bytes until splitmuxsink rotates).  Fragmented mode
-    # emits moof+mdat every fragment-duration milliseconds, so the file on
-    # disk always starts with ftyp+moov and grows continuously -- a kill
-    # -9 mid-segment loses at most one fragment.  Playback compat is
-    # unaffected (browsers, ffprobe, VLC all handle fMP4; it's the same
-    # wire format as DASH/HLS).
-    #
-    # We construct mp4mux ourselves and pass it via splitmuxsink's `muxer`
-    # property rather than relying on muxer-factory + muxer-properties --
-    # this lets us readback-verify fragment-duration in the log so we know
-    # for certain whether the property took.
-    mp4mux = Gst.ElementFactory.make('mp4mux', None)
-    if mp4mux is None:
-        print('[service] ERROR: failed to create mp4mux element',
-              file=sys.stderr)
-        sys.exit(1)
-    mp4mux.set_property('fragment-duration', 1000)
-    print(f'[service] mp4mux fragment-duration='
-          f'{mp4mux.get_property("fragment-duration")}', flush=True)
-
-    archive = pipeline.get_by_name('archive')
-    archive.set_property('muxer', mp4mux)
 
     # TURN is per-consumer on webrtcsink 0.13.x (no top-level property).
     # Same pattern as the legacy pipeline: hook deep-element-added and call
