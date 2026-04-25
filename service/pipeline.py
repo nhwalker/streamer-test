@@ -136,6 +136,20 @@ def main():
     ws = pipeline.get_by_name('ws')
     ws.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
 
+    # Enable fragmented MP4 on the archive muxer: mp4mux defaults to
+    # writing ftyp/moov only at EOS, which leaves in-progress segment
+    # files unreadable (0 bytes until the splitmuxsink rotation boundary).
+    # fragment-duration=1000 emits a moof+mdat fragment every second, so
+    # the file on disk always starts with ftyp+moov and grows continuously
+    # -- a kill -9 mid-segment loses at most one fragment instead of the
+    # whole segment.  Playback compat is unaffected (browsers, ffprobe,
+    # VLC all handle fMP4; it's the same wire format as DASH/HLS).
+    archive = pipeline.get_by_name('archive')
+    muxer_props = Gst.Structure.from_string(
+        'properties,fragment-duration=1000'
+    )[0]
+    archive.set_property('muxer-properties', muxer_props)
+
     # TURN is per-consumer on webrtcsink 0.13.x (no top-level property).
     # Same pattern as the legacy pipeline: hook deep-element-added and call
     # add-turn-server on every webrtcbin the sink spawns.
