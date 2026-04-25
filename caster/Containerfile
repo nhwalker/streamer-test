@@ -1,0 +1,157 @@
+# ─── Build Stage ─────────────────────────────────────────────────────────────
+# Builds the GStreamer `nvcodec` plugin from source so nvh264enc is available
+# on the runtime image.  No Rust, no Node, no WebRTC -- the caster is purely
+# capture + encode + SRT send.
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
+
+# ── Repos: Rocky Linux 10 supplement at lower priority ───────────────────────
+# Same pattern as the service container: Rocky 10 fills in packages UBI10
+# doesn't ship (mainly *-devel headers for the nvcodec meson build), without
+# overriding UBI-provided versions.
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && printf '%s\n' \
+        '[rocky10-baseos]' \
+        'name=Rocky Linux 10 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-appstream]' \
+        'name=Rocky Linux 10 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-crb]' \
+        'name=Rocky Linux 10 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky10-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+    && dnf clean all
+
+# ── Build dependencies for the nvcodec + srt meson build ────────────────────
+# libsrt-devel is in EPEL10 only (not RHEL10 base or Rocky CRB), which is
+# why the packaged gstreamer1-plugins-bad-free has no srtsink -- Red Hat
+# builds bad-free without libsrt since it's not in their base repos.  We
+# add it here so the source-built srt plugin can link against it.
+RUN dnf install -y \
+        gcc gcc-c++ make \
+        pkgconf-pkg-config \
+        git \
+        meson ninja-build \
+        python3 \
+        gstreamer1-devel \
+        gstreamer1-plugins-base-devel \
+        gstreamer1-plugins-bad-free-devel \
+        srt-devel \
+    && dnf clean all
+
+# ── Build nvcodec + srt from the GStreamer monorepo at the matching version ─
+# nvcodec  : nvh264enc/nvh264dec (dlopen'd at runtime; silently skipped when
+#            no GPU is present, so pipeline.py falls back to x264enc).
+# srt      : srtsink (listener mode).  Not in RHEL10's packaged bad-free
+#            because libsrt is EPEL-only -- we rebuild it with libsrt linked.
+RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
+    && echo "=== Building nvcodec + srt for GStreamer ${GST_VER} ===" \
+    && git clone --depth 1 --branch "${GST_VER}" \
+           https://gitlab.freedesktop.org/gstreamer/gstreamer.git /gst-src \
+    && cd /gst-src/subprojects/gst-plugins-bad \
+    && meson setup builddir \
+           --prefix=/opt/gst-nvcodec \
+           --libdir=lib \
+           -Dauto_features=disabled \
+           -Dnvcodec=enabled \
+           -Dsrt=enabled \
+    && ninja -C builddir -j2 \
+    && meson install -C builddir \
+    && find /opt/gst-nvcodec -name "*.so*" | sort
+
+
+# ─── Runtime Stage ───────────────────────────────────────────────────────────
+FROM registry.access.redhat.com/ubi10/ubi:latest
+
+# ── Repos: Rocky 10 + EPEL10 + RPM Fusion Free (for x264enc) ────────────────
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && printf '%s\n' \
+        '[rocky10-baseos]' \
+        'name=Rocky Linux 10 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-appstream]' \
+        'name=Rocky Linux 10 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky10-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
+    && dnf clean all
+
+# ── GStreamer runtime packages ──────────────────────────────────────────────
+# gstreamer1-plugins-good   : ximagesrc (X11 capture)
+# gstreamer1-plugins-bad-free : srtsink, mpegtsmux
+# gstreamer1-plugins-ugly   : x264enc (software H.264 fallback, via RPM Fusion)
+RUN dnf install -y \
+        gstreamer1 \
+        gstreamer1-plugins-base \
+        gstreamer1-plugins-good \
+        gstreamer1-plugins-bad-free \
+        gstreamer1-plugins-ugly \
+        srt-libs \
+        python3 \
+        python3-gobject \
+    && dnf clean all
+
+# ── nvcodec plugin + its companion libgstcuda ───────────────────────────────
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
+COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
+
+# ── srt plugin (built from source alongside nvcodec) ────────────────────────
+COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrt.so /usr/local/lib/gstreamer-1.0/
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
+
+# ── Application ─────────────────────────────────────────────────────────────
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY pipeline.py   /usr/local/bin/pipeline.py
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py
+
+# ── Environment defaults ────────────────────────────────────────────────────
+# NVIDIA_VISIBLE_DEVICES / NVIDIA_DRIVER_CAPABILITIES are no-ops without --gpus.
+ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
+    DISPLAY=:0 \
+    STREAM_WIDTH=1920 \
+    STREAM_HEIGHT=1080 \
+    STREAM_FRAMERATE=30 \
+    STREAM_BITRATE=6000 \
+    SRT_PORT=9000 \
+    SRT_LATENCY=40 \
+    SRT_PASSPHRASE="" \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=video,compute
+
+EXPOSE 9000/udp
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
