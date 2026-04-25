@@ -98,10 +98,15 @@ jobs:
           path: /tmp/artifacts/base
 
       - name: Extract base OCI layout
+        id: base-oci
         run: |
           mkdir -p /tmp/base-oci
           tar -xf /tmp/artifacts/base/streamer-base.tar -C /tmp/base-oci
-          ls /tmp/base-oci
+          # Pick the first manifest's digest so oci-layout:// can resolve
+          # unambiguously when the index contains multiple tag annotations.
+          DIGEST=$(jq -r '.manifests[0].digest' /tmp/base-oci/index.json)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Base digest: ${DIGEST}"
 
       - name: Extract metadata
         id: meta
@@ -132,7 +137,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Containerfile
           build-contexts: |
-            streamer-base=oci-layout:///tmp/base-oci
+            streamer-base=oci-layout:///tmp/base-oci@${{ steps.base-oci.outputs.digest }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           push: ${{ github.event_name != 'pull_request' }}
