@@ -1,0 +1,142 @@
+# ─── Base Builder ─────────────────────────────────────────────────────────────
+# Produces compiled GStreamer artifacts shared by both the caster and service:
+#   /opt/gst-rs/                 — all gst-plugins-rs Rust plugins
+#   /opt/gst-nvcodec/            — nvcodec (nvh264enc/dec) + webrtcbin rebuilt
+#                                  with libsrtp2 + libnice (RHEL10 omits both)
+#   /opt/gst-webrtc-signalling-server — WebSocket signalling server binary
+#   /src/                        — gst-plugins-rs source (kept for JS bundle)
+#
+# The caster and service Containerfiles each do:
+#   FROM streamer-base:latest AS base
+#   FROM ubi10 AS runtime
+#   COPY --from=base /opt/... /...
+FROM registry.access.redhat.com/ubi10/ubi:latest
+
+# ── Repos: Rocky Linux 10 supplement at lower priority ───────────────────────
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && printf '%s\n' \
+        '[rocky10-baseos]' \
+        'name=Rocky Linux 10 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-appstream]' \
+        'name=Rocky Linux 10 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        '' \
+        '[rocky10-crb]' \
+        'name=Rocky Linux 10 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky10-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+    && dnf clean all
+
+# ── OS build dependencies ─────────────────────────────────────────────────────
+RUN dnf install -y \
+        gcc gcc-c++ make \
+        pkgconf-pkg-config \
+        git curl ca-certificates \
+        meson ninja-build cmake \
+        python3 \
+        gstreamer1-devel \
+        gstreamer1-plugins-base-devel \
+        gstreamer1-plugins-bad-free-devel \
+        openssl-devel \
+        libnice-devel \
+        libsodium-devel \
+        zvbi-devel \
+        libwebp-devel \
+        gtk4-devel \
+        libsrtp-devel \
+    && dnf clean all
+
+# ── usrsctp (static lib required by GStreamer's SCTP/DataChannel) ─────────────
+RUN git clone --depth 1 https://github.com/sctplab/usrsctp.git /usrsctp-src \
+    && cmake -S /usrsctp-src -B /usrsctp-src/build \
+             -DCMAKE_INSTALL_PREFIX=/usr \
+             -Dsctp_build_shared_lib=OFF \
+             -Dsctp_werror=OFF \
+    && cmake --build /usrsctp-src/build --parallel 2 \
+    && cmake --install /usrsctp-src/build \
+    && rm -rf /usrsctp-src
+
+# ── Rust toolchain ────────────────────────────────────────────────────────────
+RUN curl -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain stable --no-modify-path \
+    && /root/.cargo/bin/cargo install cargo-c
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ── Clone gst-plugins-rs ─────────────────────────────────────────────────────
+# /src is kept after the build so the service Containerfile can build the
+# gstwebrtc-api JS bundle from /src/net/webrtc/gstwebrtc-api.
+ARG GST_PLUGINS_RS_TAG=0.13.3
+RUN git clone --depth 1 --branch "${GST_PLUGINS_RS_TAG}" \
+        https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git /src
+
+WORKDIR /src
+
+# ── Pre-fetch all Cargo dependencies ─────────────────────────────────────────
+RUN cargo fetch
+
+# ── Build every GStreamer Rust plugin ─────────────────────────────────────────
+RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c \
+    'import sys,json;d=json.load(sys.stdin);print(" ".join(p["name"] for p in d["packages"] if any("cdylib" in t.get("crate_types",[]) for t in p["targets"])))') \
+    && echo "=== Rust plugin packages to build ===" \
+    && echo "$PKGS" | tr ' ' '\n' \
+    && INSTALLED=0; FAILED=0 \
+    && for pkg in $PKGS; do \
+        echo "--- Building: $pkg ---"; \
+        if cargo cinstall -p "$pkg" --release \
+               --prefix=/opt/gst-rs --libdir=lib --jobs 2; then \
+            INSTALLED=$((INSTALLED + 1)); \
+            echo "+++ OK: $pkg"; \
+        else \
+            FAILED=$((FAILED + 1)); \
+            echo "!!! SKIP: $pkg (build failed — missing native library?)"; \
+        fi; \
+    done \
+    && echo "=== Rust plugin build complete: ${INSTALLED} installed, ${FAILED} skipped ===" \
+    && find /opt/gst-rs -name "*.so" | sort
+
+# ── WebRTC signalling server binary ──────────────────────────────────────────
+RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
+    && install -m755 target/release/gst-webrtc-signalling-server \
+                     /opt/gst-webrtc-signalling-server \
+    && rm -rf /src/target /root/.cargo/registry /root/.rustup
+
+# ── nvcodec + webrtcbin from the GStreamer monorepo ──────────────────────────
+# webrtcbin is rebuilt with libsrtp2 + libnice + sctp enabled because RHEL10's
+# packaged webrtcbin is built without libsrtp2, so DTLS-SRTP does not work.
+WORKDIR /
+RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
+    && echo "=== Building nvcodec + webrtcbin for GStreamer ${GST_VER} ===" \
+    && git clone --depth 1 --branch "${GST_VER}" \
+           https://gitlab.freedesktop.org/gstreamer/gstreamer.git /gst-src \
+    && cd /gst-src/subprojects/gst-plugins-bad \
+    && meson setup builddir \
+           --prefix=/opt/gst-nvcodec \
+           --libdir=lib \
+           -Dauto_features=disabled \
+           -Dnvcodec=enabled \
+           -Dwebrtc=enabled \
+           -Ddtls=enabled \
+           -Dsctp=enabled \
+           -Dsrtp=enabled \
+    && ninja -C builddir -j2 \
+    && meson install -C builddir \
+    && find /opt/gst-nvcodec -name "*.so*" | sort

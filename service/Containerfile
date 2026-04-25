@@ -1,120 +1,14 @@
-# ─── Build Stage ─────────────────────────────────────────────────────────────
-# Builds everything we need that isn't packaged in RHEL10/UBI10:
-#   * usrsctp (static lib)            — linked into libgstsctp-1.0.so
-#   * gst-plugins-rs @ 0.13.3         — webrtcsink, gst-webrtc-signalling-server
-#   * gstwebrtc-api JS bundle         — browser-side library
-#   * GStreamer monorepo subset       — nvcodec (NVENC/NVDEC) + webrtcbin rebuild
-#                                        with libsrtp2 + libnice (RHEL10 omits both)
-FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
+# ─── Artifacts from shared base ──────────────────────────────────────────────
+# streamer-base must be built first:  podman build -t streamer-base base/
+FROM streamer-base:latest AS base
 
-# ── Repos: Rocky Linux 10 supplement at lower priority ───────────────────────
-RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
-    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
-    && printf '%s\n' \
-        '[rocky10-baseos]' \
-        'name=Rocky Linux 10 - BaseOS' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
-        'enabled=1' \
-        'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
-        'priority=100' \
-        '' \
-        '[rocky10-appstream]' \
-        'name=Rocky Linux 10 - AppStream' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
-        'enabled=1' \
-        'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
-        'priority=100' \
-        '' \
-        '[rocky10-crb]' \
-        'name=Rocky Linux 10 - CRB' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
-        'enabled=1' \
-        'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
-        'priority=100' \
-        > /etc/yum.repos.d/rocky10-supplement.repo \
-    && dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
-    && dnf clean all
+# ─── JS Bundle Builder ───────────────────────────────────────────────────────
+# Builds the gstwebrtc-api browser-side library from the gst-plugins-rs source
+# tree that was cloned into /src by the base image.
+FROM base AS js-builder
 
-# ── A: OS build dependencies ─────────────────────────────────────────────────
-RUN dnf install -y \
-        gcc gcc-c++ make \
-        pkgconf-pkg-config \
-        git curl ca-certificates \
-        meson ninja-build cmake \
-        python3 \
-        gstreamer1-devel \
-        gstreamer1-plugins-base-devel \
-        gstreamer1-plugins-bad-free-devel \
-        nodejs npm \
-        openssl-devel \
-        libnice-devel \
-        libsodium-devel \
-        zvbi-devel \
-        libwebp-devel \
-        gtk4-devel \
-        libsrtp-devel \
-    && dnf clean all
+RUN dnf install -y nodejs npm && dnf clean all
 
-# ── A2: Build usrsctp from source (static lib) ───────────────────────────────
-RUN git clone --depth 1 https://github.com/sctplab/usrsctp.git /usrsctp-src \
-    && cmake -S /usrsctp-src -B /usrsctp-src/build \
-             -DCMAKE_INSTALL_PREFIX=/usr \
-             -Dsctp_build_shared_lib=OFF \
-             -Dsctp_werror=OFF \
-    && cmake --build /usrsctp-src/build --parallel 2 \
-    && cmake --install /usrsctp-src/build \
-    && rm -rf /usrsctp-src
-
-# ── B: Rust toolchain ────────────────────────────────────────────────────────
-RUN curl -sSf https://sh.rustup.rs | \
-        sh -s -- -y --default-toolchain stable --no-modify-path \
-    && /root/.cargo/bin/cargo install cargo-c
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# ── C: Clone gst-plugins-rs ──────────────────────────────────────────────────
-ARG GST_PLUGINS_RS_TAG=0.13.3
-RUN git clone --depth 1 --branch "${GST_PLUGINS_RS_TAG}" \
-        https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git /src
-
-WORKDIR /src
-
-# ── D: Pre-fetch all Cargo dependencies offline ──────────────────────────────
-RUN cargo fetch
-
-# ── E: Build and install every GStreamer Rust plugin ─────────────────────────
-RUN PKGS=$(cargo metadata --format-version 1 --no-deps | python3 -c \
-    'import sys,json;d=json.load(sys.stdin);print(" ".join(p["name"] for p in d["packages"] if any("cdylib" in t.get("crate_types",[]) for t in p["targets"])))') \
-    && echo "=== Rust plugin packages to build ===" \
-    && echo "$PKGS" | tr ' ' '\n' \
-    && INSTALLED=0; FAILED=0 \
-    && for pkg in $PKGS; do \
-        echo "--- Building: $pkg ---"; \
-        if cargo cinstall -p "$pkg" --release \
-               --prefix=/opt/gst-rs --libdir=lib --jobs 2; then \
-            INSTALLED=$((INSTALLED + 1)); \
-            echo "+++ OK: $pkg"; \
-        else \
-            FAILED=$((FAILED + 1)); \
-            echo "!!! SKIP: $pkg (build failed — missing native library?)"; \
-        fi; \
-    done \
-    && echo "=== Rust plugin build complete: ${INSTALLED} installed, ${FAILED} skipped ===" \
-    && find /opt/gst-rs -name "*.so" | sort
-
-# ── F: Build the WebRTC signalling server binary ─────────────────────────────
-RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
-    && install -m755 target/release/gst-webrtc-signalling-server \
-                     /opt/gst-webrtc-signalling-server \
-    && rm -rf /src/target /root/.cargo/registry /root/.rustup
-
-# ── G: Build the gstwebrtc-api JavaScript bundle ─────────────────────────────
 WORKDIR /src/net/webrtc/gstwebrtc-api
 RUN npm install && npm run build && \
     OUTPUT_DIR="" && \
@@ -143,38 +37,11 @@ RUN npm install && npm run build && \
         echo "Symlinked: $(basename "${ENTRY}") -> gstwebrtc-api.js"; \
     fi
 
-# ── H: Build nvcodec + webrtcbin from the GStreamer monorepo ─────────────────
-# nvcodec: NVENC + NVDEC (H.264 encode and decode).  The service container
-# uses NVDEC to decode the incoming SRT stream once, and NVENC (via
-# webrtcsink's automatic encoder selection) to re-encode for H.264 peers.
-# webrtcbin: rebuild with libsrtp2 + libnice + sctp enabled so DTLS-SRTP
-# actually works (RHEL10's packaged webrtcbin is built without libsrtp2).
-WORKDIR /
-RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
-    && echo "=== Building nvcodec + webrtcbin for GStreamer ${GST_VER} ===" \
-    && git clone --depth 1 --branch "${GST_VER}" \
-           https://gitlab.freedesktop.org/gstreamer/gstreamer.git /gst-src \
-    && cd /gst-src/subprojects/gst-plugins-bad \
-    && meson setup builddir \
-           --prefix=/opt/gst-nvcodec \
-           --libdir=lib \
-           -Dauto_features=disabled \
-           -Dnvcodec=enabled \
-           -Dwebrtc=enabled \
-           -Ddtls=enabled \
-           -Dsctp=enabled \
-           -Dsrtp=enabled \
-    && ninja -C builddir -j2 \
-    && meson install -C builddir \
-    && find /opt/gst-nvcodec -name "*.so*" | sort
-
 
 # ─── Runtime Stage ───────────────────────────────────────────────────────────
 FROM registry.access.redhat.com/ubi10/ubi:latest
 
 # ── Repos: Rocky 10 + EPEL10 + RPM Fusion Free ───────────────────────────────
-# RPM Fusion Free for EL10 provides gstreamer1-plugin-libav (avdec_h264 for
-# software H.264 decode fallback) and gstreamer1-plugins-ugly.
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
     && printf '%s\n' \
@@ -211,14 +78,6 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && dnf clean all
 
 # ── GStreamer runtime packages ──────────────────────────────────────────────
-# gstreamer1-plugins-good     : rtpbin, rtph264depay, udpsrc, udpsink,
-#                               matroskamux + splitmuxsink (archive),
-#                               h264parse, videoconvert
-# gstreamer1-plugins-bad-free : webrtcbin (overwritten below by source-built
-#                               libsrtp2/libnice version)
-# gstreamer1-plugins-ugly     : x264enc (software H.264 encode for H264
-#                               WebRTC peers when no GPU is available)
-# gstreamer1-plugin-libav     : avdec_h264 (software H.264 decode fallback)
 RUN dnf install -y \
         gstreamer1 \
         gstreamer1-plugins-base \
@@ -239,48 +98,48 @@ RUN dnf install -y \
         python3-gobject \
     && dnf clean all
 
-# Rust plugins (webrtcsink and friends).
-COPY --from=builder /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
+# ── Rust GStreamer plugins ────────────────────────────────────────────────────
+COPY --from=base /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
 
-# nvcodec + its companion libgstcuda.
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
-COPY --from=builder /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
+# ── nvcodec + libgstcuda ─────────────────────────────────────────────────────
+COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
+COPY --from=base /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
 
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 
-# Replace RHEL10's webrtcbin/dtls/sctp/srtp with our libsrtp2+libnice build.
-# See the upstream repo's README for why this is necessary.
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so   /usr/lib64/gstreamer-1.0/libgstdtls.so
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so   /usr/lib64/gstreamer-1.0/libgstsctp.so
-COPY --from=builder /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so   /usr/lib64/gstreamer-1.0/libgstsrtp.so
-COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so*     /usr/lib64/
-COPY --from=builder /opt/gst-nvcodec/lib/libgstwebrtcnice-1.0.so* /usr/lib64/
-COPY --from=builder /opt/gst-nvcodec/lib/libgstsctp-1.0.so*       /usr/lib64/
+# ── Replace RHEL10's webrtcbin/dtls/sctp/srtp with our libsrtp2+libnice build ─
+COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
+COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so   /usr/lib64/gstreamer-1.0/libgstdtls.so
+COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so   /usr/lib64/gstreamer-1.0/libgstsctp.so
+COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so   /usr/lib64/gstreamer-1.0/libgstsrtp.so
+COPY --from=base /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so*     /usr/lib64/
+COPY --from=base /opt/gst-nvcodec/lib/libgstwebrtcnice-1.0.so* /usr/lib64/
+COPY --from=base /opt/gst-nvcodec/lib/libgstsctp-1.0.so*       /usr/lib64/
 RUN ldconfig
 
-# Signalling server binary.
-COPY --from=builder /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
+# ── Signalling server binary ──────────────────────────────────────────────────
+COPY --from=base /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
 RUN chmod +x /usr/local/bin/gst-webrtc-signalling-server
 
-# Browser-side JS library + web page.
-COPY --from=builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
+# ── Browser-side JS library + web page ───────────────────────────────────────
+COPY --from=js-builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 COPY web/index.html /var/www/html/index.html
 
-# Application scripts.
+# ── Application scripts ───────────────────────────────────────────────────────
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY pipeline.py   /usr/local/bin/pipeline.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py
 
-# Default archive volume (mount a host directory here at runtime).
+# ── Default archive volume ────────────────────────────────────────────────────
 VOLUME /archive
 
 # ── Environment defaults (all overridable at runtime via -e) ────────────────
 ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
-    DESKTOP_HOST="" \
-    RTP_PORT=5000 \
+    CASTER_HOST="" \
+    CASTER_SIGNALLING_PORT=8443 \
     ARCHIVE_DIR=/archive \
     ARCHIVE_SEGMENT_SEC=600 \
+    ARCHIVE_BITRATE=6000 \
     SIGNALLING_HOST=0.0.0.0 \
     SIGNALLING_PORT=8443 \
     WEB_PORT=8080 \

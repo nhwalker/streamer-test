@@ -1,17 +1,11 @@
 #!/bin/bash
 # entrypoint.sh -- desktop-caster bootstrap.
 #
-# 1. Verify SERVICE_HOST is set (required for RTP push destination).
-# 2. Verify the X11 display is reachable (ximagesrc silently produces black
-#    frames when it cannot open the display -- catch this up front).
-# 3. Log GPU info if nvidia-container-toolkit injected nvidia-smi.
+# 1. Verify the X11 display is reachable.
+# 2. Log GPU info if nvidia-container-toolkit injected nvidia-smi.
+# 3. Start the WebRTC signalling server (service connects to it via webrtcsrc).
 # 4. exec pipeline.py.
 set -euo pipefail
-
-if [ -z "${SERVICE_HOST:-}" ]; then
-    echo "[caster] ERROR: SERVICE_HOST is required (IP/hostname of the service)"
-    exit 1
-fi
 
 echo "[caster] Checking X11 display: ${DISPLAY}"
 if ! gst-launch-1.0 ximagesrc num-buffers=1 ! fakesink sync=false 2>/dev/null; then
@@ -31,5 +25,31 @@ else
     echo "[caster] No NVIDIA GPU detected (software encoding will be used)."
 fi
 
-echo "[caster] Pushing RTP to ${SERVICE_HOST}:${RTP_PORT}"
+# ── Signalling server ─────────────────────────────────────────────────────────
+# The service's webrtcsrc connects to this server to receive the stream.
+echo "[caster] Starting signalling server on ${SIGNALLING_HOST}:${SIGNALLING_PORT} ..."
+gst-webrtc-signalling-server \
+    --host "${SIGNALLING_HOST}" \
+    --port "${SIGNALLING_PORT}" &
+SIGPID=$!
+
+trap 'echo "[caster] Shutting down..."; kill "${SIGPID}" 2>/dev/null; exit' \
+     EXIT INT TERM
+
+# Readiness probe — wait up to 2 s for the signalling server.
+READY=0
+for i in $(seq 1 20); do
+    if nc -z 127.0.0.1 "${SIGNALLING_PORT}" 2>/dev/null; then
+        READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "${READY}" -eq 0 ]; then
+    echo "[caster] ERROR: Signalling server did not become ready within 2 s."
+    exit 1
+fi
+echo "[caster] Signalling server ready."
+echo "[caster] Service should connect webrtcsrc to ws://CASTER_HOST:${SIGNALLING_PORT}"
+
 exec python3 -u /usr/local/bin/pipeline.py
