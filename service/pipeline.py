@@ -129,7 +129,6 @@ def main():
 
     # ── Configure webrtcsrc (connects to caster's signalling server)
     wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
-    wsrc.set_property('video-caps', Gst.Caps.from_string('video/x-h264'))
 
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
