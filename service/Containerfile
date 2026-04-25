@@ -126,9 +126,10 @@ COPY --from=js-builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 COPY web/index.html /var/www/html/index.html
 
 # ── Application scripts ───────────────────────────────────────────────────────
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY pipeline.py   /usr/local/bin/pipeline.py
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py
+COPY entrypoint.sh  /usr/local/bin/entrypoint.sh
+COPY pipeline.py    /usr/local/bin/pipeline.py
+COPY web_server.py  /usr/local/bin/web_server.py
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py /usr/local/bin/web_server.py
 
 # ── Default archive volume ────────────────────────────────────────────────────
 VOLUME /archive
@@ -142,6 +143,7 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     ARCHIVE_BITRATE=6000 \
     SIGNALLING_HOST=0.0.0.0 \
     SIGNALLING_PORT=8443 \
+    CROP_HEIGHT=1080 \
     WEB_PORT=8080 \
     GST_WEBRTC_STUN_SERVER="" \
     GST_WEBRTC_TURN_SERVER="" \
@@ -150,5 +152,7 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
 
 EXPOSE 8080/tcp
 EXPOSE 8443/tcp
+EXPOSE 8444/tcp
+EXPOSE 8445/tcp
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -50,7 +50,10 @@
 
     Query parameters:
       ?signalling=ws://host:8443   Override the signalling server URL.
-                                   Defaults to ws://<this page's hostname>:8443
+                                   Defaults based on URL path:
+                                     /        -> ws://<hostname>:8443  (full stream)
+                                     /top     -> ws://<hostname>:8444  (top half)
+                                     /bottom  -> ws://<hostname>:8445  (bottom half)
       ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
                                      browser and container are on different hosts.
   -->
@@ -97,8 +100,10 @@
   <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
   <script>
     const params   = new URLSearchParams(window.location.search);
+    const path     = window.location.pathname.replace(/\/$/, '');
+    const sigPort  = path === '/top' ? 8444 : path === '/bottom' ? 8445 : 8443;
     const sigUrl   = params.get('signalling') ??
-                     `ws://${window.location.hostname}:8443`;
+                     `ws://${window.location.hostname}:${sigPort}`;
     const stunUrl  = params.get('stun');
     const turnUri  = params.get('turn_uri');
     const turnUser = params.get('turn_user');

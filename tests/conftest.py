@@ -38,12 +38,27 @@ SERVICE_IMAGE = os.environ.get("SERVICE_IMAGE", "desktop-stream-service:ci")
 
 XVFB_DISPLAY  = ":99"
 XVFB_GEOMETRY = "1280x720x24"
+STREAM_WIDTH  = 1280
+STREAM_HEIGHT = 720
+CROP_HEIGHT   = STREAM_HEIGHT // 2   # 360 — split point for top/bottom tests
 
 # The caster's signalling server port must not collide with the service's
-# signalling server (both run on the test host via host networking).
-CASTER_SIGNALLING_PORT  = 8445   # caster exposes this; service's webrtcsrc dials it
-SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling
+# signalling servers (8443/8444/8445); use 8448 on the test host.
+CASTER_SIGNALLING_PORT  = 8448   # caster exposes this; service's webrtcsrc dials it
+SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling (full stream)
+WS_PORT_TOP             = 8444   # service top-half signalling
+WS_PORT_BOTTOM          = 8445   # service bottom-half signalling
 HTTP_PORT               = 8080
+
+# Two-tone chain (separate Xvfb/caster/service for crop-offset colour tests).
+# Ports are kept well apart from the regular chain to allow both to coexist in
+# the same pytest session on a host-networked Docker setup.
+TWO_TONE_DISPLAY                  = ":98"
+CASTER_TWO_TONE_SIGNALLING_PORT   = 8449
+TWO_TONE_SIGNALLING_PORT          = 8453   # +1 = 8454 (top), +2 = 8455 (bottom)
+TWO_TONE_WS_PORT_TOP              = 8454
+TWO_TONE_WS_PORT_BOTTOM           = 8455
+TWO_TONE_HTTP_PORT                = 8090
 
 # Optional TURN config for both sides.
 GST_TURN_SERVER    = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
@@ -53,6 +68,21 @@ WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
 
 
 # ── Xvfb + red window ────────────────────────────────────────────────────────
+
+def _sample_pixel(display, x, y):
+    """Return the ImageMagick pixel string at (x, y) on *display*."""
+    xwd = subprocess.run(
+        ["xwd", "-display", display, "-root", "-silent"],
+        check=True, timeout=5,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    result = subprocess.run(
+        ["convert", "xwd:-", "-format", f"%[pixel:p{{{x},{y}}}]", "info:"],
+        check=True, timeout=5, input=xwd.stdout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    return result.stdout.decode(errors="replace").strip()
+
 
 def _assert_xvfb_is_red(display, xvfb_proc, red_window_proc):
     """Confirm the Xvfb root window's center pixel is red before yielding."""
@@ -242,6 +272,7 @@ def _service(_caster, caster_peer_id, archive_dir):
         .with_env("CASTER_SIGNALLING_PORT", str(CASTER_SIGNALLING_PORT))
         .with_env("CASTER_PEER_ID", caster_peer_id)
         .with_env("SIGNALLING_PORT", str(SERVICE_SIGNALLING_PORT))
+        .with_env("CROP_HEIGHT", str(CROP_HEIGHT))
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping(archive_dir, "/archive", "rw")
@@ -261,7 +292,10 @@ def streaming_container(_service):
     http_port = HTTP_PORT
     ws_port   = SERVICE_SIGNALLING_PORT
 
-    wait_for_logs(_service, "web server on port", timeout=60)
+    # Wait until all three signalling servers (full, top, bottom) are ready,
+    # then wait for the web server — they start in that order in entrypoint.sh.
+    wait_for_logs(_service, f"Signalling server :{WS_PORT_BOTTOM} ready", timeout=60)
+    wait_for_logs(_service, "web server on port", timeout=10)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -350,3 +384,192 @@ def browser():
     yield driver
 
     driver.quit()
+
+
+# ── Two-tone Xvfb chain (crop-offset colour tests) ───────────────────────────
+#
+# The regular Xvfb is entirely red, which cannot distinguish top from bottom.
+# This chain runs a separate Xvfb whose top half is red and bottom half is
+# blue, so the /top and /bottom WebRTC streams produce different colours.
+# If the bottom crop offset were wrong the stream would show red instead of
+# blue and the assertion would fail.
+
+@pytest.fixture(scope="session")
+def xvfb_two_tone():
+    """
+    Xvfb on TWO_TONE_DISPLAY with top half red, bottom half blue.
+
+    Two xlogo windows continuously repaint each half — needed because Xvfb
+    has no backing store by default. Red covers the top CROP_HEIGHT rows;
+    blue covers the bottom CROP_HEIGHT rows.
+    """
+    xvfb_proc = subprocess.Popen(
+        ["Xvfb", TWO_TONE_DISPLAY, "-screen", "0", XVFB_GEOMETRY],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    socket_path = f"/tmp/.X11-unix/X{TWO_TONE_DISPLAY.lstrip(':')}"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if os.path.exists(socket_path):
+            break
+        time.sleep(0.1)
+    else:
+        xvfb_proc.terminate()
+        raise RuntimeError(f"Two-tone Xvfb socket {socket_path} did not appear within 5 s")
+
+    # Cover the top half with a continuously-redrawn red xlogo window.
+    top_geometry = f"{STREAM_WIDTH}x{CROP_HEIGHT}+0+0"
+    red_top = subprocess.Popen(
+        [
+            "xlogo",
+            "-display", TWO_TONE_DISPLAY,
+            "-geometry", top_geometry,
+            "-bg", "#ff0000",
+            "-fg", "#ff0000",
+            "-bw", "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Cover the bottom half with a continuously-redrawn blue xlogo window.
+    bot_geometry = f"{STREAM_WIDTH}x{CROP_HEIGHT}+0+{CROP_HEIGHT}"
+    blue_bottom = subprocess.Popen(
+        [
+            "xlogo",
+            "-display", TWO_TONE_DISPLAY,
+            "-geometry", bot_geometry,
+            "-bg", "#0000ff",
+            "-fg", "#0000ff",
+            "-bw", "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    time.sleep(1.0)
+    for name, proc in (("red_top", red_top), ("blue_bottom", blue_bottom)):
+        if proc.poll() is not None:
+            _, stderr = proc.communicate(timeout=2)
+            _cleanup_procs(red_top, blue_bottom, xvfb_proc)
+            raise RuntimeError(
+                f"Two-tone xlogo ({name}) exited early (rc={proc.returncode}). "
+                f"stderr: {stderr.decode(errors='replace')!r}"
+            )
+
+    # Verify both halves have the expected colours.
+    cx = STREAM_WIDTH // 2
+    try:
+        top_pixel = _sample_pixel(TWO_TONE_DISPLAY, cx, CROP_HEIGHT // 2)
+        bot_pixel = _sample_pixel(TWO_TONE_DISPLAY, cx, CROP_HEIGHT + CROP_HEIGHT // 2)
+    except Exception as exc:
+        _cleanup_procs(red_top, blue_bottom, xvfb_proc)
+        raise RuntimeError(f"Two-tone Xvfb pixel sampling failed: {exc}") from exc
+
+    if "255,0,0" not in top_pixel and top_pixel.lower() not in {"red", "#ff0000"}:
+        _cleanup_procs(red_top, blue_bottom, xvfb_proc)
+        raise RuntimeError(
+            f"Two-tone Xvfb top half is not red at ({cx},{CROP_HEIGHT // 2}); got {top_pixel!r}"
+        )
+    if "0,0,255" not in bot_pixel and bot_pixel.lower() not in {"blue", "#0000ff"}:
+        _cleanup_procs(red_top, blue_bottom, xvfb_proc)
+        raise RuntimeError(
+            f"Two-tone Xvfb bottom half is not blue at ({cx},{CROP_HEIGHT + CROP_HEIGHT // 2}); "
+            f"got {bot_pixel!r}"
+        )
+
+    yield TWO_TONE_DISPLAY
+
+    _cleanup_procs(red_top, blue_bottom, xvfb_proc)
+
+
+@pytest.fixture(scope="session")
+def _caster_two_tone(xvfb_two_tone):
+    """Caster capturing the two-tone display, publishing on its own signalling port."""
+    container = (
+        DockerContainer(CASTER_IMAGE)
+        .with_env("DISPLAY", xvfb_two_tone)
+        .with_env("STREAM_WIDTH", str(STREAM_WIDTH))
+        .with_env("STREAM_HEIGHT", str(STREAM_HEIGHT))
+        .with_env("SIGNALLING_PORT", str(CASTER_TWO_TONE_SIGNALLING_PORT))
+        .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
+        .with_kwargs(network_mode="host", ipc_mode="host")
+    )
+    with container:
+        wait_for_logs(container, "Signalling server ready", timeout=30)
+        time.sleep(1.0)
+        yield container
+
+
+@pytest.fixture(scope="session")
+def caster_two_tone_peer_id(_caster_two_tone):
+    """Peer ID of the two-tone caster producer."""
+    wait_for_logs(_caster_two_tone, "registered as a producer", timeout=15)
+    stdout, _ = _caster_two_tone.get_logs()
+    log_text = stdout.decode(errors="replace")
+    for line in log_text.splitlines():
+        if "registered as a producer" in line:
+            m = _UUID_RE.search(line)
+            if m:
+                return m.group(0)
+    raise RuntimeError(
+        "Could not find UUID in two-tone caster 'registered as a producer' log.\n"
+        + "\n".join(l for l in log_text.splitlines() if "producer" in l or "peer" in l)
+    )
+
+
+@pytest.fixture(scope="session")
+def _service_two_tone(_caster_two_tone, caster_two_tone_peer_id):
+    """Service container connected to the two-tone caster, with CROP_HEIGHT=360."""
+    container = (
+        DockerContainer(SERVICE_IMAGE)
+        .with_env("CASTER_HOST", "127.0.0.1")
+        .with_env("CASTER_SIGNALLING_PORT", str(CASTER_TWO_TONE_SIGNALLING_PORT))
+        .with_env("CASTER_PEER_ID", caster_two_tone_peer_id)
+        .with_env("SIGNALLING_PORT", str(TWO_TONE_SIGNALLING_PORT))
+        .with_env("CROP_HEIGHT", str(CROP_HEIGHT))
+        .with_env("WEB_PORT", str(TWO_TONE_HTTP_PORT))
+        .with_env("ARCHIVE_SEGMENT_SEC", "20")
+        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
+        .with_kwargs(network_mode="host")
+    )
+    with container:
+        yield container
+
+
+@pytest.fixture(scope="session")
+def streaming_container_two_tone(_service_two_tone):
+    """
+    Wait for the two-tone service's HTTP + all three signalling servers,
+    then yield (http_port, ws_port_full).
+    """
+    http_port = TWO_TONE_HTTP_PORT
+    ws_port   = TWO_TONE_SIGNALLING_PORT
+
+    wait_for_logs(
+        _service_two_tone,
+        f"Signalling server :{TWO_TONE_WS_PORT_BOTTOM} ready",
+        timeout=60,
+    )
+    wait_for_logs(_service_two_tone, "web server on port", timeout=10)
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            r = requests.get(f"http://localhost:{http_port}/", timeout=2)
+            if r.status_code == 200:
+                break
+        except requests.ConnectionError:
+            pass
+        time.sleep(0.25)
+    else:
+        stdout, stderr = _service_two_tone.get_logs()
+        raise RuntimeError(
+            f"Two-tone HTTP server on :{http_port} did not respond within 10 s.\n"
+            f"Container stdout:\n{stdout.decode()}\n"
+            f"Container stderr:\n{stderr.decode()}"
+        )
+
+    yield http_port, ws_port
