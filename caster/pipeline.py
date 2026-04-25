@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-pipeline.py — desktop-caster: X11 capture -> H.264 -> SRT listener.
+pipeline.py — desktop-caster: X11 capture -> H.264 -> RTP push.
 
 ximagesrc -> videorate -> videoscale -> videoconvert -> (nvh264enc|x264enc)
- -> h264parse -> mpegtsmux -> srtsink mode=listener
+ -> h264parse -> rtph264pay -> rtpbin -> udpsink (RTP video)
 
-The desktop-stream-service container dials this listener over SRT.  Because
-we listen here, the desktop has no knowledge of the server -- the server
-is the source of truth for which desktops exist.
+RTCP feedback loop:
+  rtpbin.send_rtcp_src_0 -> udpsink  (RTCP Sender Reports  → service)
+  udpsrc                 -> rtpbin   (RTCP Receiver Reports ← service)
+
+Each RTCP RR carries rb-fractionlost (0–255).  On receipt the encoder
+bitrate is adjusted: back off 25 % on >5 % loss, probe up 5 % on clean.
 
 Environment variables:
-  DISPLAY           X11 display                     (:0)
-  STREAM_WIDTH      capture width                   (1920)
-  STREAM_HEIGHT     capture height                  (1080)
-  STREAM_FRAMERATE  frames per second               (30)
-  STREAM_BITRATE    encoder target bitrate in kbps  (6000)
-  SRT_PORT          SRT listener port               (9000)
-  SRT_LATENCY       SRT buffer in ms                (40)
-  SRT_PASSPHRASE    optional AES key (16+ chars)    ("")
+  DISPLAY           X11 display                          (:0)
+  STREAM_WIDTH      capture width                        (1920)
+  STREAM_HEIGHT     capture height                       (1080)
+  STREAM_FRAMERATE  frames per second                    (30)
+  STREAM_BITRATE    encoder ceiling in kbps              (6000)
+  MIN_BITRATE       encoder floor in kbps                (1000)
+  SERVICE_HOST      service hostname/IP (required)
+  RTP_PORT          RTP video port                       (5000)
+                    RTCP SR  -> service at RTP_PORT + 1
+                    RTCP RR  <- service on  RTP_PORT + 2
 """
 import os
 import signal
@@ -28,57 +33,82 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
 
-DISPLAY     = os.environ.get('DISPLAY', ':0')
-WIDTH       = os.environ.get('STREAM_WIDTH', '1920')
-HEIGHT      = os.environ.get('STREAM_HEIGHT', '1080')
-FRAMERATE   = os.environ.get('STREAM_FRAMERATE', '30')
-BITRATE     = os.environ.get('STREAM_BITRATE', '6000')
-SRT_PORT    = os.environ.get('SRT_PORT', '9000')
-SRT_LATENCY = os.environ.get('SRT_LATENCY', '40')
-SRT_PASS    = os.environ.get('SRT_PASSPHRASE', '')
+DISPLAY      = os.environ.get('DISPLAY', ':0')
+WIDTH        = os.environ.get('STREAM_WIDTH', '1920')
+HEIGHT       = os.environ.get('STREAM_HEIGHT', '1080')
+FRAMERATE    = os.environ.get('STREAM_FRAMERATE', '30')
+BITRATE      = os.environ.get('STREAM_BITRATE', '6000')
+MIN_BITRATE  = os.environ.get('MIN_BITRATE', '1000')
+SERVICE_HOST = os.environ.get('SERVICE_HOST', '')
+RTP_PORT     = os.environ.get('RTP_PORT', '5000')
 
 
 def build_encoder():
-    """Return a gst-launch encoder fragment, preferring NVENC when present."""
-    # 1-second GOP keeps splitmuxsink's segment boundaries tight on the
-    # receiving end (it waits for the next keyframe to rotate segments).
+    """Return a gst-launch encoder fragment; encoder is named 'enc'."""
+    # 1-second GOP keeps splitmuxsink segment boundaries tight on the service.
     gop = FRAMERATE
     if Gst.ElementFactory.find('nvh264enc'):
         print('[caster] NVIDIA NVENC detected: using nvh264enc', flush=True)
         return (
-            f'nvh264enc preset=low-latency-hq rc-mode=cbr '
-            f'bitrate={BITRATE} gop-size={gop}'
+            f'nvh264enc name=enc preset=low-latency-hq rc-mode=vbr-hq '
+            f'bitrate={MIN_BITRATE} max-bitrate={BITRATE} gop-size={gop}'
         )
     print('[caster] NVIDIA NVENC not detected: using x264enc (software)',
           flush=True)
+    # x264enc bitrate is not hot-settable in all builds; RTCP-driven adjustments
+    # are logged but may not take effect until the pipeline restarts.
     return (
-        f'x264enc tune=zerolatency speed-preset=ultrafast '
+        f'x264enc name=enc tune=zerolatency speed-preset=ultrafast '
         f'bitrate={BITRATE} key-int-max={gop}'
     )
 
 
-def build_srt_uri():
-    params = [f'mode=listener', f'latency={SRT_LATENCY}']
-    if SRT_PASS:
-        # pbkeylen must be 16, 24, or 32; pick the smallest that accepts the key.
-        params.append(f'passphrase={SRT_PASS}')
-        params.append('pbkeylen=16')
-    return f'srt://:{SRT_PORT}?' + '&'.join(params)
+def connect_rtcp_feedback(rtpbin, encoder):
+    """Wire RTCP Receiver Reports to encoder bitrate adjustments."""
+    current = [int(BITRATE)]
+
+    def on_ssrc_active(session, ssrc):
+        src = session.emit('get-source-by-ssrc', ssrc)
+        if src is None:
+            return
+        stats = src.get_property('stats')
+        lost = stats.get_int('rb-fractionlost')[1]   # 0–255 (255 = 100 % loss)
+        if lost > 12:          # > ~5 % loss: back off fast
+            current[0] = max(int(MIN_BITRATE), int(current[0] * 0.75))
+        elif lost == 0:        # clean path: probe up slowly
+            current[0] = min(int(BITRATE), int(current[0] * 1.05))
+        encoder.set_property('bitrate', current[0])
+        print(f'[caster] RTCP: loss={lost}/255 → bitrate={current[0]} kbps',
+              flush=True)
+
+    def on_new_ssrc(rb, session_id, ssrc):
+        session = rb.emit('get-internal-session', session_id)
+        session.connect('on-ssrc-active', on_ssrc_active)
+
+    rtpbin.connect('on-new-ssrc', on_new_ssrc)
 
 
 def main():
+    if not SERVICE_HOST:
+        print('[caster] ERROR: SERVICE_HOST is required '
+              '(IP/hostname of the service)', file=sys.stderr)
+        sys.exit(1)
+
     Gst.init(None)
 
-    encoder = build_encoder()
-    srt_uri = build_srt_uri()
+    encoder_str = build_encoder()
+
+    rtp_port = int(RTP_PORT)
+    rtcp_sr  = rtp_port + 1   # caster sends SR here  (service listens)
+    rtcp_rr  = rtp_port + 2   # caster listens for RR (service sends)
 
     print('[caster] Starting capture:', flush=True)
-    print(f'  Display    : {DISPLAY}')
-    print(f'  Resolution : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
-    print(f'  Bitrate    : {BITRATE} kbps')
-    print(f'  SRT URI    : srt://0.0.0.0:{SRT_PORT} (listener)')
-    if SRT_PASS:
-        print(f'  SRT        : AES-128 encrypted')
+    print(f'  Display       : {DISPLAY}')
+    print(f'  Resolution    : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
+    print(f'  Bitrate range : {MIN_BITRATE}–{BITRATE} kbps')
+    print(f'  Service RTP   : rtp://{SERVICE_HOST}:{rtp_port}')
+    print(f'  RTCP SR→      : udp://{SERVICE_HOST}:{rtcp_sr}')
+    print(f'  RTCP RR←      : udp://0.0.0.0:{rtcp_rr}')
 
     desc = (
         f'ximagesrc display-name={DISPLAY} use-damage=false '
@@ -87,14 +117,18 @@ def main():
         f'! videoscale '
         f'! video/x-raw,width={WIDTH},height={HEIGHT} '
         f'! videoconvert '
-        f'! {encoder} '
+        f'! {encoder_str} '
         f'! h264parse config-interval=1 '
-        # Force Annex-B byte-stream with AU alignment going into srtsink so
-        # the receiver can demux it with h264parse alone (no mpegtsmux +
-        # tsdemux dance, which introduces a dynamic-pad link that fails
-        # silently when tsdemux never exposes a video pad).
-        f'! video/x-h264,stream-format=byte-stream,alignment=au '
-        f'! srtsink uri="{srt_uri}" wait-for-connection=false'
+        f'! rtph264pay config-interval=1 pt=96 '
+        f'! rtpbin.send_rtp_sink_0 '
+        f'rtpbin name=rtpbin '
+        f'rtpbin.send_rtp_src_0 '
+        f'  ! queue max-size-time=200000000 leaky=downstream '
+        f'  ! udpsink host={SERVICE_HOST} port={rtp_port} '
+        f'rtpbin.send_rtcp_src_0 '
+        f'  ! udpsink host={SERVICE_HOST} port={rtcp_sr} sync=false async=false '
+        f'udpsrc port={rtcp_rr} caps="application/x-rtcp" '
+        f'  ! rtpbin.recv_rtcp_sink_0'
     )
 
     try:
@@ -103,6 +137,10 @@ def main():
         print(f'[caster] ERROR: Failed to parse pipeline: {exc}',
               file=sys.stderr)
         sys.exit(1)
+
+    encoder  = pipeline.get_by_name('enc')
+    rtpbin_e = pipeline.get_by_name('rtpbin')
+    connect_rtcp_feedback(rtpbin_e, encoder)
 
     loop = GLib.MainLoop()
     bus = pipeline.get_bus()

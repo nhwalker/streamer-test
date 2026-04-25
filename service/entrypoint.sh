@@ -4,16 +4,12 @@
 # Starts three services in order and waits on all of them:
 #   1. gst-webrtc-signalling-server  (background, :SIGNALLING_PORT)
 #   2. python3 -m http.server        (background, :WEB_PORT, serves /var/www/html)
-#   3. pipeline.py                   (background, SRT -> tee -> archive + WebRTC)
-#
-# SRT reachability probe up front catches a misconfigured DESKTOP_HOST before
-# the GStreamer pipeline tries to connect and emits an opaque error.
+#   3. pipeline.py                   (background, RTP -> tee -> archive + WebRTC)
 set -euo pipefail
 
 # ── Config sanity ────────────────────────────────────────────────────────────
 if [ -z "${DESKTOP_HOST:-}" ]; then
-    echo "[service] ERROR: DESKTOP_HOST is required (e.g. desktop-01.lan)"
-    exit 1
+    echo "[service] WARNING: DESKTOP_HOST not set; RTCP bitrate feedback to caster disabled."
 fi
 
 mkdir -p "${ARCHIVE_DIR}"
@@ -26,18 +22,6 @@ if command -v nvidia-smi &>/dev/null; then
         || echo "  (nvidia-smi present but query failed)"
 else
     echo "[service] No NVIDIA GPU detected (software decode + encode will be used)."
-fi
-
-# ── SRT reachability probe ───────────────────────────────────────────────────
-# SRT runs over UDP, so `nc -z -u` checks that something is listening.
-# Non-fatal: the caster may legitimately start after the service, and srtsrc
-# in caller mode retries.  But logging the probe result early makes
-# "wrong hostname" vs "caster not up yet" easy to disambiguate.
-echo "[service] Probing caster at ${DESKTOP_HOST}:${DESKTOP_PORT} (UDP) ..."
-if nc -z -u -w 2 "${DESKTOP_HOST}" "${DESKTOP_PORT}" 2>/dev/null; then
-    echo "[service] Caster reachable."
-else
-    echo "[service] WARNING: caster not reachable yet; srtsrc will retry."
 fi
 
 # ── Signalling server ────────────────────────────────────────────────────────
@@ -78,7 +62,7 @@ echo "│  Desktop Stream Service ready                       │"
 echo "│                                                     │"
 echo "│  Web page  : http://${HOST_IP}:${WEB_PORT}          "
 echo "│  Signalling: ws://${HOST_IP}:${SIGNALLING_PORT}     "
-echo "│  Caster    : srt://${DESKTOP_HOST}:${DESKTOP_PORT}  "
+echo "│  Caster    : rtp://${DESKTOP_HOST:-unknown}:${RTP_PORT} (RTCP feedback)  "
 echo "│  Archive   : ${ARCHIVE_DIR}                         "
 echo "└─────────────────────────────────────────────────────┘"
 echo ""

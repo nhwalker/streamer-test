@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-pipeline.py -- desktop-stream-service: SRT ingress -> tee -> archive + WebRTC.
+pipeline.py -- desktop-stream-service: RTP ingress -> tee -> archive + WebRTC.
 
-srtsrc mode=caller -> typefind -> h264parse -> tee
+udpsrc (RTP) -> rtpbin -> rtph264depay -> h264parse -> tee
   tee. -> splitmuxsink matroskamux               (archive, H.264 passthrough)
   tee. -> <nvh264dec|avdec_h264> -> webrtcsink   (decode once, per-peer encode)
+
+rtpbin.recv_rtp_src_0_0 is a dynamic pad emitted when the first RTP packet
+arrives; a pad-added handler links it to rtph264depay.  The pipeline is
+therefore built via the GObject API (no parse_launch) to allow this late link.
 
 The tee sits before the decoder so the archive branch never decodes or
 re-encodes -- .mkv files are the caster's H.264 bytes muxed directly
@@ -16,18 +20,22 @@ The WebRTC branch decodes once; webrtcsink then re-encodes per peer for
 adaptive bitrate, preferring nvh264enc by plugin rank when a GPU is
 present.
 
+RTCP feedback loop (if DESKTOP_HOST is set):
+  udpsrc (RTCP SR from caster) -> rtpbin.recv_rtcp_sink_0
+  rtpbin.send_rtcp_src_0       -> udpsink (RTCP RR -> caster)
+
 Environment variables:
-  DESKTOP_HOST           caster hostname (required)
-  DESKTOP_PORT           caster SRT port                       (9000)
-  SRT_LATENCY            SRT buffer in ms                      (40)
-  SRT_PASSPHRASE         optional AES key (must match caster)  ("")
+  DESKTOP_HOST           caster hostname for RTCP RR (optional)
+  RTP_PORT               RTP video port                         (5000)
+                         RTCP SR ← caster at RTP_PORT + 1
+                         RTCP RR → caster on  RTP_PORT + 2
 
-  ARCHIVE_DIR            output dir for .mkv segments          (/archive)
-  ARCHIVE_SEGMENT_SEC    segment duration in seconds           (600)
+  ARCHIVE_DIR            output dir for .mkv segments           (/archive)
+  ARCHIVE_SEGMENT_SEC    segment duration in seconds            (600)
 
-  SIGNALLING_PORT        signalling server port                (8443)
-  GST_WEBRTC_STUN_SERVER optional STUN URI                     ("")
-  GST_WEBRTC_TURN_SERVER optional TURN URI                     ("")
+  SIGNALLING_PORT        signalling server port                 (8443)
+  GST_WEBRTC_STUN_SERVER optional STUN URI                      ("")
+  GST_WEBRTC_TURN_SERVER optional TURN URI                      ("")
 """
 import os
 import signal
@@ -39,9 +47,7 @@ gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
 
 DESKTOP_HOST        = os.environ.get('DESKTOP_HOST', '')
-DESKTOP_PORT        = os.environ.get('DESKTOP_PORT', '9000')
-SRT_LATENCY         = os.environ.get('SRT_LATENCY', '40')
-SRT_PASS            = os.environ.get('SRT_PASSPHRASE', '')
+RTP_PORT            = os.environ.get('RTP_PORT', '5000')
 
 ARCHIVE_DIR         = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
@@ -51,17 +57,6 @@ STUN                = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 
 WEBRTC_VIDEO_CAPS   = 'video/x-vp9;video/x-h264'
-
-
-def build_srt_uri():
-    params = [
-        'mode=caller',
-        f'latency={SRT_LATENCY}',
-    ]
-    if SRT_PASS:
-        params.append(f'passphrase={SRT_PASS}')
-        params.append('pbkeylen=16')
-    return f'srt://{DESKTOP_HOST}:{DESKTOP_PORT}?' + '&'.join(params)
 
 
 def select_decoder():
@@ -74,80 +69,149 @@ def select_decoder():
     return 'avdec_h264'
 
 
+def _request_pad(element, name):
+    """Request a pad by name, compatible with GStreamer < and >= 1.20."""
+    if hasattr(element, 'request_pad_simple'):
+        return element.request_pad_simple(name)
+    return element.get_request_pad(name)
+
+
 def main():
     if not DESKTOP_HOST:
-        print('[service] ERROR: DESKTOP_HOST is required', file=sys.stderr)
-        sys.exit(1)
+        print('[service] WARNING: DESKTOP_HOST not set; '
+              'RTCP bitrate feedback to caster disabled.', flush=True)
 
     Gst.init(None)
-
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-    srt_uri   = build_srt_uri()
-    decoder   = select_decoder()
-    sig_uri   = f'ws://127.0.0.1:{SIG_PORT}'
-    # splitmuxsink max-size-time is in nanoseconds.
+    decoder    = select_decoder()
+    sig_uri    = f'ws://127.0.0.1:{SIG_PORT}'
     segment_ns = ARCHIVE_SEGMENT_SEC * Gst.SECOND
     archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mkv')
 
+    rtp_port = int(RTP_PORT)
+    rtcp_sr  = rtp_port + 1   # service listens for SR from caster
+    rtcp_rr  = rtp_port + 2   # service sends RR back to caster
+
     print('[service] Starting stream service:', flush=True)
-    print(f'  Caster        : srt://{DESKTOP_HOST}:{DESKTOP_PORT} (caller)')
+    print(f'  Caster RTP    : rtp://0.0.0.0:{rtp_port} (listening)')
     print(f'  Archive       : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Signalling    : {sig_uri}')
     print(f'  WebRTC codecs : {WEBRTC_VIDEO_CAPS}')
+    if DESKTOP_HOST:
+        print(f'  RTCP RR→      : udp://{DESKTOP_HOST}:{rtcp_rr}')
     if STUN:
         print(f'  STUN          : {STUN}')
     if TURN:
         print(f'  TURN          : {TURN}')
 
-    # Build the pipeline string.  video-caps is set after parse_launch as a
-    # GstCaps object to avoid semicolon-in-property-string escaping issues.
-    webrtcsink_frag = f'webrtcsink name=ws signaller::uri={sig_uri}'
-    if STUN:
-        webrtcsink_frag += f' stun-server={STUN}'
+    pipeline = Gst.Pipeline.new('service-pipeline')
 
-    desc = (
-        f'srtsrc uri="{srt_uri}" name=srtsrc '
-        # srtsrc has no `caps` property in this gst-plugins-bad build, and
-        # h264parse's sink pad refuses ANY caps, so we use typefind to
-        # auto-detect the H.264 byte-stream from the data and emit the
-        # right caps downstream.  GStreamer's H.264 typefinder recognises
-        # Annex-B NAL units and yields video/x-h264,stream-format=byte-
-        # stream once enough bytes have flowed.
-        f'! typefind '
-        f'! queue '
-        f'! h264parse config-interval=1 '
-        f'! tee name=t '
-        f't. ! queue '
-        # matroskamux is streaming-by-default: writes EBML headers and
-        # cluster data continuously as buffers arrive, so the on-disk
-        # file is always readable mid-segment.  No fragment-duration to
-        # tune, no buffer-until-EOS surprise.
-        f'   ! splitmuxsink name=archive muxer-factory=matroskamux '
-        f'     location="{archive_pattern}" '
-        f'     max-size-time={segment_ns} '
-        f't. ! queue '
-        f'   ! {decoder} '
-        f'   ! videoconvert '
-        f'   ! {webrtcsink_frag}'
+    def make(kind, name=None):
+        el = Gst.ElementFactory.make(kind, name)
+        if el is None:
+            print(f'[service] ERROR: cannot create element {kind!r}',
+                  file=sys.stderr)
+            sys.exit(1)
+        pipeline.add(el)
+        return el
+
+    # ── RTP ingress (dynamic pad from rtpbin requires programmatic linking)
+    udpsrc_rtp = make('udpsrc',      'udpsrc_rtp')
+    rtpbin     = make('rtpbin',      'rtpbin')
+    depay      = make('rtph264depay', 'depay')
+    q_rtp      = make('queue',       'q_rtp')
+    h264parse  = make('h264parse',   'h264parse')
+    tee        = make('tee',         't')
+
+    # ── Archive branch
+    q_arch  = make('queue',       'q_arch')
+    archive = make('splitmuxsink', 'archive')
+
+    # ── WebRTC branch
+    q_webrtc   = make('queue',        'q_webrtc')
+    decoder_el = make(decoder,        'decoder')
+    vconvert   = make('videoconvert', 'vconvert')
+    ws         = make('webrtcsink',   'ws')
+
+    # ── RTCP transport
+    udpsrc_rtcp  = make('udpsrc',  'udpsrc_rtcp')
+    udpsink_rtcp = make('udpsink', 'udpsink_rtcp')
+
+    # ── Configure elements
+    rtp_caps = Gst.Caps.from_string(
+        'application/x-rtp,media=video,payload=96,'
+        'clock-rate=90000,encoding-name=H264'
     )
+    udpsrc_rtp.set_property('port', rtp_port)
+    udpsrc_rtp.set_property('caps', rtp_caps)
 
-    try:
-        pipeline = Gst.parse_launch(desc)
-    except Exception as exc:
-        print(f'[service] ERROR: Failed to parse pipeline: {exc}',
-              file=sys.stderr)
-        sys.exit(1)
+    rtcp_caps = Gst.Caps.from_string('application/x-rtcp')
+    udpsrc_rtcp.set_property('port', rtcp_sr)
+    udpsrc_rtcp.set_property('caps', rtcp_caps)
 
-    # Set video-caps on webrtcsink as a proper GstCaps object (Gst.Caps
-    # handles the ; separator cleanly; gst-launch string escaping doesn't).
-    ws = pipeline.get_by_name('ws')
+    if DESKTOP_HOST:
+        udpsink_rtcp.set_property('host', DESKTOP_HOST)
+        udpsink_rtcp.set_property('port', rtcp_rr)
+        udpsink_rtcp.set_property('sync', False)
+        udpsink_rtcp.set_property('async', False)
+
+    # config-interval=-1: inject SPS/PPS before every keyframe so each
+    # splitmuxsink segment is self-contained and independently decodable.
+    h264parse.set_property('config-interval', -1)
+
+    archive.set_property('muxer-factory', 'matroskamux')
+    archive.set_property('location', archive_pattern)
+    archive.set_property('max-size-time', segment_ns)
+
+    ws.set_property('signaller::uri', sig_uri)
+    if STUN:
+        ws.set_property('stun-server', STUN)
     ws.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
 
+    # ── Link RTP/RTCP request pads (exist at construction time)
+    rtp_sink_pad = _request_pad(rtpbin, 'recv_rtp_sink_0')
+    udpsrc_rtp.get_static_pad('src').link(rtp_sink_pad)
 
-    # TURN is per-consumer on webrtcsink 0.13.x (no top-level property).
-    # Same pattern as the legacy pipeline: hook deep-element-added and call
-    # add-turn-server on every webrtcbin the sink spawns.
+    rtcp_sink_pad = _request_pad(rtpbin, 'recv_rtcp_sink_0')
+    udpsrc_rtcp.get_static_pad('src').link(rtcp_sink_pad)
+
+    if DESKTOP_HOST:
+        rtcp_src_pad = _request_pad(rtpbin, 'send_rtcp_src_0')
+        rtcp_src_pad.link(udpsink_rtcp.get_static_pad('sink'))
+
+    # ── Static chain: depay -> q_rtp -> h264parse -> tee
+    depay.link(q_rtp)
+    q_rtp.link(h264parse)
+    h264parse.link(tee)
+
+    # ── Archive: tee -> q_arch -> splitmuxsink
+    tee.link(q_arch)
+    q_arch.link(archive)
+
+    # ── WebRTC: tee -> q_webrtc -> decoder -> vconvert -> webrtcsink
+    tee.link(q_webrtc)
+    q_webrtc.link(decoder_el)
+    decoder_el.link(vconvert)
+    vconvert.link(ws)
+
+    # ── rtpbin emits recv_rtp_src_0_0 when the first RTP packet arrives.
+    def on_pad_added(_, pad):
+        if not pad.get_name().startswith('recv_rtp_src_'):
+            return
+        sink = depay.get_static_pad('sink')
+        if sink.is_linked():
+            return
+        ret = pad.link(sink)
+        if ret != Gst.PadLinkReturn.OK:
+            print(f'[service] ERROR: rtpbin pad link failed: {ret}',
+                  file=sys.stderr)
+        else:
+            print('[service] rtpbin → rtph264depay linked', flush=True)
+
+    rtpbin.connect('pad-added', on_pad_added)
+
+    # ── TURN is per-consumer on webrtcsink 0.13.x (no top-level property).
     if TURN:
         def on_deep_element_added(_bin, _sub_bin, element):
             factory = element.get_factory()
@@ -180,8 +244,6 @@ def main():
                 print(f'[service] debug: {dbg}', file=sys.stderr)
             loop.quit()
         elif t == Gst.MessageType.STATE_CHANGED and msg.src is pipeline:
-            # Only log top-level pipeline state transitions; element-level
-            # changes are too noisy.  Confirms we actually reach PLAYING.
             old, new, _ = msg.parse_state_changed()
             print(f'[service] pipeline state: {old.value_nick} -> '
                   f'{new.value_nick}', flush=True)
