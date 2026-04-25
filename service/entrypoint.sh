@@ -1,10 +1,10 @@
 #!/bin/bash
 # entrypoint.sh -- desktop-stream-service bootstrap.
 #
-# Starts three services in order and waits on all of them:
-#   1. gst-webrtc-signalling-server  (background, :SIGNALLING_PORT, for browser clients)
-#   2. python3 -m http.server        (background, :WEB_PORT, serves /var/www/html)
-#   3. pipeline.py                   (background, connects to caster + serves browsers)
+# Starts services in order and waits on all of them:
+#   1. gst-webrtc-signalling-server x3  (background, :SIGNALLING_PORT, +1, +2)
+#   2. web_server.py                    (background, :WEB_PORT, serves /var/www/html)
+#   3. pipeline.py                      (background, connects to caster + serves browsers)
 set -euo pipefail
 
 # ── Config sanity ─────────────────────────────────────────────────────────────
@@ -15,6 +15,9 @@ fi
 
 mkdir -p "${ARCHIVE_DIR}"
 
+SIG_PORT_TOP=$((SIGNALLING_PORT + 1))
+SIG_PORT_BOTTOM=$((SIGNALLING_PORT + 2))
+
 # ── GPU pre-flight ────────────────────────────────────────────────────────────
 if command -v nvidia-smi &>/dev/null; then
     echo "[service] NVIDIA GPU detected:"
@@ -24,34 +27,41 @@ else
     echo "[service] No NVIDIA GPU detected (software decode + encode will be used)."
 fi
 
-# ── Signalling server (for browser WebRTC clients) ───────────────────────────
-echo "[service] Starting signalling server on ${SIGNALLING_HOST}:${SIGNALLING_PORT} ..."
-gst-webrtc-signalling-server \
-    --host "${SIGNALLING_HOST}" \
-    --port "${SIGNALLING_PORT}" &
-SIGPID=$!
+# ── Signalling servers (full / top / bottom) ─────────────────────────────────
+SIG_PIDS=()
+for PORT in "${SIGNALLING_PORT}" "${SIG_PORT_TOP}" "${SIG_PORT_BOTTOM}"; do
+    echo "[service] Starting signalling server on ${SIGNALLING_HOST}:${PORT} ..."
+    gst-webrtc-signalling-server \
+        --host "${SIGNALLING_HOST}" \
+        --port "${PORT}" &
+    SIG_PIDS+=($!)
+done
+
 PIPPID=""
 
-trap 'echo "[service] Shutting down..."; kill "${SIGPID}" 2>/dev/null; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; exit' \
+trap 'echo "[service] Shutting down..."; kill "${SIG_PIDS[@]}" 2>/dev/null; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; exit' \
      EXIT INT TERM
 
-READY=0
-for i in $(seq 1 20); do
-    if nc -z 127.0.0.1 "${SIGNALLING_PORT}" 2>/dev/null; then
-        READY=1
-        break
+# Readiness probe -- wait up to 2 s per signalling server.
+for PORT in "${SIGNALLING_PORT}" "${SIG_PORT_TOP}" "${SIG_PORT_BOTTOM}"; do
+    READY=0
+    for i in $(seq 1 20); do
+        if nc -z 127.0.0.1 "${PORT}" 2>/dev/null; then
+            READY=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${READY}" -eq 0 ]; then
+        echo "[service] ERROR: Signalling server :${PORT} did not become ready within 2 s."
+        exit 1
     fi
-    sleep 0.1
+    echo "[service] Signalling server :${PORT} ready."
 done
-if [ "${READY}" -eq 0 ]; then
-    echo "[service] ERROR: Signalling server did not become ready within 2 s."
-    exit 1
-fi
-echo "[service] Signalling server ready."
 
 # ── Web server ───────────────────────────────────────────────────────────────
 echo "[service] Starting web server on port ${WEB_PORT} ..."
-python3 -m http.server --directory /var/www/html "${WEB_PORT}" &
+python3 /usr/local/bin/web_server.py &
 
 # ── Access info ──────────────────────────────────────────────────────────────
 HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
@@ -59,8 +69,13 @@ echo ""
 echo "┌─────────────────────────────────────────────────────┐"
 echo "│  Desktop Stream Service ready                       │"
 echo "│                                                     │"
-echo "│  Web page  : http://${HOST_IP}:${WEB_PORT}          "
-echo "│  Signalling: ws://${HOST_IP}:${SIGNALLING_PORT}     "
+echo "│  Full stream  : http://${HOST_IP}:${WEB_PORT}/      "
+echo "│  Top half     : http://${HOST_IP}:${WEB_PORT}/top   "
+echo "│  Bottom half  : http://${HOST_IP}:${WEB_PORT}/bottom"
+echo "│                                                     │"
+echo "│  Signalling / : ws://${HOST_IP}:${SIGNALLING_PORT}  "
+echo "│  Signalling /top    : ws://${HOST_IP}:${SIG_PORT_TOP}    "
+echo "│  Signalling /bottom : ws://${HOST_IP}:${SIG_PORT_BOTTOM} "
 echo "│  Caster    : ws://${CASTER_HOST}:${CASTER_SIGNALLING_PORT} (ingest)  "
 echo "│  Archive   : ${ARCHIVE_DIR}                         "
 echo "└─────────────────────────────────────────────────────┘"

@@ -4,7 +4,10 @@ pipeline.py -- desktop-stream-service: webrtcsrc ingress -> tee -> archive + Web
 
 webrtcsrc (connects to caster's signalling server) -> videoconvert -> tee
   tee. -> encoder -> h264parse -> splitmuxsink matroskamux    (archive)
-  tee. -> webrtcsink                                           (browser WebRTC)
+  tee. -> tee_webrtc
+            tee_webrtc. -> webrtcsink (full)                  (browser, per-peer encode)
+            tee_webrtc. -> videocrop (bottom) -> webrtcsink   (top half)
+            tee_webrtc. -> videocrop (top)    -> webrtcsink   (bottom half)
 
 The service's webrtcsrc dials the caster's gst-webrtc-signalling-server.
 webrtcsink (service-side) handles per-browser encoding and adaptive bitrate
@@ -25,10 +28,12 @@ Environment variables:
   ARCHIVE_SEGMENT_SEC    segment duration in seconds       (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps     (6000)
 
-  SIGNALLING_PORT        service's own signalling port
-                         (browsers connect here)           (8443)
-  GST_WEBRTC_STUN_SERVER optional STUN URI                 ("")
-  GST_WEBRTC_TURN_SERVER optional TURN URI                 ("")
+  SIGNALLING_PORT        service's browser-facing signalling port (8443)
+                         top-half  stream uses SIGNALLING_PORT+1  (8444)
+                         bottom-half stream uses SIGNALLING_PORT+2 (8445)
+  CROP_HEIGHT            pixel row where frame is split            (1080)
+  GST_WEBRTC_STUN_SERVER optional STUN URI                        ("")
+  GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
 """
 import os
 import signal
@@ -48,6 +53,9 @@ ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
 
 SIG_PORT              = os.environ.get('SIGNALLING_PORT', '8443')
+SIG_PORT_TOP          = str(int(SIG_PORT) + 1)
+SIG_PORT_BOTTOM       = str(int(SIG_PORT) + 2)
+CROP_HEIGHT           = int(os.environ.get('CROP_HEIGHT', '1080'))
 STUN                  = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 
@@ -86,7 +94,6 @@ def main():
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
     caster_sig_uri  = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
-    service_sig_uri = f'ws://127.0.0.1:{SIG_PORT}'
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
     archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mkv')
 
@@ -94,7 +101,10 @@ def main():
     print(f'  Caster signalling : {caster_sig_uri}')
     print(f'  Archive           : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Archive bitrate   : {ARCHIVE_BITRATE} kbps')
-    print(f'  Browser signalling: {service_sig_uri}')
+    print(f'  Signalling /      : ws://127.0.0.1:{SIG_PORT}')
+    print(f'  Signalling /top   : ws://127.0.0.1:{SIG_PORT_TOP}')
+    print(f'  Signalling /bottom: ws://127.0.0.1:{SIG_PORT_BOTTOM}')
+    print(f'  Crop height       : {CROP_HEIGHT}px')
     print(f'  WebRTC codecs     : {WEBRTC_VIDEO_CAPS}')
     if STUN:
         print(f'  STUN              : {STUN}')
@@ -113,20 +123,31 @@ def main():
         return el
 
     # ── Ingress from caster (dynamic src pad)
-    wsrc     = make('webrtcsrc',    'wsrc')
-    vconvert = make('videoconvert', 'vconvert')
-    tee      = make('tee',          't')
+    wsrc      = make('webrtcsrc',    'wsrc')
+    vconvert  = make('videoconvert', 'vconvert')
+    tee       = make('tee',          't')
 
     # ── Archive branch
-    q_arch   = make('queue',        'q_arch')
-    arch_enc = build_archive_encoder()
+    q_arch    = make('queue',        'q_arch')
+    arch_enc  = build_archive_encoder()
     pipeline.add(arch_enc)
-    arch_h264 = make('h264parse',   'arch_h264')
+    arch_h264 = make('h264parse',    'arch_h264')
     archive   = make('splitmuxsink', 'archive')
 
-    # ── Browser WebRTC branch
-    q_webrtc = make('queue',        'q_webrtc')
-    ws       = make('webrtcsink',   'ws')
+    # ── Browser WebRTC branch: fan out to full / top / bottom streams
+    q_webrtc   = make('queue',       'q_webrtc')
+    tee_webrtc = make('tee',         't_webrtc')
+
+    q_full     = make('queue',       'q_full')
+    ws_full    = make('webrtcsink',  'ws_full')
+
+    q_top      = make('queue',       'q_top')
+    crop_top   = make('videocrop',   'crop_top')
+    ws_top     = make('webrtcsink',  'ws_top')
+
+    q_bot      = make('queue',       'q_bot')
+    crop_bot   = make('videocrop',   'crop_bot')
+    ws_bot     = make('webrtcsink',  'ws_bot')
 
     # ── Configure webrtcsrc (connects to caster's signalling server)
     wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
@@ -140,20 +161,38 @@ def main():
     archive.set_property('location', archive_pattern)
     archive.set_property('max-size-time', segment_ns)
 
-    # ── Configure browser webrtcsink
-    ws.get_property('signaller').set_property('uri', service_sig_uri)
-    ws.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
-    if STUN:
-        ws.set_property('stun-server', STUN)
+    # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
+    crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
+    crop_bot.set_property('top',    CROP_HEIGHT)   # keep bottom half
 
-    # ── Static links: vconvert -> tee -> both branches
+    # ── Configure browser webrtcsink instances
+    for sink, port in ((ws_full, SIG_PORT), (ws_top, SIG_PORT_TOP), (ws_bot, SIG_PORT_BOTTOM)):
+        sink.get_property('signaller').set_property('uri', f'ws://127.0.0.1:{port}')
+        sink.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
+        if STUN:
+            sink.set_property('stun-server', STUN)
+
+    # ── Static links: vconvert -> tee -> archive + webrtc branches
     vconvert.link(tee)
+
     tee.link(q_arch)
     q_arch.link(arch_enc)
     arch_enc.link(arch_h264)
     arch_h264.link(archive)
+
     tee.link(q_webrtc)
-    q_webrtc.link(ws)
+    q_webrtc.link(tee_webrtc)
+
+    tee_webrtc.link(q_full)
+    q_full.link(ws_full)
+
+    tee_webrtc.link(q_top)
+    q_top.link(crop_top)
+    crop_top.link(ws_top)
+
+    tee_webrtc.link(q_bot)
+    q_bot.link(crop_bot)
+    crop_bot.link(ws_bot)
 
     # ── Dynamic src pad from webrtcsrc → videoconvert
     vconvert_sink = vconvert.get_static_pad('sink')

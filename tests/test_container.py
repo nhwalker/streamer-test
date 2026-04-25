@@ -20,6 +20,8 @@ import websockets
 
 from selenium.webdriver.support.ui import WebDriverWait
 
+from conftest import WS_PORT_TOP, WS_PORT_BOTTOM
+
 
 class TestServiceAvailability:
     """HTTP and WebSocket smoke tests — no browser needed."""
@@ -77,6 +79,46 @@ class TestServiceAvailability:
                 # websockets 12 exposed `ws.closed`; 13+ replaced it with
                 # `ws.state` (an enum).  Use `state.name` which works in both.
                 assert ws.state.name == "OPEN", "WebSocket closed immediately after connect"
+
+        asyncio.run(_connect())
+
+    def test_top_endpoint_returns_200(self, streaming_container):
+        http_port, _ = streaming_container
+        r = requests.get(f"http://localhost:{http_port}/top", timeout=10)
+        assert r.status_code == 200
+
+    def test_top_endpoint_has_video_element(self, streaming_container):
+        http_port, _ = streaming_container
+        r = requests.get(f"http://localhost:{http_port}/top", timeout=10)
+        assert "<video" in r.text, "/top must contain a <video> element"
+
+    def test_bottom_endpoint_returns_200(self, streaming_container):
+        http_port, _ = streaming_container
+        r = requests.get(f"http://localhost:{http_port}/bottom", timeout=10)
+        assert r.status_code == 200
+
+    def test_bottom_endpoint_has_video_element(self, streaming_container):
+        http_port, _ = streaming_container
+        r = requests.get(f"http://localhost:{http_port}/bottom", timeout=10)
+        assert "<video" in r.text, "/bottom must contain a <video> element"
+
+    def test_top_signalling_accepts_connection(self, streaming_container):
+        """Top-half signalling server accepts WebSocket connections on WS_PORT+1."""
+        async def _connect():
+            uri = f"ws://localhost:{WS_PORT_TOP}"
+            async with websockets.connect(uri, open_timeout=10) as ws:
+                await asyncio.sleep(0.2)
+                assert ws.state.name == "OPEN", "Top signalling WebSocket closed immediately"
+
+        asyncio.run(_connect())
+
+    def test_bottom_signalling_accepts_connection(self, streaming_container):
+        """Bottom-half signalling server accepts WebSocket connections on WS_PORT+2."""
+        async def _connect():
+            uri = f"ws://localhost:{WS_PORT_BOTTOM}"
+            async with websockets.connect(uri, open_timeout=10) as ws:
+                await asyncio.sleep(0.2)
+                assert ws.state.name == "OPEN", "Bottom signalling WebSocket closed immediately"
 
         asyncio.run(_connect())
 

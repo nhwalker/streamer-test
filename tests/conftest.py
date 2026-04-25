@@ -40,9 +40,11 @@ XVFB_DISPLAY  = ":99"
 XVFB_GEOMETRY = "1280x720x24"
 
 # The caster's signalling server port must not collide with the service's
-# signalling server (both run on the test host via host networking).
-CASTER_SIGNALLING_PORT  = 8445   # caster exposes this; service's webrtcsrc dials it
-SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling
+# signalling servers (8443/8444/8445); use 8448 on the test host.
+CASTER_SIGNALLING_PORT  = 8448   # caster exposes this; service's webrtcsrc dials it
+SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling (full stream)
+WS_PORT_TOP             = 8444   # service top-half signalling
+WS_PORT_BOTTOM          = 8445   # service bottom-half signalling
 HTTP_PORT               = 8080
 
 # Optional TURN config for both sides.
@@ -261,7 +263,10 @@ def streaming_container(_service):
     http_port = HTTP_PORT
     ws_port   = SERVICE_SIGNALLING_PORT
 
-    wait_for_logs(_service, "web server on port", timeout=60)
+    # Wait until all three signalling servers (full, top, bottom) are ready,
+    # then wait for the web server — they start in that order in entrypoint.sh.
+    wait_for_logs(_service, f"Signalling server :{WS_PORT_BOTTOM} ready", timeout=60)
+    wait_for_logs(_service, "web server on port", timeout=10)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
