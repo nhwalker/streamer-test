@@ -7,9 +7,9 @@ Fixture dependency graph:
          │                                                 │
          ▼                                                 │
     _caster (session)  ── runs caster container            │
-         │  SRT listener on :9000 against Xvfb             │
+         │  RTP push to service on :RTP_PORT against Xvfb  │
          ▼                                                 ▼
-    _service (session)  ── runs service container; dials caster,
+    _service (session)  ── runs service container; receives RTP,
          │                  mounts archive_dir as /archive
          ▼
     streaming_container (session)  ──► yields (http_port, ws_port)
@@ -40,8 +40,8 @@ SERVICE_IMAGE = os.environ.get("SERVICE_IMAGE", "desktop-stream-service:ci")
 XVFB_DISPLAY = ":99"
 XVFB_GEOMETRY = "1280x720x24"
 
-# Fixed ports for host networking.  SRT is UDP, HTTP/WS are TCP.
-SRT_PORT  = 9000
+# Fixed ports for host networking.  RTP/RTCP are UDP, HTTP/WS are TCP.
+RTP_PORT  = 5000
 HTTP_PORT = 8080
 WS_PORT   = 8443
 
@@ -189,10 +189,10 @@ def archive_dir(tmp_path_factory):
 @pytest.fixture(scope="session")
 def _caster(xvfb_display):
     """
-    The caster container: X11 capture → H.264 → SRT listener on :SRT_PORT.
+    The caster container: X11 capture → H.264 → RTP push to SERVICE_HOST:RTP_PORT.
 
     Runs with host networking so the service container (also host-networked)
-    can reach it at 127.0.0.1, and with host IPC so ximagesrc's MIT-SHM
+    can receive RTP at 127.0.0.1, and with host IPC so ximagesrc's MIT-SHM
     attach can reach the host Xvfb's SysV shared-memory segment (otherwise
     ximagesrc captures all-zero frames despite a successful X connection).
     """
@@ -201,17 +201,15 @@ def _caster(xvfb_display):
         .with_env("DISPLAY", xvfb_display)
         .with_env("STREAM_WIDTH", "1280")
         .with_env("STREAM_HEIGHT", "720")
-        .with_env("SRT_PORT", str(SRT_PORT))
+        .with_env("SERVICE_HOST", "127.0.0.1")
+        .with_env("RTP_PORT", str(RTP_PORT))
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         .with_kwargs(network_mode="host", ipc_mode="host")
     )
     with container:
-        # The caster logs "Starting capture:" after Gst.parse_launch succeeds
-        # but before set_state(PLAYING) returns, so srtsink isn't bound yet
-        # when this line appears.  Wait for the log, then give GStreamer a
-        # couple of seconds to complete the state transition and bind the
-        # UDP socket.  Service-side srtsrc also retries in caller mode, so
-        # the timing is belt-and-suspenders.
+        # The caster logs "Starting capture:" once the pipeline is parsed.
+        # Give GStreamer a couple of seconds to reach PLAYING so that RTP
+        # datagrams are flowing before the service starts.
         wait_for_logs(container, "Starting capture", timeout=30)
         time.sleep(2.0)
         yield container
@@ -221,16 +219,15 @@ def _caster(xvfb_display):
 @pytest.fixture(scope="session")
 def _service(_caster, archive_dir):
     """
-    The service container: SRT caller → tee → MP4 archive + webrtcsink.
+    The service container: RTP → tee → Matroska archive + webrtcsink.
 
-    Depends on _caster so the caster is up and listening before the service
-    tries to dial it (srtsrc in caller mode retries, but failing fast makes
-    test failures clearer).
+    Depends on _caster so the caster is already pushing RTP before the
+    service pipeline starts listening on the UDP port.
     """
     container = (
         DockerContainer(SERVICE_IMAGE)
-        .with_env("DESKTOP_HOST", "127.0.0.1")
-        .with_env("DESKTOP_PORT", str(SRT_PORT))
+        .with_env("DESKTOP_HOST", "127.0.0.1")   # RTCP RR feedback destination
+        .with_env("RTP_PORT", str(RTP_PORT))
         # 20-second segments so test runs produce at least one complete
         # segment well inside the test timeout budget; production default
         # is 600 s.  Keep it an integer so splitmuxsink math is clean.
