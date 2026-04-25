@@ -130,7 +130,7 @@ def main():
 
     # ── Configure webrtcsrc (connects to caster's signalling server)
     wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
-    wsrc.set_property('producer-peer-id', CASTER_PEER_ID)
+    wsrc.get_property('signaller').set_property('producer-peer-id', CASTER_PEER_ID)
 
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is

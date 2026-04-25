@@ -18,6 +18,7 @@ Fixture dependency graph:
     browser (function)
 """
 import os
+import re
 import subprocess
 import time
 
@@ -198,9 +199,28 @@ def _caster(xvfb_display):
         yield container
 
 
+# ── Caster peer ID ───────────────────────────────────────────────────────────
+@pytest.fixture(scope="session")
+def caster_peer_id(_caster):
+    """Extract the caster's randomly-assigned signalling peer ID from its logs."""
+    wait_for_logs(_caster, "registered as a producer", timeout=15)
+    stdout, _ = _caster.get_logs()
+    m = re.search(
+        r'registered as a producer \[peer_id=([^\]]+)\]',
+        stdout.decode(errors='replace'),
+    )
+    if not m:
+        raise RuntimeError(
+            "Could not find 'registered as a producer [peer_id=...]' in caster logs"
+        )
+    peer_id = m.group(1)
+    print(f'[conftest] caster peer_id = {peer_id}', flush=True)
+    return peer_id
+
+
 # ── Service ──────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
-def _service(_caster, archive_dir):
+def _service(_caster, caster_peer_id, archive_dir):
     """
     The service container: webrtcsrc dials caster → tee → archive + webrtcsink.
 
@@ -211,6 +231,7 @@ def _service(_caster, archive_dir):
         DockerContainer(SERVICE_IMAGE)
         .with_env("CASTER_HOST", "127.0.0.1")
         .with_env("CASTER_SIGNALLING_PORT", str(CASTER_SIGNALLING_PORT))
+        .with_env("CASTER_PEER_ID", caster_peer_id)
         .with_env("SIGNALLING_PORT", str(SERVICE_SIGNALLING_PORT))
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)

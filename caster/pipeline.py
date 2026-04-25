@@ -35,7 +35,6 @@ FRAMERATE    = os.environ.get('STREAM_FRAMERATE', '30')
 SIG_PORT     = os.environ.get('SIGNALLING_PORT', '8443')
 STUN         = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN         = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
-CASTER_PEER_ID = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 
 
 def main():
@@ -71,7 +70,6 @@ def main():
 
     ws = pipeline.get_by_name('ws')
     ws.get_property('signaller').set_property('uri', sig_uri)
-    ws.get_property('signaller').set_property('our-peer-id', CASTER_PEER_ID)
     if STUN:
         ws.set_property('stun-server', STUN)
 
