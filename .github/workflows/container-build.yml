@@ -98,15 +98,16 @@ jobs:
           path: /tmp/artifacts/base
 
       - name: Extract base OCI layout
-        id: base-oci
         run: |
           mkdir -p /tmp/base-oci
           tar -xf /tmp/artifacts/base/streamer-base.tar -C /tmp/base-oci
-          # Pick the first manifest's digest so oci-layout:// can resolve
-          # unambiguously when the index contains multiple tag annotations.
-          DIGEST=$(jq -r '.manifests[0].digest' /tmp/base-oci/index.json)
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Base digest: ${DIGEST}"
+          # BuildKit cannot auto-select when the index has multiple manifests
+          # (one per tag).  Trim to the first entry so it resolves without an
+          # explicit digest — appending @digest produces an invalid reference
+          # format through the docker-container buildx driver.
+          jq '.manifests = [.manifests[0]]' /tmp/base-oci/index.json \
+            > /tmp/base-oci/index.json.tmp
+          mv /tmp/base-oci/index.json.tmp /tmp/base-oci/index.json
 
       - name: Extract metadata
         id: meta
@@ -137,7 +138,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Containerfile
           build-contexts: |
-            streamer-base=oci-layout:///tmp/base-oci@${{ steps.base-oci.outputs.digest }}
+            streamer-base=oci-layout:///tmp/base-oci
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           push: ${{ github.event_name != 'pull_request' }}
