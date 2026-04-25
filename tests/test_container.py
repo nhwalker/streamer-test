@@ -20,7 +20,11 @@ import websockets
 
 from selenium.webdriver.support.ui import WebDriverWait
 
-from conftest import WS_PORT_TOP, WS_PORT_BOTTOM
+from conftest import (
+    CROP_HEIGHT, STREAM_WIDTH,
+    WS_PORT_TOP, WS_PORT_BOTTOM,
+    TWO_TONE_WS_PORT_TOP, TWO_TONE_WS_PORT_BOTTOM,
+)
 
 
 class TestServiceAvailability:
@@ -322,3 +326,164 @@ class TestWebRTCStream:
                 "Decoded WebRTC frame is not red.  Expected R>200, G<60, B<60 "
                 f"from the red Xvfb root. Last sample: {last_stats}"
             )
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+# JavaScript that waits for a decodable frame then returns the canvas stats.
+# Returns {stage, width, height, avgR, avgG, avgB, avgA, readyState, currentTime}
+# or an error dict if the video is not ready.
+_CAPTURE_SCRIPT = """
+    const v = document.querySelector('video');
+    if (!v || !v.videoWidth || !v.videoHeight) {
+        return {stage: 'no-video-size', readyState: v ? v.readyState : -1};
+    }
+    if (v.readyState < 2) {
+        return {stage: 'not-ready', readyState: v.readyState, currentTime: v.currentTime};
+    }
+    const c = document.createElement('canvas');
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    const ctx = c.getContext('2d');
+    try { ctx.drawImage(v, 0, 0, c.width, c.height); }
+    catch (e) { return {stage: 'drawImage-error', error: String(e)}; }
+    let data;
+    try { data = ctx.getImageData(0, 0, c.width, c.height).data; }
+    catch (e) { return {stage: 'getImageData-error', error: String(e)}; }
+    let r = 0, g = 0, b = 0, a = 0;
+    const n = data.length / 4;
+    for (let i = 0; i < data.length; i += 4) {
+        r += data[i]; g += data[i+1]; b += data[i+2]; a += data[i+3];
+    }
+    return {
+        stage: 'ok',
+        width: c.width, height: c.height,
+        avgR: r/n, avgG: g/n, avgB: b/n, avgA: a/n,
+        readyState: v.readyState, currentTime: v.currentTime,
+    };
+"""
+
+
+def _wait_for_playing(browser, http_port, signalling_port, turn_params, timeout=60):
+    """Navigate to the service page using the given signalling port and wait for playback."""
+    browser.get(
+        f"http://localhost:{http_port}/"
+        f"?signalling=ws://localhost:{signalling_port}{turn_params}"
+    )
+
+    def video_is_playing(driver):
+        t = driver.execute_script(
+            "const v = document.querySelector('video'); return v ? v.currentTime : -1;"
+        )
+        return isinstance(t, (int, float)) and t > 0
+
+    WebDriverWait(browser, timeout=timeout, poll_frequency=0.5).until(video_is_playing)
+
+
+def _capture_frame(browser):
+    """Return canvas stats for the current video frame, polling until ready."""
+    last = {}
+
+    def frame_ready(driver):
+        s = driver.execute_script(_CAPTURE_SCRIPT)
+        last.clear()
+        last.update(s or {})
+        return s if s and s.get("stage") == "ok" else False
+
+    WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(frame_ready)
+    return last
+
+
+# ── Level 3: split-stream playback + dimensions ───────────────────────────────
+
+class TestSplitStreamPlayback:
+    """
+    Verify /top and /bottom WebRTC streams play and produce correctly-sized frames.
+
+    Uses the regular single-colour (all-red) container chain.  Both halves are
+    expected to produce frames of exactly CROP_HEIGHT rows — confirming the
+    videocrop elements are active and sized correctly.
+    """
+
+    def _run(self, browser, http_port, sig_port, turn_params, label):
+        try:
+            _wait_for_playing(browser, http_port, sig_port, turn_params)
+        except Exception:
+            pytest.fail(f"{label} WebRTC stream did not start playing within 60 s")
+
+        stats = _capture_frame(browser)
+
+        assert stats["width"] == STREAM_WIDTH, (
+            f"{label} frame width: expected {STREAM_WIDTH}, got {stats['width']}"
+        )
+        assert stats["height"] == CROP_HEIGHT, (
+            f"{label} frame height: expected {CROP_HEIGHT} (CROP_HEIGHT), "
+            f"got {stats['height']} — crop is not producing half-height frames"
+        )
+        assert stats["avgR"] > 200 and stats["avgG"] < 60 and stats["avgB"] < 60, (
+            f"{label} frame is not red (R>200, G<60, B<60): {stats}"
+        )
+
+    def test_top_webrtc_plays(self, streaming_container, _service, browser, turn_params):
+        http_port, _ = streaming_container
+        self._run(browser, http_port, WS_PORT_TOP, turn_params, "/top")
+
+    def test_bottom_webrtc_plays(self, streaming_container, _service, browser, turn_params):
+        http_port, _ = streaming_container
+        self._run(browser, http_port, WS_PORT_BOTTOM, turn_params, "/bottom")
+
+
+# ── Level 4: split-stream crop-offset colour tests ────────────────────────────
+
+class TestSplitStreamCrop:
+    """
+    Prove that /top and /bottom serve the correct halves of the source frame.
+
+    Uses the two-tone container chain: the caster captures an Xvfb whose top
+    CROP_HEIGHT rows are red and bottom CROP_HEIGHT rows are blue.
+
+    /top  must produce a red frame  (rows 0 – CROP_HEIGHT-1 of the source).
+    /bottom must produce a blue frame (rows CROP_HEIGHT – end of the source).
+
+    If the bottom stream's y-offset were missing or wrong — e.g. it returned
+    the top rows instead of the bottom rows — it would deliver red pixels and
+    the blue assertion would fail.
+    """
+
+    def _run_colour_test(self, browser, http_port, sig_port, turn_params,
+                         label, colour_check, colour_desc):
+        try:
+            _wait_for_playing(browser, http_port, sig_port, turn_params)
+        except Exception:
+            pytest.fail(f"{label} WebRTC stream (two-tone) did not start playing within 60 s")
+
+        stats = _capture_frame(browser)
+        assert colour_check(stats), (
+            f"{label} frame colour is wrong. Expected {colour_desc}. "
+            f"avgR={stats.get('avgR'):.1f}, avgG={stats.get('avgG'):.1f}, "
+            f"avgB={stats.get('avgB'):.1f}  — "
+            "the crop y-offset may be incorrect."
+        )
+
+    def test_top_stream_shows_red(
+        self, streaming_container_two_tone, _service_two_tone, browser, turn_params
+    ):
+        """Top stream shows the red upper half of the two-tone source."""
+        http_port, _ = streaming_container_two_tone
+        self._run_colour_test(
+            browser, http_port, TWO_TONE_WS_PORT_TOP, turn_params,
+            "/top",
+            lambda s: s.get("avgR", 0) > 200 and s.get("avgG", 255) < 60 and s.get("avgB", 255) < 60,
+            "red (R>200, G<60, B<60)",
+        )
+
+    def test_bottom_stream_shows_blue(
+        self, streaming_container_two_tone, _service_two_tone, browser, turn_params
+    ):
+        """Bottom stream shows the blue lower half — proving the y-offset is applied."""
+        http_port, _ = streaming_container_two_tone
+        self._run_colour_test(
+            browser, http_port, TWO_TONE_WS_PORT_BOTTOM, turn_params,
+            "/bottom",
+            lambda s: s.get("avgR", 255) < 60 and s.get("avgG", 255) < 60 and s.get("avgB", 0) > 200,
+            "blue (R<60, G<60, B>200)",
+        )
