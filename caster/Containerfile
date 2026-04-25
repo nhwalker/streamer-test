@@ -103,13 +103,15 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
     && dnf clean all
 
 # ── GStreamer runtime packages ──────────────────────────────────────────────
-# gstreamer1-plugins-good : ximagesrc (X11 capture), rtpbin, rtph264pay,
-#                           udpsrc, udpsink, h264parse, videoconvert
-# gstreamer1-plugins-ugly : x264enc (software H.264 fallback, via RPM Fusion)
+# gstreamer1-plugins-good     : ximagesrc (X11 capture), rtpbin, rtph264pay,
+#                               udpsrc, udpsink, videoconvert
+# gstreamer1-plugins-bad-free : h264parse (videoparsersbad)
+# gstreamer1-plugins-ugly     : x264enc (software H.264 fallback, via RPM Fusion)
 RUN dnf install -y \
         gstreamer1 \
         gstreamer1-plugins-base \
         gstreamer1-plugins-good \
+        gstreamer1-plugins-bad-free \
         gstreamer1-plugins-ugly \
         python3 \
         python3-gobject \

@@ -164,7 +164,9 @@ def main():
     archive.set_property('location', archive_pattern)
     archive.set_property('max-size-time', segment_ns)
 
-    ws.set_property('signaller::uri', sig_uri)
+    # signaller::uri uses GstChildProxy notation which PyGObject's set_property
+    # does not support; access the signaller child object directly instead.
+    ws.get_property('signaller').set_property('uri', sig_uri)
     if STUN:
         ws.set_property('stun-server', STUN)
     ws.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
