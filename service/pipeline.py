@@ -115,7 +115,12 @@ def main():
         f'! h264parse config-interval=1 '
         f'! tee name=t '
         f't. ! queue '
-        f'   ! splitmuxsink name=archive muxer-factory=mp4mux '
+        # No muxer-factory= here: we attach a pre-configured mp4mux instance
+        # via the `muxer` property below so we can set fragment-duration on
+        # it directly (the prior muxer-properties approach silently produced
+        # a 0-byte file -- we couldn't tell whether the property was applied
+        # or whether mp4mux ignored it).
+        f'   ! splitmuxsink name=archive '
         f'     location="{archive_pattern}" '
         f'     max-size-time={segment_ns} '
         f't. ! queue '
@@ -136,19 +141,30 @@ def main():
     ws = pipeline.get_by_name('ws')
     ws.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
 
-    # Enable fragmented MP4 on the archive muxer: mp4mux defaults to
-    # writing ftyp/moov only at EOS, which leaves in-progress segment
-    # files unreadable (0 bytes until the splitmuxsink rotation boundary).
-    # fragment-duration=1000 emits a moof+mdat fragment every second, so
-    # the file on disk always starts with ftyp+moov and grows continuously
-    # -- a kill -9 mid-segment loses at most one fragment instead of the
-    # whole segment.  Playback compat is unaffected (browsers, ffprobe,
-    # VLC all handle fMP4; it's the same wire format as DASH/HLS).
+    # Enable fragmented MP4 on the archive muxer.  Non-fragmented mp4mux
+    # buffers ftyp/moov until EOS, which leaves in-progress segment files
+    # unreadable (0 bytes until splitmuxsink rotates).  Fragmented mode
+    # emits moof+mdat every fragment-duration milliseconds, so the file on
+    # disk always starts with ftyp+moov and grows continuously -- a kill
+    # -9 mid-segment loses at most one fragment.  Playback compat is
+    # unaffected (browsers, ffprobe, VLC all handle fMP4; it's the same
+    # wire format as DASH/HLS).
+    #
+    # We construct mp4mux ourselves and pass it via splitmuxsink's `muxer`
+    # property rather than relying on muxer-factory + muxer-properties --
+    # this lets us readback-verify fragment-duration in the log so we know
+    # for certain whether the property took.
+    mp4mux = Gst.ElementFactory.make('mp4mux', None)
+    if mp4mux is None:
+        print('[service] ERROR: failed to create mp4mux element',
+              file=sys.stderr)
+        sys.exit(1)
+    mp4mux.set_property('fragment-duration', 1000)
+    print(f'[service] mp4mux fragment-duration='
+          f'{mp4mux.get_property("fragment-duration")}', flush=True)
+
     archive = pipeline.get_by_name('archive')
-    muxer_props = Gst.Structure.from_string(
-        'properties,fragment-duration=1000'
-    )[0]
-    archive.set_property('muxer-properties', muxer_props)
+    archive.set_property('muxer', mp4mux)
 
     # TURN is per-consumer on webrtcsink 0.13.x (no top-level property).
     # Same pattern as the legacy pipeline: hook deep-element-added and call
