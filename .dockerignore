@@ -1,3 +1,7 @@
 .git
+.github/
 target/
+tests/
 *.log
+*.md
+LICENSE

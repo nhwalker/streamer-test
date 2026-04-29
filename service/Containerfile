@@ -79,6 +79,8 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
 
 # ── GStreamer runtime packages ──────────────────────────────────────────────
 RUN dnf install -y \
+        --setopt=install_weak_deps=False \
+        --setopt=tsflags=nodocs \
         gstreamer1 \
         gstreamer1-plugins-base \
         gstreamer1-plugins-good \
@@ -96,7 +98,9 @@ RUN dnf install -y \
         python3 \
         nmap-ncat \
         python3-gobject \
-    && dnf clean all
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* \
+              /usr/share/doc /usr/share/man /usr/share/info
 
 # ── Rust GStreamer plugins ────────────────────────────────────────────────────
 COPY --from=base /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/

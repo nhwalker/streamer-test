@@ -140,3 +140,12 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
     && ninja -C builddir -j2 \
     && meson install -C builddir \
     && find /opt/gst-nvcodec -name "*.so*" | sort
+
+# ── Strip debug symbols from all native artifacts ────────────────────────────
+# cargo --release leaves debug info in cdylibs by default, and meson install
+# copies nvcodec/webrtc .so files unstripped. Strip everything in /opt here so
+# the caster and service runtime images receive pre-stripped artifacts and do
+# not need binutils themselves.
+RUN find /opt -type f \( -name '*.so' -o -name '*.so.*' \) \
+        -exec strip --strip-unneeded {} + 2>/dev/null || true \
+    && strip --strip-unneeded /opt/gst-webrtc-signalling-server 2>/dev/null || true
