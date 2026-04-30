@@ -1,0 +1,16 @@
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
+
+RUN microdnf install -y python3 && microdnf clean all \
+    && rm -rf /var/cache/dnf /var/log/dnf*
+
+COPY web/           /etc/hub/web/
+COPY web_server.py  /usr/local/bin/web_server.py
+COPY entrypoint.sh  /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/web_server.py /usr/local/bin/entrypoint.sh
+
+ENV WEB_PORT=8080 \
+    WEB_DIR=/etc/hub/web
+
+EXPOSE 8080/tcp
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
