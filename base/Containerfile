@@ -2,48 +2,48 @@
 # Produces compiled GStreamer artifacts shared by both the caster and service:
 #   /opt/gst-rs/                 — all gst-plugins-rs Rust plugins
 #   /opt/gst-nvcodec/            — nvcodec (nvh264enc/dec) + webrtcbin rebuilt
-#                                  with libsrtp2 + libnice (RHEL10 omits both)
+#                                  with libsrtp2 + libnice (RHEL9 omits both)
 #   /opt/gst-webrtc-signalling-server — WebSocket signalling server binary
 #   /src/                        — gst-plugins-rs source (kept for JS bundle)
 #
 # The caster and service Containerfiles each do:
 #   FROM streamer-base:latest AS base
-#   FROM ubi10 AS runtime
+#   FROM ubi9 AS runtime
 #   COPY --from=base /opt/... /...
-FROM registry.access.redhat.com/ubi10/ubi:latest
+FROM registry.access.redhat.com/ubi9/ubi:latest
 
-# ── Repos: Rocky Linux 10 supplement at lower priority ───────────────────────
+# ── Repos: Rocky Linux 9 supplement at lower priority ───────────────────────
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
-    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
     && printf '%s\n' \
-        '[rocky10-baseos]' \
-        'name=Rocky Linux 10 - BaseOS' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        '[rocky9-baseos]' \
+        'name=Rocky Linux 9 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-appstream]' \
-        'name=Rocky Linux 10 - AppStream' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        '[rocky9-appstream]' \
+        'name=Rocky Linux 9 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-crb]' \
-        'name=Rocky Linux 10 - CRB' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        '[rocky9-crb]' \
+        'name=Rocky Linux 9 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
-        > /etc/yum.repos.d/rocky10-supplement.repo \
+        > /etc/yum.repos.d/rocky9-supplement.repo \
     && dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
     && dnf clean all
 
 # ── OS build dependencies ─────────────────────────────────────────────────────
@@ -84,7 +84,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # ── Clone gst-plugins-rs ─────────────────────────────────────────────────────
 # /src is kept after the build so the service Containerfile can build the
 # gstwebrtc-api JS bundle from /src/net/webrtc/gstwebrtc-api.
-ARG GST_PLUGINS_RS_TAG=0.13.3
+ARG GST_PLUGINS_RS_TAG=0.12.7
 RUN git clone --depth 1 --branch "${GST_PLUGINS_RS_TAG}" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git /src
 
@@ -117,7 +117,7 @@ RUN cargo build --release --jobs 2 --bin gst-webrtc-signalling-server \
     && rm -rf /src/target /root/.cargo/registry /root/.rustup
 
 # ── nvcodec + webrtcbin from the GStreamer monorepo ──────────────────────────
-# webrtcbin is rebuilt with libsrtp2 + libnice + sctp enabled because RHEL10's
+# webrtcbin is rebuilt with libsrtp2 + libnice + sctp enabled because RHEL9's
 # packaged webrtcbin is built without libsrtp2, so DTLS-SRTP does not work.
 WORKDIR /
 RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
