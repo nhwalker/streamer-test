@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Desktop Streams</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #111;
+      color: #ddd;
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      padding: 2em;
+    }
+
+    h1 { font-size: 1.4em; font-weight: 600; margin-bottom: 1.5em; color: #fff; }
+
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 1em;
+    }
+
+    .card {
+      background: rgba(255,255,255,0.07);
+      border-radius: 8px;
+      padding: 1.25em;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75em;
+    }
+
+    .card-name {
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .links { display: flex; flex-wrap: wrap; gap: 0.5em; }
+
+    .links a {
+      padding: 0.4em 0.9em;
+      background: rgba(255,255,255,0.1);
+      border-radius: 5px;
+      color: #ddd;
+      text-decoration: none;
+      font-size: 0.9em;
+      transition: background 0.15s;
+    }
+
+    .links a:hover { background: rgba(255,255,255,0.2); color: #fff; }
+    .links a.primary { background: rgba(255,255,255,0.18); color: #fff; }
+
+    #empty { color: #777; padding: 2em 0; }
+  </style>
+</head>
+<body>
+  <h1>Desktop Streams</h1>
+  <div id="grid"></div>
+  <p id="empty" hidden>
+    No streams configured. Mount a <code>streams.json</code> file into the container.
+  </p>
+
+  <script>
+    fetch('/streams.json')
+      .then(r => r.json())
+      .then(streams => {
+        if (!streams.length) { document.getElementById('empty').hidden = false; return; }
+        const grid = document.getElementById('grid');
+        streams.forEach(({ name, url }) => {
+          const base = url.replace(/\/$/, '');
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.innerHTML =
+            `<div class="card-name" title="${name}">${name}</div>` +
+            `<div class="links">` +
+              `<a class="primary" href="${base}/"      target="_blank">Full</a>` +
+              `<a                href="${base}/top"    target="_blank">Top</a>` +
+              `<a                href="${base}/bottom" target="_blank">Bottom</a>` +
+            `</div>`;
+          grid.appendChild(card);
+        });
+      })
+      .catch(() => { document.getElementById('empty').hidden = false; });
+  </script>
+</body>
+</html>

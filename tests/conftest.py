@@ -35,6 +35,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 CASTER_IMAGE  = os.environ.get("CASTER_IMAGE",  "desktop-caster:ci")
 SERVICE_IMAGE = os.environ.get("SERVICE_IMAGE", "desktop-stream-service:ci")
+HUB_IMAGE     = os.environ.get("HUB_IMAGE",     "desktop-stream-hub:ci")
 
 XVFB_DISPLAY  = ":99"
 XVFB_GEOMETRY = "1280x720x24"
@@ -53,6 +54,14 @@ HTTP_PORT               = 8080
 # Two-tone chain (separate Xvfb/caster/service for crop-offset colour tests).
 # Ports are kept well apart from the regular chain to allow both to coexist in
 # the same pytest session on a host-networked Docker setup.
+HUB_HTTP_PORT = 8091
+
+# Test data written to a temp file and mounted as /etc/hub/web/streams.json.
+HUB_TEST_STREAMS = [
+    {"name": "Desktop A", "url": "http://10.0.0.1:8080"},
+    {"name": "Desktop B", "url": "http://10.0.0.2:8080"},
+]
+
 TWO_TONE_DISPLAY                  = ":98"
 CASTER_TWO_TONE_SIGNALLING_PORT   = 8449
 TWO_TONE_SIGNALLING_PORT          = 8453   # +1 = 8454 (top), +2 = 8455 (bottom)
@@ -573,3 +582,49 @@ def streaming_container_two_tone(_service_two_tone):
         )
 
     yield http_port, ws_port
+
+
+# ── Hub container ─────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def hub_streams_file(tmp_path_factory):
+    """Write HUB_TEST_STREAMS to a temp file for mounting into the hub container."""
+    import json as _json
+    p = tmp_path_factory.mktemp("hub") / "streams.json"
+    p.write_text(_json.dumps(HUB_TEST_STREAMS))
+    return str(p)
+
+
+@pytest.fixture(scope="session")
+def _hub(hub_streams_file):
+    """Hub container with the test streams config mounted into its web root."""
+    container = (
+        DockerContainer(HUB_IMAGE)
+        .with_env("WEB_PORT", str(HUB_HTTP_PORT))
+        .with_volume_mapping(hub_streams_file, "/etc/hub/web/streams.json", "ro")
+        .with_kwargs(network_mode="host")
+    )
+    with container:
+        yield container
+
+
+@pytest.fixture(scope="session")
+def hub_container(_hub):
+    """Wait for the hub's HTTP server to be ready, then yield the HTTP port."""
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        try:
+            r = requests.get(f"http://localhost:{HUB_HTTP_PORT}/", timeout=2)
+            if r.status_code == 200:
+                break
+        except requests.ConnectionError:
+            pass
+        time.sleep(0.25)
+    else:
+        stdout, stderr = _hub.get_logs()
+        raise RuntimeError(
+            f"Hub HTTP server on :{HUB_HTTP_PORT} did not respond within 15 s.\n"
+            f"Container stdout:\n{stdout.decode()}\n"
+            f"Container stderr:\n{stderr.decode()}"
+        )
+    yield HUB_HTTP_PORT
