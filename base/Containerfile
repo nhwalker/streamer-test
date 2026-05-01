@@ -57,7 +57,6 @@ RUN dnf install -y \
         gstreamer1-plugins-base-devel \
         gstreamer1-plugins-bad-free-devel \
         openssl-devel \
-        libnice-devel \
         libsodium-devel \
         zvbi-devel \
         libwebp-devel \
@@ -74,6 +73,23 @@ RUN git clone --depth 1 https://github.com/sctplab/usrsctp.git /usrsctp-src \
     && cmake --build /usrsctp-src/build --parallel 2 \
     && cmake --install /usrsctp-src/build \
     && rm -rf /usrsctp-src
+
+# ── libnice 0.1.21 (EPEL9 ships 0.1.19 but GStreamer 1.22.x webrtcbin requires ≥0.1.20) ──
+RUN curl -fsSL https://libnice.freedesktop.org/releases/libnice-0.1.21.tar.gz \
+        | tar -xz -C / \
+    && meson setup /libnice-0.1.21/builddir /libnice-0.1.21 \
+           --prefix=/usr \
+           --libdir=lib64 \
+           -Ddefault_library=shared \
+           -Dgupnp=disabled \
+           -Dgtk_doc=disabled \
+           -Dtests=disabled \
+           -Dexamples=disabled \
+           -Dintrospection=disabled \
+    && ninja -C /libnice-0.1.21/builddir -j2 \
+    && meson install -C /libnice-0.1.21/builddir \
+    && ldconfig \
+    && rm -rf /libnice-0.1.21
 
 # ── Rust toolchain ────────────────────────────────────────────────────────────
 RUN curl -sSf https://sh.rustup.rs | \
