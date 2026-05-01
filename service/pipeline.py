@@ -59,7 +59,7 @@ CROP_HEIGHT           = int(os.environ.get('CROP_HEIGHT', '1080'))
 STUN                  = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 
-WEBRTC_VIDEO_CAPS     = 'video/x-vp9;video/x-h264'
+WEBRTC_VIDEO_CAPS     = 'video/x-h264'
 
 
 def build_archive_encoder():
