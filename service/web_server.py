@@ -50,7 +50,7 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 from archive_times import parse_segment_times, renamed_segment_path
 from video_transcode import transcode_to_video
@@ -291,5 +291,5 @@ class Router(SimpleHTTPRequestHandler):
 
 if __name__ == '__main__':
     port = int(os.environ.get('WEB_PORT', '8080'))
-    server = HTTPServer(('', port), Router)
+    server = ThreadingHTTPServer(('', port), Router)
     server.serve_forever()

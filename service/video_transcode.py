@@ -147,33 +147,33 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
 
     filters = []
 
-    filters.append(
-        f'color=c={color}:s={size}:r={fps_str}'
-        f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
-    )
+    if timeline:
+        filters.append(
+            f'color=c={color}:s={size}:r={fps_str}'
+            f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
+        )
 
-    for i, item in enumerate(timeline):
-        label = f'[c{i}]'
-        y     = item.output_start_s
-        if item.offset_s > 0:
-            filters.append(
-                f'[{i}:v]trim=start={item.offset_s:.6f}'
-                f',setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
-            )
-        else:
-            filters.append(
-                f'[{i}:v]setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
-            )
+        for i, item in enumerate(timeline):
+            label = f'[c{i}]'
+            y     = item.output_start_s
+            if item.offset_s > 0:
+                filters.append(
+                    f'[{i}:v]trim=start={item.offset_s:.6f}'
+                    f',setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
+                )
+            else:
+                filters.append(
+                    f'[{i}:v]setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
+                )
 
-    prev = 'base'
-    for i in range(len(timeline)):
-        src  = f'[{prev}]' if prev == 'base' else prev
-        clip = f'[c{i}]'
-        out  = '[out]' if i == len(timeline) - 1 else f'[t{i}]'
-        filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
-        prev = f'[t{i}]'
-
-    if not timeline:
+        prev = 'base'
+        for i in range(len(timeline)):
+            src  = f'[{prev}]' if prev == 'base' else prev
+            clip = f'[c{i}]'
+            out  = '[out]' if i == len(timeline) - 1 else f'[t{i}]'
+            filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
+            prev = f'[t{i}]'
+    else:
         filters.append(
             f'color=c={color}:s={size}:r={fps_str}'
             f':duration={total_dur:.6f},setpts=PTS-STARTPTS[out]'
