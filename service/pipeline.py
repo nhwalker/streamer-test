@@ -173,11 +173,12 @@ def main():
     archive.set_property('max-size-time', segment_ns)
 
     # ── Rename completed segments to embed their recording timestamps
-    # format-location fires (from the mux thread) when splitmuxsink opens a new
-    # fragment file.  That moment is simultaneously the end of the previous
-    # fragment, so we rename the previous file using the wall-clock time captured
-    # at each rotation.  The last fragment is renamed on EOS.
-    _fragment_starts = {}  # fragment_id -> start wall-clock nanoseconds
+    # Preferred: format-location-full provides the first GstSample of each new
+    # fragment; base_time + buf.pts gives the wall-clock time of that actual
+    # frame, so end(N) = start(N+1) in stream time and duration is exact.
+    # Fallback: format-location + time.time() if the fuller signal is absent.
+    # The last fragment is renamed on EOS using time.time() in both cases.
+    _fragment_starts = {}  # fragment_id -> start nanoseconds
 
     def _rename_fragment(frag_id, end_ns):
         if frag_id not in _fragment_starts:
@@ -193,13 +194,30 @@ def main():
             print(f'[service] WARNING: could not rename {src}: {exc}',
                   file=sys.stderr, flush=True)
 
+    def _on_format_location_full(_splitmux, fragment_id, first_sample):
+        buf = first_sample.get_buffer()
+        pts = buf.pts
+        now_ns = (pipeline.get_base_time() + pts
+                  if pts != Gst.CLOCK_TIME_NONE
+                  else int(time.time() * 1e9))
+        _rename_fragment(fragment_id - 1, now_ns)
+        _fragment_starts[fragment_id] = now_ns
+        return None
+
     def _on_format_location(_splitmux, fragment_id):
         now_ns = int(time.time() * 1e9)
         _rename_fragment(fragment_id - 1, now_ns)
         _fragment_starts[fragment_id] = now_ns
-        return None  # keep default location from the 'location' property
+        return None
 
-    archive.connect('format-location', _on_format_location)
+    try:
+        archive.connect('format-location-full', _on_format_location_full)
+        print('[service] archive: using format-location-full (PTS-based timestamps)',
+              flush=True)
+    except TypeError:
+        archive.connect('format-location', _on_format_location)
+        print('[service] archive: format-location-full unavailable, '
+              'using wall-clock timestamps', flush=True)
 
     # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
     crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
