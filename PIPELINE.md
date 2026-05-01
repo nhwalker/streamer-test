@@ -2,7 +2,8 @@
 
 This document describes every element in the GStreamer pipelines used by the
 caster and service containers, and traces the full WebRTC signalling and media
-flow from X11 screen capture to a viewer's browser.
+flow from X11 screen capture to a viewer's browser.  It also covers the HTTP
+web server that serves the archive download and video-assembly endpoints.
 
 ---
 
@@ -96,7 +97,7 @@ sequenceDiagram
     SvcPipe-->>Browser: Encoded video SRTP/RTP stream (UDP)
     Browser->>Browser: RTCPeerConnection decodes → <video> element
     Browser->>SvcSig: RTCP REMB (bandwidth estimate)
-    SvcSig-->>SvcPipe: Forward RTCP feedback
+    SvcSig-->>Browser: Forward RTCP feedback
     note over SvcPipe: webrtcsink adjusts encoder bitrate per-browser
 ```
 
@@ -104,7 +105,7 @@ sequenceDiagram
 
 ## Caster Pipeline
 
-**Pipeline string** (`caster/pipeline.py:54–62`):
+**Pipeline string** (`caster/pipeline.py`, `main()`):
 ```
 ximagesrc display-name=:0 use-damage=false
   ! videorate
@@ -198,15 +199,16 @@ delivery. H.264 decoding is universally hardware-accelerated, making it the
 most efficient codec for the internal caster→service leg.
 
 TURN server configuration is applied per `webrtcbin` via the `deep-element-added`
-signal (`caster/pipeline.py:77–87`) because `webrtcsink` creates a new
-`webrtcbin` for each peer and TURN credentials must be injected after creation.
+signal (`caster/pipeline.py`, `on_deep_element_added`) because `webrtcsink`
+creates a new `webrtcbin` for each peer and TURN credentials must be injected
+after creation.
 
 ---
 
 ## Service Pipeline
 
-The service pipeline is constructed programmatically rather than from a single
-description string (`service/pipeline.py:114–195`).
+The service pipeline is constructed programmatically (`service/pipeline.py`,
+`main()`).
 
 ### `webrtcsrc` (name: `wsrc`)
 
@@ -228,8 +230,8 @@ description string (`service/pipeline.py:114–195`).
 
 Because `webrtcsrc` does not know the stream's properties at construction time,
 the `src` pad is only added once the remote SDP is processed. The `pad-added`
-signal handler (`service/pipeline.py:200–215`) listens for this event and links
-the first video pad to `videoconvert`'s sink pad.
+signal handler (`on_pad_added`) listens for this event and links the first video
+pad to `videoconvert`'s sink pad.
 
 ### `videoconvert` (name: `vconvert`)
 
@@ -261,7 +263,7 @@ branch run at its own pace.
 #### `nvh264enc` or `x264enc` (name: `arch_enc`)
 
 Re-encodes the raw decoded video to H.264 for the archive. The encoder is
-selected at runtime (`service/pipeline.py:65–84`):
+selected at runtime (`build_archive_encoder()`):
 
 **NVIDIA GPU present — `nvh264enc`:**
 
@@ -305,14 +307,70 @@ would be undecodable without seeking back to the previous segment.
 | Property | Value | Purpose |
 |---|---|---|
 | `muxer-factory` | `matroskamux` | Wrap H.264 in Matroska (.mkv) container |
-| `location` | `/archive/stream-%05d.mkv` | Output path with zero-padded segment index |
-| `max-size-time` | `600 × Gst.SECOND` | Rotate to a new file every 10 minutes |
+| `location` | `/archive/{prefix}-%05d.mkv` | Output path with zero-padded segment index |
+| `max-size-time` | `ARCHIVE_SEGMENT_SEC × Gst.SECOND` | Rotate to a new file every N seconds |
 
 Muxes the H.264 stream into rotating Matroska segments. `splitmuxsink` opens a
 new file automatically when the current segment reaches the `max-size-time`
 limit, ensuring no single file grows unboundedly. Matroska was chosen over MP4
 because it handles non-monotonic timestamps and open-ended streams gracefully,
 and does not require a final `moov` atom write to be playable.
+
+---
+
+### Segment Naming and Timestamping
+
+Segments are written with sequential numeric names
+(`{prefix}-00000.mkv`, `{prefix}-00001.mkv`, …).  When a segment is completed,
+it is atomically renamed to embed its precise wall-clock recording interval:
+
+```
+{prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mkv
+```
+
+**How timestamps are derived:**
+
+The `format-location-full` signal fires on `splitmuxsink` at the start of each
+new fragment.  The callback (`_on_format_location_full`) computes the wall-clock
+time of the first frame in the new fragment as:
+
+```
+now_ns = pipeline.get_base_time() + buf.pts
+```
+
+This value simultaneously becomes the **end** timestamp of the just-completed
+fragment and the **start** timestamp of the new one.  The old fragment is
+renamed immediately using `archive_times.renamed_segment_path()`.
+
+On pipeline shutdown (EOS), `format-location-full` does not fire for the final
+fragment.  The EOS handler (`on_message`) renames it using
+`pipeline.query_position(Gst.Format.TIME)` as the end timestamp, falling back
+to `time.time()` if the clock query fails.
+
+The timestamp precision is millisecond-level, matching the filename format
+`YYYYMMDD-HHMMSS.SSS`.  The start of segment N+1 is always exactly equal to the
+end of segment N — there are no gaps or overlaps between adjacent completed
+segments.
+
+---
+
+### Archive Retention (Purge)
+
+When either `ARCHIVE_MAX_BYTES` or `ARCHIVE_MAX_AGE_DAYS` is non-zero,
+`archive_purge.purge_archive()` runs:
+
+- **At pipeline startup**, before the GLib main loop starts.
+- **Every `ARCHIVE_SEGMENT_SEC` seconds** thereafter, scheduled via
+  `GLib.timeout_add_seconds`.
+
+The purge logic (`archive_purge.py`):
+
+1. Sorts all `.mkv` files in `ARCHIVE_DIR` by mtime.
+2. Exempts the most recent file (it may still be open for writing).
+3. If `ARCHIVE_MAX_AGE_DAYS` is set, deletes every remaining file whose mtime
+   is older than the cutoff.
+4. If `ARCHIVE_MAX_BYTES` is set, deletes the oldest remaining files one by
+   one until the total size of surviving files is within the limit.
 
 ---
 
@@ -413,13 +471,91 @@ fixed at `ARCHIVE_BITRATE` kbps and is never reduced due to network conditions.
 ## TURN Server Configuration
 
 TURN server credentials are injected per `webrtcbin` instance via the
-`deep-element-added` pipeline signal (both `caster/pipeline.py:77–87` and
-`service/pipeline.py:218–231`). `webrtcsink` and `webrtcsrc` create a new
-internal `webrtcbin` element for each peer connection; the signal fires each
-time one is added to the pipeline hierarchy, at which point
+`deep-element-added` pipeline signal (both `caster/pipeline.py` and
+`service/pipeline.py`, `on_deep_element_added`). `webrtcsink` and `webrtcsrc`
+create a new internal `webrtcbin` element for each peer connection; the signal
+fires each time one is added to the pipeline hierarchy, at which point
 `element.emit('add-turn-server', TURN)` registers the relay. This approach is
 required because there is no single `webrtcbin` element to configure upfront —
 it is a dynamic, per-peer resource.
+
+---
+
+## HTTP Web Server
+
+`web_server.py` serves on `WEB_PORT` (default 8080) and handles four routes.
+
+### `GET /top`, `GET /bottom`
+
+Serve `index.html` directly (no redirect) so the browser's path-aware
+JavaScript can detect which sub-stream it is viewing and connect to the correct
+WebRTC signalling port (`SIGNALLING_PORT`, `+1`, or `+2`).  All other paths are
+served as static files from `WEB_DIR`.
+
+### `GET /archive`
+
+Returns a `.zip` of all `.mkv` segments whose recorded time overlaps the
+requested window.
+
+**Parameters** (one form required):
+
+| Form | Example |
+|---|---|
+| `last=<duration>` | `last=30m` |
+| `start=<ts>&end=<ts>` | `start=1700000000&end=1700003600` |
+
+`<duration>` is a number followed by `s`, `m`, or `h` (e.g. `90s`, `1.5h`).
+
+`<ts>` accepts:
+- Unix epoch seconds (integer or float)
+- ISO 8601 datetime with optional timezone (`Z` or `±HH:MM`); no timezone
+  assumes UTC.
+
+**Implementation:** `stage_segments()` copies overlapping segments into a
+temporary directory, then `zip_segments()` packs them into a zip file streamed
+directly to the client.
+
+### `GET /video`
+
+Returns a single `.mkv` covering **exactly** the requested time window.
+Requests longer than 12 hours are rejected with 400.
+
+**Parameters:** same as `/archive`.
+
+**Implementation** (`stage_segments()` → `transcode_to_video()`):
+
+1. **Staging** (`stage_segments()`): overlapping segments are copied to a temp
+   directory.  All staged files receive timestamp-embedded names so downstream
+   code can rely purely on filename parsing.
+
+   - **Completed segments** (timestamp names): copied as-is.
+   - **Active segment** (sequential numeric name — the file currently being
+     written by `splitmuxsink`): its start time is taken from the end timestamp
+     of the last completed segment (the same boundary `pipeline.py` will record
+     when it finalises the file).  The file is opened by file descriptor before
+     the copy begins; an `os.rename` by the pipeline after that point does not
+     interrupt the copy because the fd holds the inode reference.  If the rename
+     fires before the `open()` call, the now-completed file is found via a fresh
+     directory scan.
+
+2. **Assembly** (`video_transcode.py`, `transcode_to_video()`): builds and runs
+   an ffmpeg `filter_complex`:
+
+   - A solid-colour **base video** of exactly `end_ts − start_ts` seconds fills
+     the entire output duration.  Its colour is `VIDEO_FILL_COLOR` (ARGB);
+     its dimensions and frame rate are taken from the first available segment.
+   - Each segment is **overlaid** on the base at its correct temporal position
+     using `overlay=eof_action=pass`.  Overlays are applied in chronological
+     order.
+   - A segment whose recording start is **before** `start_ts` has its leading
+     content trimmed (`trim=start=<offset>`).
+   - A segment whose recording end is **after** `end_ts` is clipped implicitly
+     when the base video ends — no explicit trim needed.
+   - Gaps (periods with no recorded content) are filled by the base colour
+     showing through where no overlay is present.
+
+   The output is encoded with `libx264 -preset ultrafast` and streamed to the
+   client as `video/x-matroska`.
 
 ---
 
@@ -447,8 +583,15 @@ it is a dynamic, per-peer resource.
 | `ARCHIVE_DIR` | `/archive` | Output directory for `.mkv` segments |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
 | `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps |
-| `SIGNALLING_PORT` | `8443` | Base port for browser signalling servers |
+| `ARCHIVE_PREFIX` | `stream` | Filename prefix for segment files |
+| `ARCHIVE_MAX_BYTES` | `0` | Delete oldest segments when archive exceeds this size; `0` = unlimited |
+| `ARCHIVE_MAX_AGE_DAYS` | `0` | Delete segments older than this many days; `0` = unlimited |
+| `SIGNALLING_PORT` | `8443` | Base port for browser-facing signalling servers |
 | `CROP_HEIGHT` | `1080` | Pixel row where the frame is split for top/bottom streams |
+| `WEB_PORT` | `8080` | HTTP server listening port |
+| `VIDEO_FILL_COLOR` | `0xFF000000` | ARGB fill colour for gaps in `/video` output (default: opaque black) |
+| `VIDEO_DEFAULT_WIDTH` | `1920` | Output width for `/video` when no segments are available |
+| `VIDEO_DEFAULT_HEIGHT` | `1080` | Output height for `/video` when no segments are available |
 | `GST_WEBRTC_STUN_SERVER` | `` | STUN URI |
 | `GST_WEBRTC_TURN_SERVER` | `` | TURN URI |
 
