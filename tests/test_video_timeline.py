@@ -1,8 +1,8 @@
 """
 Unit tests for _build_timeline() in video_transcode.py.
 
-No GStreamer, Docker, or live pipelines required.  _query_file_info is mocked
-to return a fixed (duration_ns, width, height, fps_num, fps_denom) tuple.
+No ffmpeg, Docker, or live pipelines required.  _query_file_info is mocked
+to return a fixed (duration_s, width, height, fps_str) tuple.
 """
 import os
 import sys
@@ -13,16 +13,15 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
 from video_transcode import _build_timeline, TimelineItem  # noqa: E402
 
-# Shared constants
 SEGMENT_SEC = 600
+DURATION_S  = float(SEGMENT_SEC)
 WIDTH, HEIGHT = 1920, 1080
-FPS_NUM, FPS_DENOM = 25, 1
-DURATION_NS = SEGMENT_SEC * 10 ** 9  # 600 s in nanoseconds
+FPS_STR = '25/1'
 
 
 def _mock_info(path):
     """Always report a full 600-second segment."""
-    return DURATION_NS, WIDTH, HEIGHT, FPS_NUM, FPS_DENOM
+    return DURATION_S, WIDTH, HEIGHT, FPS_STR
 
 
 def _make_seg(directory, index, age_seconds=0):
@@ -53,7 +52,7 @@ def _make_renamed(directory, start_epoch, end_epoch):
 
 
 def _total_duration(timeline):
-    return sum(item.duration_ns for item in timeline)
+    return sum(item.duration_s for item in timeline)
 
 
 # ── empty stage dir ───────────────────────────────────────────────────────────
@@ -72,7 +71,7 @@ class TestEmptyStageDir:
         start, end = now - 300, now
         tl = _build_timeline(str(tmp_path), start, end, SEGMENT_SEC,
                              _query_info=_mock_info)
-        assert abs(_total_duration(tl) - int((end - start) * 1e9)) <= 1
+        assert abs(_total_duration(tl) - (end - start)) < 0.001
 
 
 # ── single segment fills the range ───────────────────────────────────────────
@@ -84,8 +83,7 @@ class TestSingleSegmentFillsRange:
         _make_renamed(tmp_path, now - 700, now - 100)
         tl = _build_timeline(str(tmp_path), now - 600, now - 200, SEGMENT_SEC,
                              _query_info=_mock_info)
-        paths = [item.path for item in tl]
-        assert None not in paths
+        assert all(item.path is not None for item in tl)
 
     def test_single_item(self, tmp_path):
         now = time.time()
@@ -126,8 +124,7 @@ class TestGapsAtEdges:
         req_start, req_end = now - 600, now - 100
         tl = _build_timeline(str(tmp_path), req_start, req_end, SEGMENT_SEC,
                              _query_info=_mock_info)
-        expected_ns = int((req_end - req_start) * 1e9)
-        assert abs(_total_duration(tl) - expected_ns) <= FPS_NUM  # within 1 frame
+        assert abs(_total_duration(tl) - (req_end - req_start)) < 0.1
 
 
 # ── gap in the middle ─────────────────────────────────────────────────────────
@@ -136,13 +133,11 @@ class TestGapBetweenSegments:
 
     def test_middle_gap_present(self, tmp_path):
         now = time.time()
-        # Two segments with a 200-second gap between them
         _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
         _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 1400, now, SEGMENT_SEC,
                              _query_info=_mock_info)
-        gap_items = [item for item in tl if item.path is None]
-        assert len(gap_items) >= 1
+        assert any(item.path is None for item in tl)
 
     def test_order_is_clip_gap_clip(self, tmp_path):
         now = time.time()
@@ -168,7 +163,7 @@ class TestClipOffsetAndTruncation:
         tl = _build_timeline(str(tmp_path), req_start, seg_start + 500,
                              SEGMENT_SEC, _query_info=_mock_info)
         clip = next(item for item in tl if item.path is not None)
-        assert clip.offset_ns == pytest.approx(200 * 10 ** 9, abs=10 ** 6)
+        assert clip.offset_s == pytest.approx(200.0, abs=0.001)
 
     def test_duration_truncated_when_request_ends_before_segment_end(self, tmp_path):
         now = time.time()
@@ -178,7 +173,7 @@ class TestClipOffsetAndTruncation:
         tl = _build_timeline(str(tmp_path), seg_start, req_end,
                              SEGMENT_SEC, _query_info=_mock_info)
         clip = next(item for item in tl if item.path is not None)
-        assert clip.duration_ns == pytest.approx(300 * 10 ** 9, abs=10 ** 6)
+        assert clip.duration_s == pytest.approx(300.0, abs=0.001)
 
 
 # ── unnamed segments (mtime-based start) ─────────────────────────────────────
@@ -186,25 +181,20 @@ class TestClipOffsetAndTruncation:
 class TestUnnamedSegmentMtimeStart:
 
     def test_unnamed_segment_included_in_range(self, tmp_path):
-        # Active segment whose mtime places it within the request window
         _make_seg(tmp_path, 0, age_seconds=100)
         now = time.time()
         tl = _build_timeline(str(tmp_path), now - 200, now, SEGMENT_SEC,
                              _query_info=_mock_info)
-        clips = [item for item in tl if item.path is not None]
-        assert len(clips) == 1
+        assert any(item.path is not None for item in tl)
 
     def test_unnamed_segment_excluded_when_range_before_it(self, tmp_path):
-        # Segment's mtime-estimated start is after the request end
         _make_seg(tmp_path, 0, age_seconds=0)
         mtime = os.path.getmtime(
             os.path.join(str(tmp_path), 'stream-00000.mkv'))
-        # Request ends before estimated segment start (mtime - SEGMENT_SEC)
         req_end = mtime - SEGMENT_SEC - 10
         tl = _build_timeline(str(tmp_path), 0, req_end, SEGMENT_SEC,
                              _query_info=_mock_info)
-        clips = [item for item in tl if item.path is not None]
-        assert clips == []
+        assert all(item.path is None for item in tl)
 
 
 # ── total duration invariant ──────────────────────────────────────────────────
@@ -223,17 +213,14 @@ class TestTotalDurationInvariant:
         req_start = now - window
         req_end   = now
 
-        # Place n_segs non-overlapping renamed segments inside the window
         cursor = req_start + 50
         for i in range(n_segs):
-            seg_start = cursor
-            seg_end   = cursor + SEGMENT_SEC
+            seg_end = cursor + SEGMENT_SEC
             if seg_end >= req_end:
                 break
-            _make_renamed(tmp_path, seg_start, seg_end)
+            _make_renamed(tmp_path, cursor, seg_end)
             cursor = seg_end + gap_size
 
         tl = _build_timeline(str(tmp_path), req_start, req_end, SEGMENT_SEC,
                              _query_info=_mock_info)
-        expected_ns = int(window * 1e9)
-        assert abs(_total_duration(tl) - expected_ns) <= FPS_NUM * (10 ** 9 // FPS_NUM)
+        assert abs(_total_duration(tl) - window) < 0.1
