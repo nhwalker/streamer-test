@@ -215,9 +215,12 @@ def main():
         print('[service] archive: using format-location-full (PTS-based timestamps)',
               flush=True)
     except TypeError:
-        archive.connect('format-location', _on_format_location)
-        print('[service] archive: format-location-full unavailable, '
-              'using wall-clock timestamps', flush=True)
+        # format-location-full is required; hard-fail so CI catches missing support
+        # archive.connect('format-location', _on_format_location)
+        print('[service] FATAL: format-location-full signal not available on this '
+              'GStreamer build; cannot record accurate segment timestamps',
+              file=sys.stderr, flush=True)
+        sys.exit(1)
 
     # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
     crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
