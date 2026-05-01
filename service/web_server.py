@@ -7,11 +7,17 @@ browser's path-aware signalling-port logic in index.html can select the correct
 WebRTC signalling server for that stream.  All other paths are served as static
 files from WEB_DIR.
 
-GET /archive?start=<unix_ts>&end=<unix_ts>
+GET /archive?start=<timestamp>&end=<timestamp>
   Returns a zip of the .mkv segments whose recorded time overlaps the requested
   window.  The active (currently-writing) segment is included when the window
   extends past the last completed segment; its bytes are read as-is (Matroska
   streaming format is valid at any truncation point).
+
+  <timestamp> accepts:
+    - Unix epoch seconds as a number (integer or float)
+    - ISO 8601 datetime with optional timezone (Z or ±HH:MM).
+      When no timezone is given, UTC is assumed.
+      Examples: 2024-01-15T10:30:00Z  2024-01-15T10:30:00+05:00  2024-01-15T10:30:00
 
 Environment variables:
   WEB_PORT            HTTP listening port         (8080)
@@ -19,6 +25,7 @@ Environment variables:
   ARCHIVE_DIR         Directory of .mkv segments  (/archive)
   ARCHIVE_SEGMENT_SEC Nominal segment duration    (600)
 """
+import datetime
 import glob
 import os
 import shutil
@@ -33,6 +40,22 @@ ARCHIVE_DIR         = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 
 ROUTED_PATHS = {'/top', '/bottom'}
+
+
+def parse_timestamp(s):
+    """Return a UTC epoch float parsed from s.
+
+    Accepts a numeric epoch string or any ISO 8601 datetime string.
+    When no timezone is present the value is assumed to be UTC.
+    """
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    dt = datetime.datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
 
 
 def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
@@ -97,10 +120,10 @@ class Router(SimpleHTTPRequestHandler):
     def _handle_archive(self):
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         try:
-            start_ts = float(params['start'][0])
-            end_ts   = float(params['end'][0])
+            start_ts = parse_timestamp(params['start'][0])
+            end_ts   = parse_timestamp(params['end'][0])
         except (KeyError, ValueError, IndexError):
-            self.send_error(400, 'start and end query parameters must be numeric Unix timestamps')
+            self.send_error(400, 'start and end must be epoch seconds or ISO 8601 timestamps')
             return
 
         tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)

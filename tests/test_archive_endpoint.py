@@ -1,8 +1,10 @@
 """
-Unit tests for stage_segments() and zip_segments() in web_server.py.
+Unit tests for parse_timestamp(), stage_segments(), and zip_segments()
+in web_server.py.
 
 No Docker, GStreamer, or live HTTP server required.
 """
+import datetime
 import os
 import sys
 import time
@@ -11,9 +13,51 @@ import zipfile
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from web_server import stage_segments, zip_segments  # noqa: E402
+from web_server import parse_timestamp, stage_segments, zip_segments  # noqa: E402
 
 SEGMENT_SEC = 600
+
+# Reference UTC epoch for 2024-01-15 10:30:00 UTC
+_REF_DT  = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
+_REF_EPS = _REF_DT.timestamp()
+
+
+class TestParseTimestamp:
+
+    def test_integer_string(self):
+        assert parse_timestamp('1234567890') == 1234567890.0
+
+    def test_float_string(self):
+        assert parse_timestamp('1234567890.5') == pytest.approx(1234567890.5)
+
+    def test_iso_with_z(self):
+        assert parse_timestamp('2024-01-15T10:30:00Z') == pytest.approx(_REF_EPS)
+
+    def test_iso_without_timezone_assumed_utc(self):
+        assert parse_timestamp('2024-01-15T10:30:00') == pytest.approx(_REF_EPS)
+
+    def test_iso_with_positive_offset(self):
+        # +05:00 means the wall time is 5 h ahead of UTC, so UTC is 5 h earlier
+        assert parse_timestamp('2024-01-15T15:30:00+05:00') == pytest.approx(_REF_EPS)
+
+    def test_iso_with_negative_offset(self):
+        assert parse_timestamp('2024-01-15T05:30:00-05:00') == pytest.approx(_REF_EPS)
+
+    def test_iso_date_only_assumed_utc_midnight(self):
+        midnight = datetime.datetime(2024, 1, 15, tzinfo=datetime.timezone.utc).timestamp()
+        assert parse_timestamp('2024-01-15') == pytest.approx(midnight)
+
+    def test_iso_with_fractional_seconds(self):
+        ref = _REF_EPS + 0.123
+        assert parse_timestamp('2024-01-15T10:30:00.123Z') == pytest.approx(ref, abs=1e-3)
+
+    def test_invalid_raises_value_error(self):
+        with pytest.raises(ValueError):
+            parse_timestamp('not-a-timestamp')
+
+    def test_invalid_date_raises_value_error(self):
+        with pytest.raises(ValueError):
+            parse_timestamp('2024-13-01T00:00:00')
 
 
 def _make_segment(directory, index, content=b'mkv-data', age_seconds=0):
