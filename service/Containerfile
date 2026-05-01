@@ -98,6 +98,7 @@ RUN dnf install -y \
         python3 \
         nmap-ncat \
         python3-gobject \
+        ffmpeg \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* \
               /usr/share/doc /usr/share/man /usr/share/info
@@ -130,14 +131,15 @@ COPY --from=js-builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 COPY web/index.html /var/www/html/index.html
 
 # ── Application scripts ───────────────────────────────────────────────────────
-COPY entrypoint.sh    /usr/local/bin/entrypoint.sh
-COPY pipeline.py      /usr/local/bin/pipeline.py
-COPY web_server.py    /usr/local/bin/web_server.py
-COPY archive_purge.py /usr/local/bin/archive_purge.py
-COPY archive_times.py /usr/local/bin/archive_times.py
+COPY entrypoint.sh       /usr/local/bin/entrypoint.sh
+COPY pipeline.py         /usr/local/bin/pipeline.py
+COPY web_server.py       /usr/local/bin/web_server.py
+COPY archive_purge.py    /usr/local/bin/archive_purge.py
+COPY archive_times.py    /usr/local/bin/archive_times.py
+COPY video_transcode.py  /usr/local/bin/video_transcode.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
              /usr/local/bin/web_server.py /usr/local/bin/archive_purge.py \
-             /usr/local/bin/archive_times.py
+             /usr/local/bin/archive_times.py /usr/local/bin/video_transcode.py
 
 # ── Default archive volume ────────────────────────────────────────────────────
 VOLUME /archive
@@ -155,6 +157,9 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     WEB_PORT=8080 \
     GST_WEBRTC_STUN_SERVER="" \
     GST_WEBRTC_TURN_SERVER="" \
+    VIDEO_FILL_COLOR=0xFF000000 \
+    VIDEO_DEFAULT_WIDTH=1920 \
+    VIDEO_DEFAULT_HEIGHT=1080 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=video,compute
 
