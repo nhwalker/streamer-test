@@ -2,3 +2,6 @@
 # These are only used when building behind a TLS-inspecting corporate proxy.
 build-ca-certs/
 Dockerfile.buildtest
+
+__pycache__/
+*.pyc
