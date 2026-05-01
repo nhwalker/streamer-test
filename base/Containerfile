@@ -50,7 +50,7 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
 RUN dnf install -y \
         gcc gcc-c++ make \
         pkgconf-pkg-config \
-        git curl ca-certificates \
+        git ca-certificates \
         meson ninja-build cmake \
         python3 \
         gstreamer1-devel \
