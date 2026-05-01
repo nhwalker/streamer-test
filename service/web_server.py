@@ -96,22 +96,18 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
-def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
+def stage_segments(archive_dir, start_ts, end_ts):
     """Copy overlapping segments into a TemporaryDirectory and return it.
 
     Completed segments have their recording timestamps embedded in their
     filenames (via the fragment-closed rename in pipeline.py); those
-    timestamps are used directly.  Any file whose name does not match the
-    renamed pattern (the active segment still being written, or a segment
-    from a crashed run) falls back to mtime-based time-range estimation:
-      - consecutive unnamed files: [mtime(N-1), mtime(N)]
-      - first unnamed file after renamed ones: [last_renamed_end, mtime]
-      - first unnamed file with no renamed files: [mtime - segment_sec, mtime]
-      - the last unnamed file (highest mtime, i.e. the active segment):
-        end = now()
+    timestamps are used directly.
 
-    The active segment is copied as-is; matroskamux streaming format is
-    valid at any truncation point.
+    The current active segment (the highest-named unnamed file) is included
+    when its estimated time range overlaps the request window.  Its start
+    time is the end of the last completed segment; its end time is now().
+    If no completed segments exist before it, the active segment is excluded
+    (no reliable start time can be determined).
 
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
@@ -122,8 +118,8 @@ def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
         return tmp
 
     now = time.time()
-    renamed = []   # [(path, seg_start, seg_end)] — timestamps from filename
-    unnamed = []   # [path] — no embedded timestamps; use mtime estimation
+    renamed = []
+    unnamed = []
 
     for path in all_files:
         times = parse_segment_times(os.path.basename(path))
@@ -132,34 +128,30 @@ def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
         else:
             unnamed.append(path)
 
-    renamed.sort(key=lambda x: x[1])       # sort by start timestamp
-    unnamed.sort(key=os.path.getmtime)      # sort oldest-first by mtime
+    renamed.sort(key=lambda x: x[1])
 
     for path, seg_start, seg_end in renamed:
         if seg_start < end_ts and seg_end > start_ts:
             shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
 
-    # Mtime-based estimation for unnamed files; copy with timestamp name so
-    # _build_timeline can rely purely on filename parsing.
-    last_known_end = renamed[-1][2] if renamed else None
-    for i, path in enumerate(unnamed):
-        is_active = (i == len(unnamed) - 1)
-        mtime     = os.path.getmtime(path)
-        seg_end   = now if is_active else mtime
-        if i == 0:
-            seg_start = last_known_end if last_known_end is not None else mtime - segment_sec
-        else:
-            seg_start = os.path.getmtime(unnamed[i - 1])
+    # The active (currently-writing) segment is the highest-named unnamed
+    # file.  Its start time equals the end of the last completed segment —
+    # the same boundary pipeline.py will use when it finalizes the file.
+    # Without a completed predecessor we have no reliable start time, so
+    # any other unnamed files (orphans from crashed runs) are dropped.
+    if unnamed and renamed:
+        active    = max(unnamed)
+        seg_start = renamed[-1][2]
+        seg_end   = now
         if seg_start < end_ts and seg_end > start_ts:
-            basename = os.path.basename(path)
-            prefix   = basename.rsplit('-', 1)[0]
+            prefix = os.path.basename(active).rsplit('-', 1)[0]
             dst = renamed_segment_path(
-                os.path.join(tmp.name, basename),
+                os.path.join(tmp.name, os.path.basename(active)),
                 int(seg_start * 1e9),
                 int(seg_end   * 1e9),
                 prefix,
             )
-            shutil.copy2(path, dst)
+            shutil.copy2(active, dst)
 
     return tmp
 
@@ -207,7 +199,7 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'invalid parameter value')
             return
 
-        tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)
+        tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts)
         try:
             zip_path = os.path.join(tmp.name, '_archive.zip')
             zip_segments(tmp.name, zip_path)
@@ -242,7 +234,7 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'requested range exceeds 12-hour maximum')
             return
 
-        stage_tmp  = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)
+        stage_tmp  = stage_segments(ARCHIVE_DIR, start_ts, end_ts)
         output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
         try:
             output_path = os.path.join(output_tmp.name, 'video.mkv')
