@@ -143,9 +143,13 @@ def stage_segments(archive_dir, start_ts, end_ts):
     # Without a completed predecessor we have no reliable start time, so
     # any other unnamed files (orphans from crashed runs) are dropped.
     #
-    # If a segment rollover fires between our glob and this copy the file
-    # may no longer exist; skip it silently — the output gets a gap at the
-    # trailing edge which the base color video fills.
+    # Race with segment rollover (pipeline.py calling os.rename):
+    #   - If we open() the file before rename fires, the fd holds a
+    #     reference to the inode; the copy completes even if the name
+    #     changes underneath us.
+    #   - If rename fires before open(), we get FileNotFoundError.
+    #     The file now exists under its timestamp name, so we re-glob
+    #     to find and copy it as a completed segment.
     if unnamed and renamed:
         active    = max(unnamed)
         seg_start = renamed[-1][2]
@@ -159,9 +163,21 @@ def stage_segments(archive_dir, start_ts, end_ts):
                 prefix,
             )
             try:
-                shutil.copy2(active, dst)
+                with open(active, 'rb') as src, open(dst, 'wb') as out:
+                    shutil.copyfileobj(src, out)
             except FileNotFoundError:
-                pass  # rollover fired between glob and copy; skip it
+                # Rollover fired in the window before open().
+                # Find the now-completed file by its start timestamp.
+                for path in glob.glob(os.path.join(archive_dir, '*.mkv')):
+                    times = parse_segment_times(os.path.basename(path))
+                    if times and abs(times[0] - seg_start) < 1.0:
+                        if times[0] < end_ts and times[1] > start_ts:
+                            try:
+                                shutil.copy2(path, os.path.join(
+                                    tmp.name, os.path.basename(path)))
+                            except FileNotFoundError:
+                                pass
+                        break
 
     return tmp
 
