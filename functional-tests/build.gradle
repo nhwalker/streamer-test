@@ -17,9 +17,10 @@ repositories {
 }
 
 ext {
-    junitVersion        = '5.11.4'
+    junitVersion          = '5.11.4'
     testcontainersVersion = '1.20.4'
-    allureVersion       = '2.29.0'
+    allureVersion         = '2.29.0'
+    seleniumVersion       = '4.27.0'
 }
 
 dependencies {
@@ -28,8 +29,12 @@ dependencies {
 
     testImplementation "org.testcontainers:testcontainers:${testcontainersVersion}"
     testImplementation "org.testcontainers:junit-jupiter:${testcontainersVersion}"
+    testImplementation "org.testcontainers:selenium:${testcontainersVersion}"
+
+    testImplementation "org.seleniumhq.selenium:selenium-java:${seleniumVersion}"
 
     testImplementation "io.qameta.allure:allure-junit5:${allureVersion}"
+    testImplementation "io.qameta.allure:allure-selenide:${allureVersion}"
 }
 
 allure {
