@@ -3,8 +3,10 @@ video_transcode.py -- ffmpeg-based video assembly for the /video endpoint.
 
 Takes a directory of staged .mkv segments and produces a single output .mkv
 that exactly covers the requested time window:
-  - segments are clipped to the window boundaries
-  - gaps (missing coverage) are filled with solid-color frames
+  - a full-duration solid-color base video covers the entire window
+  - each segment is overlaid at its correct temporal position
+  - segments starting before the window are trimmed; segments extending past
+    the end are cut off implicitly when the base video ends
   - the output is always a complete, decodable Matroska file
 
 Requires: ffmpeg and ffprobe available in PATH.
@@ -19,7 +21,6 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from archive_times import parse_segment_times
 
@@ -28,11 +29,9 @@ _DEFAULT_FPS = '25/1'
 
 @dataclass
 class TimelineItem:
-    start_ts:   float          # wall-clock epoch seconds
-    end_ts:     float          # wall-clock epoch seconds
-    path:       Optional[str]  # None → gap (fill color)
-    offset_s:   float          # seek position within file in seconds (0 for gaps)
-    duration_s: float          # duration in the output in seconds
+    path:           str
+    offset_s:       float  # > 0 → trim=start=offset_s to skip pre-window content
+    output_start_s: float  # seconds from start of output where overlay begins
 
 
 # ── File introspection ────────────────────────────────────────────────────────
@@ -65,13 +64,14 @@ def _query_file_info(path):
 def _build_timeline(stage_dir, start_ts, end_ts, segment_sec, _query_info=None):
     """Build an ordered list of TimelineItem covering [start_ts, end_ts].
 
-    Segments are classified as renamed (timestamps in filename) or unnamed
-    (mtime-based start estimate), mirroring the logic in stage_segments().
-    Duration for each comes from ffprobe — the end timestamp embedded in
-    renamed filenames is deliberately ignored so clip boundaries are driven
-    by actual recorded content.
+    Each item represents a file segment that overlaps the window.  Gaps are
+    implicit: the base color video in transcode_to_video fills them.
 
-    Gaps between and around segments are inserted as None-path items.
+    Segments starting before start_ts have offset_s > 0; their leading
+    pre-window content is trimmed by transcode_to_video.  Segments extending
+    past end_ts are cut off automatically when the base video ends.
+
+    Returns [] when no segments overlap (pure color output).
 
     _query_info is injectable for unit testing (defaults to _query_file_info).
     """
@@ -85,9 +85,8 @@ def _build_timeline(stage_dir, start_ts, end_ts, segment_sec, _query_info=None):
     ]
 
     if not all_files:
-        return [TimelineItem(start_ts, end_ts, None, 0.0, end_ts - start_ts)]
+        return []
 
-    # Query every file exactly once
     file_info = {path: _query_info(path) for path in all_files}
 
     renamed = []
@@ -120,36 +119,22 @@ def _build_timeline(stage_dir, start_ts, end_ts, segment_sec, _query_info=None):
 
     segments.sort(key=lambda x: x[0])
 
-    # Resolve real durations and filter to [start_ts, end_ts]
-    raw = []
+    timeline = []
     for seg_start, path in segments:
         dur_s = file_info[path][0]
         if dur_s == 0:
             dur_s = max(0.0, time.time() - seg_start)
         seg_end = seg_start + dur_s
-        if seg_start < end_ts and seg_end > start_ts:
-            raw.append((seg_start, seg_end, path))
 
-    # Assemble timeline: gaps + clipped file items
-    timeline = []
-    cursor = start_ts
+        if seg_start >= end_ts or seg_end <= start_ts:
+            continue
 
-    for seg_start, seg_end, path in raw:
-        gap_end = min(seg_start, end_ts)
-        if cursor < gap_end:
-            timeline.append(TimelineItem(cursor, gap_end, None, 0.0, gap_end - cursor))
-        if seg_start >= end_ts:
-            break
-        cursor = max(cursor, seg_start)
-        clip_end   = min(seg_end, end_ts)
-        offset_s   = cursor - seg_start
-        duration_s = clip_end - cursor
-        if duration_s > 0:
-            timeline.append(TimelineItem(cursor, clip_end, path, offset_s, duration_s))
-        cursor = clip_end
-
-    if cursor < end_ts:
-        timeline.append(TimelineItem(cursor, end_ts, None, 0.0, end_ts - cursor))
+        clip_start = max(seg_start, start_ts)
+        timeline.append(TimelineItem(
+            path           = path,
+            offset_s       = clip_start - seg_start,
+            output_start_s = clip_start - start_ts,
+        ))
 
     return timeline
 
@@ -162,7 +147,9 @@ def transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
                        _query_info=None):
     """Assemble a single MKV covering [start_ts, end_ts] from staged segments.
 
-    Gaps are filled with solid frames of fill_color_argb (0xAARRGGBB).
+    A solid fill_color_argb (0xAARRGGBB) base video covers the full duration.
+    Each segment is overlaid at its correct temporal position.  Gaps between
+    segments and at the edges are filled by the base.
     output_path will be overwritten.  Raises RuntimeError on ffmpeg failure.
     """
     if _query_info is None:
@@ -171,45 +158,62 @@ def transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
     timeline = _build_timeline(
         stage_dir, start_ts, end_ts, segment_sec, _query_info=_query_info)
 
-    # Video properties from first file clip; fall back to defaults
     width, height, fps_str = default_width, default_height, _DEFAULT_FPS
     for item in timeline:
-        if item.path is not None:
-            _, w, h, fps = _query_info(item.path)
-            if w > 0 and h > 0:
-                width, height, fps_str = w, h, fps
+        _, w, h, fps = _query_info(item.path)
+        if w > 0 and h > 0:
+            width, height, fps_str = w, h, fps
             break
 
     r = (fill_color_argb >> 16) & 0xFF
     g = (fill_color_argb >>  8) & 0xFF
     b =  fill_color_argb        & 0xFF
-    color = f'0x{r:02X}{g:02X}{b:02X}'
-    size  = f'{width}x{height}'
+    color     = f'0x{r:02X}{g:02X}{b:02X}'
+    size      = f'{width}x{height}'
+    total_dur = end_ts - start_ts
 
     cmd = ['ffmpeg', '-y']
     for item in timeline:
-        if item.path is not None:
-            cmd += ['-i', item.path]
+        cmd += ['-i', item.path]
 
-    filters  = []
-    labels   = []
-    file_idx = 0
+    filters = []
+
+    base_filter = (
+        f'color=c={color}:s={size}:r={fps_str}'
+        f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
+    )
+    filters.append(base_filter)
+
     for i, item in enumerate(timeline):
-        label = f'[v{i}]'
-        if item.path is None:
+        label = f'[c{i}]'
+        y     = item.output_start_s
+        if item.offset_s > 0:
             filters.append(
-                f'color=c={color}:s={size}:r={fps_str}'
-                f':duration={item.duration_s:.6f},setpts=PTS-STARTPTS{label}'
+                f'[{i}:v]trim=start={item.offset_s:.6f}'
+                f',setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
             )
         else:
             filters.append(
-                f'[{file_idx}:v]trim=start={item.offset_s:.6f}'
-                f':duration={item.duration_s:.6f},setpts=PTS-STARTPTS{label}'
+                f'[{i}:v]setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
             )
-            file_idx += 1
-        labels.append(label)
 
-    filters.append(f'{"".join(labels)}concat=n={len(timeline)}:v=1:a=0[out]')
+    prev = 'base'
+    for i in range(len(timeline)):
+        src   = f'[{prev}]' if prev == 'base' else prev
+        clip  = f'[c{i}]'
+        if i < len(timeline) - 1:
+            out = f'[t{i}]'
+        else:
+            out = '[out]'
+        filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
+        prev = f'[t{i}]'
+
+    if not timeline:
+        filters.append(
+            f'color=c={color}:s={size}:r={fps_str}'
+            f':duration={total_dur:.6f},setpts=PTS-STARTPTS[out]'
+        )
+
     cmd += ['-filter_complex', ';'.join(filters)]
     cmd += ['-map', '[out]', '-c:v', 'libx264', '-preset', 'ultrafast', output_path]
 
