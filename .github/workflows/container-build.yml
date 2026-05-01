@@ -328,7 +328,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends xvfb
+          sudo apt-get install -y --no-install-recommends xvfb coturn
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
@@ -361,8 +361,34 @@ jobs:
 
           docker images | grep -E '^(desktop-caster|desktop-stream-service)\s+ci\s'
 
+      - name: Start local TURN relay
+        run: |
+          turnserver \
+            --listening-port=3478 \
+            --listening-ip=127.0.0.1 \
+            --relay-ip=127.0.0.1 \
+            --lt-cred-mech \
+            --user=ci:ci \
+            --realm=test.local \
+            --no-tls \
+            --no-dtls \
+            --allow-loopback-peers \
+            --no-cli \
+            --verbose \
+            --log-file=/tmp/turnserver-ft.log &
+          for i in $(seq 1 20); do
+            if ss -ulnp 2>/dev/null | grep -q ':3478 '; then
+              echo "TURN server ready on UDP 3478"; break
+            fi
+            sleep 0.5
+          done
+
       - name: Run functional tests
         working-directory: functional-tests
+        env:
+          CASTER_IMAGE:           "desktop-caster:ci"
+          SERVICE_IMAGE:          "desktop-stream-service:ci"
+          GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
         run: ./gradlew test
 
       - name: Generate Allure report
@@ -385,3 +411,9 @@ jobs:
           name: functional-test-allure-report
           path: functional-tests/build/reports/allure-report/
           retention-days: 7
+
+      - name: Show TURN server log
+        if: always()
+        run: |
+          echo "=== coturn log (functional-test) ==="
+          cat /tmp/turnserver-ft.log 2>/dev/null || echo "(no log file)"

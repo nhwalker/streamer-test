@@ -53,7 +53,8 @@ test {
     // Keep all test classes in one JVM so the ServiceStack singleton is shared.
     forkEvery = 0
     maxParallelForks = 1
-    // Allow image names to be overridden via environment variables.
-    systemProperty 'CASTER_IMAGE',  System.getenv('CASTER_IMAGE')  ?: 'desktop-caster:ci'
-    systemProperty 'SERVICE_IMAGE', System.getenv('SERVICE_IMAGE') ?: 'desktop-stream-service:ci'
+    // Allow image names and TURN server to be overridden via environment variables.
+    systemProperty 'CASTER_IMAGE',           System.getenv('CASTER_IMAGE')           ?: 'desktop-caster:ci'
+    systemProperty 'SERVICE_IMAGE',          System.getenv('SERVICE_IMAGE')          ?: 'desktop-stream-service:ci'
+    systemProperty 'GST_WEBRTC_TURN_SERVER', System.getenv('GST_WEBRTC_TURN_SERVER') ?: ''
 }

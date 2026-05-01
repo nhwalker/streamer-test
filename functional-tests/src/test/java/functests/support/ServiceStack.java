@@ -1,7 +1,6 @@
 package functests.support;
 
 import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.Network;
 import org.testcontainers.containers.wait.strategy.Wait;
 
 import java.io.IOException;
@@ -22,6 +21,10 @@ import java.util.regex.Pattern;
  * for the duration of the test run. Call {@link #getInstance()} from each test
  * class's {@code @BeforeAll}; the stack is started exactly once and torn down
  * via a JVM shutdown hook.
+ *
+ * Both containers run with network_mode=host, matching the proven Python test
+ * setup. The caster's signalling server uses port 8448 to avoid colliding with
+ * the service's own browser-facing signalling servers on 8443/8444/8445.
  */
 public final class ServiceStack {
 
@@ -29,6 +32,17 @@ public final class ServiceStack {
             System.getProperty("CASTER_IMAGE",  "desktop-caster:ci");
     private static final String SERVICE_IMAGE =
             System.getProperty("SERVICE_IMAGE", "desktop-stream-service:ci");
+    private static final String TURN_SERVER   =
+            System.getProperty("GST_WEBRTC_TURN_SERVER", "");
+
+    // Fixed ports — both containers run with network_mode=host so there is no
+    // dynamic port mapping. Caster uses 8448 (not 8443) to avoid conflict with
+    // the service's signalling servers on 8443/8444/8445.
+    private static final int CASTER_SIGNALLING = 8448;
+    private static final int HTTP_PORT         = 8080;
+    private static final int WS_PORT           = 8443;
+    private static final int WS_PORT_TOP       = 8444;
+    private static final int WS_PORT_BOTTOM    = 8445;
 
     private static final Pattern UUID_PATTERN = Pattern.compile(
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -49,23 +63,15 @@ public final class ServiceStack {
     }
 
     // ── Infrastructure handles ────────────────────────────────────────────────
-    private final Network             network;
     private final Process             xvfbProcess;
     private final GenericContainer<?> caster;
     private final GenericContainer<?> service;
     private final Path                archiveDir;
 
-    private final int httpPort;
-    private final int wsPort;
-    private final int wsPortTop;
-    private final int wsPortBottom;
-
     // ── Construction / start ─────────────────────────────────────────────────
     @SuppressWarnings("resource")
     private ServiceStack() {
         try {
-            network = Network.newNetwork();
-
             // 1. Xvfb
             xvfbProcess = startXvfb();
 
@@ -87,10 +93,6 @@ public final class ServiceStack {
             service.start();
 
             // 6. Poll HTTP until ready
-            httpPort    = service.getMappedPort(8080);
-            wsPort      = service.getMappedPort(8443);
-            wsPortTop   = service.getMappedPort(8444);
-            wsPortBottom = service.getMappedPort(8445);
             awaitHttpReady();
 
             // 7. Shutdown hook
@@ -126,13 +128,12 @@ public final class ServiceStack {
     @SuppressWarnings("resource")
     private GenericContainer<?> buildCaster() {
         return new GenericContainer<>(CASTER_IMAGE)
-                .withNetwork(network)
-                .withNetworkAliases("caster")
+                .withNetworkMode("host")
                 .withEnv("DISPLAY", ":99")
                 .withEnv("STREAM_WIDTH", "1280")
                 .withEnv("STREAM_HEIGHT", "720")
                 .withEnv("STREAM_FRAMERATE", "30")
-                .withEnv("SIGNALLING_PORT", "8443")
+                .withEnv("SIGNALLING_PORT", String.valueOf(CASTER_SIGNALLING))
                 .withFileSystemBind("/tmp/.X11-unix", "/tmp/.X11-unix")
                 .withCreateContainerCmdModifier(cmd ->
                         cmd.getHostConfig().withIpcMode("host"))
@@ -161,18 +162,23 @@ public final class ServiceStack {
     // ── Service container ─────────────────────────────────────────────────────
     @SuppressWarnings("resource")
     private GenericContainer<?> buildService(String peerId) {
-        return new GenericContainer<>(SERVICE_IMAGE)
-                .withNetwork(network)
-                .withEnv("CASTER_HOST", "caster")
-                .withEnv("CASTER_SIGNALLING_PORT", "8443")
+        GenericContainer<?> c = new GenericContainer<>(SERVICE_IMAGE)
+                .withNetworkMode("host")
+                .withEnv("CASTER_HOST", "127.0.0.1")
+                .withEnv("CASTER_SIGNALLING_PORT", String.valueOf(CASTER_SIGNALLING))
                 .withEnv("CASTER_PEER_ID", peerId)
+                .withEnv("SIGNALLING_PORT", String.valueOf(WS_PORT))
+                .withEnv("CROP_HEIGHT", "360")
                 .withEnv("ARCHIVE_SEGMENT_SEC", "20")
                 .withEnv("ARCHIVE_DIR", "/archive")
-                .withEnv("WEB_PORT", "8080")
+                .withEnv("WEB_PORT", String.valueOf(HTTP_PORT))
                 .withFileSystemBind(archiveDir.toString(), "/archive")
-                .withExposedPorts(8080, 8443, 8444, 8445)
                 .waitingFor(Wait.forLogMessage(".*web server on port.*", 1)
                         .withStartupTimeout(Duration.ofSeconds(120)));
+        if (!TURN_SERVER.isEmpty()) {
+            c = c.withEnv("GST_WEBRTC_TURN_SERVER", TURN_SERVER);
+        }
+        return c;
     }
 
     private void awaitHttpReady() throws Exception {
@@ -200,7 +206,6 @@ public final class ServiceStack {
     private void stop() {
         try { service.stop(); } catch (Exception ignored) {}
         try { caster.stop();  } catch (Exception ignored) {}
-        try { network.close(); } catch (Exception ignored) {}
 
         xvfbProcess.destroy();
         try {
@@ -219,10 +224,10 @@ public final class ServiceStack {
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
-    public String baseUrl()     { return "http://localhost:" + httpPort; }
-    public int    wsPort()      { return wsPort; }
-    public int    wsPortTop()   { return wsPortTop; }
-    public int    wsPortBottom(){ return wsPortBottom; }
+    public String baseUrl()     { return "http://localhost:" + HTTP_PORT; }
+    public int    wsPort()      { return WS_PORT; }
+    public int    wsPortTop()   { return WS_PORT_TOP; }
+    public int    wsPortBottom(){ return WS_PORT_BOTTOM; }
     public Path   archiveDir()  { return archiveDir; }
 
     /**
