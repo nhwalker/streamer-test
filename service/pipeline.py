@@ -27,6 +27,7 @@ Environment variables:
   ARCHIVE_DIR            output dir for .mkv segments     (/archive)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds       (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps     (6000)
+  ARCHIVE_PREFIX         filename prefix for segments      (stream)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
                          exceeds this many bytes; 0 = unlimited          (0)
   ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
@@ -42,9 +43,11 @@ Environment variables:
 import os
 import signal
 import sys
+import time
 
 import gi
 from archive_purge import purge_archive
+from archive_times import renamed_segment_path
 gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
@@ -56,6 +59,7 @@ CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
+ARCHIVE_PREFIX        = os.environ.get('ARCHIVE_PREFIX', 'stream')
 ARCHIVE_MAX_BYTES     = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
 ARCHIVE_MAX_AGE_DAYS  = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 
@@ -102,7 +106,7 @@ def main():
 
     caster_sig_uri  = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
-    archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mkv')
+    archive_pattern = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-%05d.mkv')
 
     print('[service] Starting stream service:', flush=True)
     print(f'  Caster signalling : {caster_sig_uri}')
@@ -167,6 +171,35 @@ def main():
     archive.set_property('muxer-factory', 'matroskamux')
     archive.set_property('location', archive_pattern)
     archive.set_property('max-size-time', segment_ns)
+
+    # ── Rename completed segments to embed their recording timestamps
+    # format-location fires (from the mux thread) when splitmuxsink opens a new
+    # fragment file.  That moment is simultaneously the end of the previous
+    # fragment, so we rename the previous file using the wall-clock time captured
+    # at each rotation.  The last fragment is renamed on EOS.
+    _fragment_starts = {}  # fragment_id -> start wall-clock nanoseconds
+
+    def _rename_fragment(frag_id, end_ns):
+        if frag_id not in _fragment_starts:
+            return
+        start_ns = _fragment_starts.pop(frag_id)
+        src = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-{frag_id:05d}.mkv')
+        dst = renamed_segment_path(src, start_ns, end_ns, ARCHIVE_PREFIX)
+        try:
+            os.rename(src, dst)
+            print(f'[service] archive: {os.path.basename(src)}'
+                  f' -> {os.path.basename(dst)}', flush=True)
+        except OSError as exc:
+            print(f'[service] WARNING: could not rename {src}: {exc}',
+                  file=sys.stderr, flush=True)
+
+    def _on_format_location(_splitmux, fragment_id):
+        now_ns = int(time.time() * 1e9)
+        _rename_fragment(fragment_id - 1, now_ns)
+        _fragment_starts[fragment_id] = now_ns
+        return None  # keep default location from the 'location' property
+
+    archive.connect('format-location', _on_format_location)
 
     # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
     crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
@@ -245,6 +278,9 @@ def main():
         t = msg.type
         if t == Gst.MessageType.EOS:
             print('[service] EOS received')
+            # Rename the last fragment — format-location won't fire for it.
+            if _fragment_starts:
+                _rename_fragment(max(_fragment_starts), int(time.time() * 1e9))
             loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()

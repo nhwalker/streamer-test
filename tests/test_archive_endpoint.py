@@ -191,6 +191,63 @@ class TestStageSegments:
             assert len(os.listdir(stage_dir)) == 4
 
 
+# ── stage_segments with renamed (timestamp-in-filename) segments ─────────────
+
+class TestStageSegmentsRenamed:
+    """stage_segments uses filename timestamps for completed (renamed) segments."""
+
+    def _make_renamed(self, directory, start_epoch, end_epoch, content=b'data'):
+        import datetime as _dt
+        utc = _dt.timezone.utc
+        fmt = '%Y%m%d-%H%M%S'
+        def _fmt(e):
+            d = _dt.datetime.fromtimestamp(e, tz=utc)
+            return f'{d.strftime(fmt)}.{d.microsecond // 1000:03d}'
+        name = f'stream_{_fmt(start_epoch)}_to_{_fmt(end_epoch)}.mkv'
+        path = os.path.join(str(directory), name)
+        with open(path, 'wb') as fh:
+            fh.write(content)
+        return path, name
+
+    def test_renamed_segment_in_range_included(self, tmp_path):
+        now = time.time()
+        self._make_renamed(tmp_path, now - 1200, now - 600)
+        with stage_segments(str(tmp_path), now - 1100, now - 700, SEGMENT_SEC) as stage_dir:
+            assert len(os.listdir(stage_dir)) == 1
+
+    def test_renamed_segment_outside_range_excluded(self, tmp_path):
+        now = time.time()
+        self._make_renamed(tmp_path, now - 2400, now - 1800)
+        with stage_segments(str(tmp_path), now - 600, now, SEGMENT_SEC) as stage_dir:
+            assert os.listdir(stage_dir) == []
+
+    def test_renamed_content_preserved(self, tmp_path):
+        content = b'\x1a\x45\xdf\xa3renamed-mkv'
+        now = time.time()
+        _, name = self._make_renamed(tmp_path, now - 1200, now - 600, content=content)
+        with stage_segments(str(tmp_path), now - 1300, now - 500, SEGMENT_SEC) as stage_dir:
+            with open(os.path.join(stage_dir, name), 'rb') as fh:
+                assert fh.read() == content
+
+    def test_active_segment_follows_last_renamed(self, tmp_path):
+        # Renamed segment ends at now-600; active segment starts there.
+        # A query covering [now-300, now+1] should get only the active segment.
+        now = time.time()
+        self._make_renamed(tmp_path, now - 1200, now - 600)
+        _make_segment(tmp_path, 0, age_seconds=1)  # active (highest mtime)
+        with stage_segments(str(tmp_path), now - 300, now + 1, SEGMENT_SEC) as stage_dir:
+            files = os.listdir(stage_dir)
+            assert 'stream-00000.mkv' in files
+            assert len(files) == 1
+
+    def test_mix_renamed_and_unnamed_all_in_range(self, tmp_path):
+        now = time.time()
+        self._make_renamed(tmp_path, now - 1200, now - 600)
+        _make_segment(tmp_path, 0, age_seconds=1)   # active
+        with stage_segments(str(tmp_path), now - 1300, now + 1, SEGMENT_SEC) as stage_dir:
+            assert len(os.listdir(stage_dir)) == 2
+
+
 # ── zip_segments ──────────────────────────────────────────────────────────────
 
 class TestZipSegments:

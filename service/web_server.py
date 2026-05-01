@@ -42,6 +42,8 @@ import urllib.parse
 import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
+from archive_times import parse_segment_times
+
 WEB_DIR             = os.environ.get('WEB_DIR', '/var/www/html')
 ARCHIVE_DIR         = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
@@ -82,34 +84,58 @@ def parse_timestamp(s):
 def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
     """Copy overlapping segments into a TemporaryDirectory and return it.
 
-    Segment time ranges are estimated from filesystem mtimes:
-      - closed segment N covers [mtime(N-1), mtime(N)]
-      - the active (last) segment covers [mtime(last_closed), now()]
-      - if only one segment exists its nominal start is mtime - segment_sec
+    Completed segments have their recording timestamps embedded in their
+    filenames (via the fragment-closed rename in pipeline.py); those
+    timestamps are used directly.  Any file whose name does not match the
+    renamed pattern (the active segment still being written, or a segment
+    from a crashed run) falls back to mtime-based time-range estimation:
+      - consecutive unnamed files: [mtime(N-1), mtime(N)]
+      - first unnamed file after renamed ones: [last_renamed_end, mtime]
+      - first unnamed file with no renamed files: [mtime - segment_sec, mtime]
+      - the last unnamed file (highest mtime, i.e. the active segment):
+        end = now()
 
-    The active segment is copied as-is; matroskamux produces a valid, playable
-    file at any truncation point in streaming mode.
+    The active segment is copied as-is; matroskamux streaming format is
+    valid at any truncation point.
 
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
     """
     tmp = tempfile.TemporaryDirectory(prefix='archive_stage_')
-    segments = sorted(glob.glob(os.path.join(archive_dir, 'stream-*.mkv')))
-    if not segments:
+    all_files = glob.glob(os.path.join(archive_dir, '*.mkv'))
+    if not all_files:
         return tmp
 
     now = time.time()
-    mtimes = [os.path.getmtime(p) for p in segments]
+    renamed = []   # [(path, seg_start, seg_end)] — timestamps from filename
+    unnamed = []   # [path] — no embedded timestamps; use mtime estimation
 
-    for i, path in enumerate(segments):
-        is_active = (i == len(segments) - 1)
-        seg_end = now if is_active else mtimes[i]
-        seg_start = mtimes[i - 1] if i > 0 else mtimes[i] - segment_sec
+    for path in all_files:
+        times = parse_segment_times(os.path.basename(path))
+        if times:
+            renamed.append((path, times[0], times[1]))
+        else:
+            unnamed.append(path)
 
-        if seg_start >= end_ts or seg_end <= start_ts:
-            continue
+    renamed.sort(key=lambda x: x[1])       # sort by start timestamp
+    unnamed.sort(key=os.path.getmtime)      # sort oldest-first by mtime
 
-        shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
+    for path, seg_start, seg_end in renamed:
+        if seg_start < end_ts and seg_end > start_ts:
+            shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
+
+    # Mtime-based estimation for unnamed files.
+    last_known_end = renamed[-1][2] if renamed else None
+    for i, path in enumerate(unnamed):
+        is_active = (i == len(unnamed) - 1)
+        mtime     = os.path.getmtime(path)
+        seg_end   = now if is_active else mtime
+        if i == 0:
+            seg_start = last_known_end if last_known_end is not None else mtime - segment_sec
+        else:
+            seg_start = os.path.getmtime(unnamed[i - 1])
+        if seg_start < end_ts and seg_end > start_ts:
+            shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
 
     return tmp
 

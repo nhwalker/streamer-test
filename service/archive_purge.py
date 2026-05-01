@@ -12,11 +12,14 @@ def purge_archive(archive_dir, max_bytes, max_age_days):
     first: age-expired ones are removed unconditionally, then the oldest are
     removed until the total size of surviving segments is within max_bytes.
     """
-    segments = sorted(glob.glob(os.path.join(archive_dir, 'stream-*.mkv')))
+    segments = sorted(
+        glob.glob(os.path.join(archive_dir, '*.mkv')),
+        key=os.path.getmtime,
+    )
     if len(segments) < 2:
         return  # nothing to purge (active file is always kept)
 
-    # The last segment is the one splitmuxsink may currently be writing.
+    # The last segment (highest mtime) is the one splitmuxsink may be writing.
     purgeable = segments[:-1]
 
     if max_age_days:
