@@ -22,6 +22,8 @@ Environment variables:
 import glob
 import io
 import os
+import shutil
+import tempfile
 import time
 import urllib.parse
 import zipfile
@@ -35,24 +37,27 @@ ROUTED_PATHS = {'/top', '/bottom'}
 
 
 def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
-    """Return [(basename, bytes)] for segments that overlap [start_ts, end_ts].
+    """Copy overlapping segments into a TemporaryDirectory and return it.
 
     Segment time ranges are estimated from filesystem mtimes:
       - closed segment N covers [mtime(N-1), mtime(N)]
       - the active (last) segment covers [mtime(last_closed), now()]
       - if only one segment exists its nominal start is mtime - segment_sec
 
-    The active segment is read as-is; matroskamux produces a valid, playable
+    The active segment is copied as-is; matroskamux produces a valid, playable
     file at any truncation point in streaming mode.
+
+    The caller owns the returned TemporaryDirectory and must clean it up
+    (use as a context manager or call .cleanup() explicitly).
     """
+    tmp = tempfile.TemporaryDirectory(prefix='archive_stage_')
     segments = sorted(glob.glob(os.path.join(archive_dir, 'stream-*.mkv')))
     if not segments:
-        return []
+        return tmp
 
     now = time.time()
     mtimes = [os.path.getmtime(p) for p in segments]
 
-    result = []
     for i, path in enumerate(segments):
         is_active = (i == len(segments) - 1)
         seg_end = now if is_active else mtimes[i]
@@ -61,19 +66,17 @@ def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
         if seg_start >= end_ts or seg_end <= start_ts:
             continue
 
-        with open(path, 'rb') as fh:
-            data = fh.read()
-        result.append((os.path.basename(path), data))
+        shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
 
-    return result
+    return tmp
 
 
-def zip_segments(staged):
-    """Pack [(filename, bytes)] into an in-memory zip and return the bytes."""
+def zip_segments(stage_dir):
+    """Zip all .mkv files in stage_dir and return the bytes."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-        for name, data in staged:
-            zf.writestr(name, data)
+        for path in sorted(glob.glob(os.path.join(stage_dir, '*.mkv'))):
+            zf.write(path, os.path.basename(path))
     return buf.getvalue()
 
 
@@ -103,8 +106,11 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'start and end query parameters must be numeric Unix timestamps')
             return
 
-        staged   = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)
-        zip_data = zip_segments(staged)
+        tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)
+        try:
+            zip_data = zip_segments(tmp.name)
+        finally:
+            tmp.cleanup()
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/zip')
