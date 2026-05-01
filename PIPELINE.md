@@ -338,14 +338,16 @@ time of the first frame in the new fragment as:
 now_ns = pipeline.get_base_time() + buf.pts
 ```
 
+(falling back to `time.time()` if `buf.pts` is unavailable)
+
 This value simultaneously becomes the **end** timestamp of the just-completed
 fragment and the **start** timestamp of the new one.  The old fragment is
 renamed immediately using `archive_times.renamed_segment_path()`.
 
 On pipeline shutdown (EOS), `format-location-full` does not fire for the final
 fragment.  The EOS handler (`on_message`) renames it using
-`pipeline.query_position(Gst.Format.TIME)` as the end timestamp, falling back
-to `time.time()` if the clock query fails.
+`pipeline.get_base_time() + pipeline.query_position(Gst.Format.TIME)` as the
+end timestamp, falling back to `time.time()` if the clock query fails.
 
 The timestamp precision is millisecond-level, matching the filename format
 `YYYYMMDD-HHMMSS.SSS`.  The start of segment N+1 is always exactly equal to the
@@ -589,6 +591,7 @@ Requests longer than 12 hours are rejected with 400.
 | `SIGNALLING_PORT` | `8443` | Base port for browser-facing signalling servers |
 | `CROP_HEIGHT` | `1080` | Pixel row where the frame is split for top/bottom streams |
 | `WEB_PORT` | `8080` | HTTP server listening port |
+| `WEB_DIR` | `/var/www/html` | Static file root for the HTTP web server |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | ARGB fill colour for gaps in `/video` output (default: opaque black) |
 | `VIDEO_DEFAULT_WIDTH` | `1920` | Output width for `/video` when no segments are available |
 | `VIDEO_DEFAULT_HEIGHT` | `1080` | Output height for `/video` when no segments are available |
