@@ -43,6 +43,7 @@ Environment variables:
 import os
 import signal
 import sys
+import time
 
 import gi
 from archive_purge import purge_archive
@@ -172,27 +173,33 @@ def main():
     archive.set_property('max-size-time', segment_ns)
 
     # ── Rename completed segments to embed their recording timestamps
-    # fragment-closed fires after splitmuxsink fully closes each file.
-    # running_time / running_time_end are nanoseconds of pipeline running time;
-    # adding the pipeline base_time converts them to nanoseconds since epoch.
-    def _on_fragment_closed(_splitmux, location, running_time, running_time_end):
-        if running_time == Gst.CLOCK_TIME_NONE or running_time_end == Gst.CLOCK_TIME_NONE:
-            print(f'[service] WARNING: no valid timestamps for {location}; skipping rename',
-                  file=sys.stderr, flush=True)
+    # format-location fires (from the mux thread) when splitmuxsink opens a new
+    # fragment file.  That moment is simultaneously the end of the previous
+    # fragment, so we rename the previous file using the wall-clock time captured
+    # at each rotation.  The last fragment is renamed on EOS.
+    _fragment_starts = {}  # fragment_id -> start wall-clock nanoseconds
+
+    def _rename_fragment(frag_id, end_ns):
+        if frag_id not in _fragment_starts:
             return
-        base_time = pipeline.get_base_time()
-        new_path = renamed_segment_path(
-            location, base_time + running_time, base_time + running_time_end, ARCHIVE_PREFIX
-        )
+        start_ns = _fragment_starts.pop(frag_id)
+        src = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-{frag_id:05d}.mkv')
+        dst = renamed_segment_path(src, start_ns, end_ns, ARCHIVE_PREFIX)
         try:
-            os.rename(location, new_path)
-            print(f'[service] archive: {os.path.basename(location)}'
-                  f' -> {os.path.basename(new_path)}', flush=True)
+            os.rename(src, dst)
+            print(f'[service] archive: {os.path.basename(src)}'
+                  f' -> {os.path.basename(dst)}', flush=True)
         except OSError as exc:
-            print(f'[service] WARNING: could not rename {location}: {exc}',
+            print(f'[service] WARNING: could not rename {src}: {exc}',
                   file=sys.stderr, flush=True)
 
-    archive.connect('fragment-closed', _on_fragment_closed)
+    def _on_format_location(_splitmux, fragment_id):
+        now_ns = int(time.time() * 1e9)
+        _rename_fragment(fragment_id - 1, now_ns)
+        _fragment_starts[fragment_id] = now_ns
+        return None  # keep default location from the 'location' property
+
+    archive.connect('format-location', _on_format_location)
 
     # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
     crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
@@ -271,6 +278,9 @@ def main():
         t = msg.type
         if t == Gst.MessageType.EOS:
             print('[service] EOS received')
+            # Rename the last fragment — format-location won't fire for it.
+            if _fragment_starts:
+                _rename_fragment(max(_fragment_starts), int(time.time() * 1e9))
             loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
