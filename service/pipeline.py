@@ -27,6 +27,7 @@ Environment variables:
   ARCHIVE_DIR            output dir for .mkv segments     (/archive)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds       (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps     (6000)
+  ARCHIVE_PREFIX         filename prefix for segments      (stream)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
                          exceeds this many bytes; 0 = unlimited          (0)
   ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
@@ -45,6 +46,7 @@ import sys
 
 import gi
 from archive_purge import purge_archive
+from archive_times import renamed_segment_path
 gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
@@ -56,6 +58,7 @@ CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
+ARCHIVE_PREFIX        = os.environ.get('ARCHIVE_PREFIX', 'stream')
 ARCHIVE_MAX_BYTES     = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
 ARCHIVE_MAX_AGE_DAYS  = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 
@@ -102,7 +105,7 @@ def main():
 
     caster_sig_uri  = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
-    archive_pattern = os.path.join(ARCHIVE_DIR, 'stream-%05d.mkv')
+    archive_pattern = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-%05d.mkv')
 
     print('[service] Starting stream service:', flush=True)
     print(f'  Caster signalling : {caster_sig_uri}')
@@ -167,6 +170,29 @@ def main():
     archive.set_property('muxer-factory', 'matroskamux')
     archive.set_property('location', archive_pattern)
     archive.set_property('max-size-time', segment_ns)
+
+    # ── Rename completed segments to embed their recording timestamps
+    # fragment-closed fires after splitmuxsink fully closes each file.
+    # running_time / running_time_end are nanoseconds of pipeline running time;
+    # adding the pipeline base_time converts them to nanoseconds since epoch.
+    def _on_fragment_closed(_splitmux, location, running_time, running_time_end):
+        if running_time == Gst.CLOCK_TIME_NONE or running_time_end == Gst.CLOCK_TIME_NONE:
+            print(f'[service] WARNING: no valid timestamps for {location}; skipping rename',
+                  file=sys.stderr, flush=True)
+            return
+        base_time = pipeline.get_base_time()
+        new_path = renamed_segment_path(
+            location, base_time + running_time, base_time + running_time_end, ARCHIVE_PREFIX
+        )
+        try:
+            os.rename(location, new_path)
+            print(f'[service] archive: {os.path.basename(location)}'
+                  f' -> {os.path.basename(new_path)}', flush=True)
+        except OSError as exc:
+            print(f'[service] WARNING: could not rename {location}: {exc}',
+                  file=sys.stderr, flush=True)
+
+    archive.connect('fragment-closed', _on_fragment_closed)
 
     # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
     crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half

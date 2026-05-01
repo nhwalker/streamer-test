@@ -130,12 +130,14 @@ COPY --from=js-builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
 COPY web/index.html /var/www/html/index.html
 
 # ── Application scripts ───────────────────────────────────────────────────────
-COPY entrypoint.sh   /usr/local/bin/entrypoint.sh
-COPY pipeline.py     /usr/local/bin/pipeline.py
-COPY web_server.py   /usr/local/bin/web_server.py
+COPY entrypoint.sh    /usr/local/bin/entrypoint.sh
+COPY pipeline.py      /usr/local/bin/pipeline.py
+COPY web_server.py    /usr/local/bin/web_server.py
 COPY archive_purge.py /usr/local/bin/archive_purge.py
+COPY archive_times.py /usr/local/bin/archive_times.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
-             /usr/local/bin/web_server.py /usr/local/bin/archive_purge.py
+             /usr/local/bin/web_server.py /usr/local/bin/archive_purge.py \
+             /usr/local/bin/archive_times.py
 
 # ── Default archive volume ────────────────────────────────────────────────────
 VOLUME /archive
