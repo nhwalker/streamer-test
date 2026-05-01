@@ -52,7 +52,7 @@ import urllib.parse
 import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-from archive_times import parse_segment_times
+from archive_times import parse_segment_times, renamed_segment_path
 from video_transcode import transcode_to_video
 
 WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
@@ -139,7 +139,8 @@ def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
         if seg_start < end_ts and seg_end > start_ts:
             shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
 
-    # Mtime-based estimation for unnamed files.
+    # Mtime-based estimation for unnamed files; copy with timestamp name so
+    # _build_timeline can rely purely on filename parsing.
     last_known_end = renamed[-1][2] if renamed else None
     for i, path in enumerate(unnamed):
         is_active = (i == len(unnamed) - 1)
@@ -150,7 +151,15 @@ def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
         else:
             seg_start = os.path.getmtime(unnamed[i - 1])
         if seg_start < end_ts and seg_end > start_ts:
-            shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
+            basename = os.path.basename(path)
+            prefix   = basename.rsplit('-', 1)[0]
+            dst = renamed_segment_path(
+                os.path.join(tmp.name, basename),
+                int(seg_start * 1e9),
+                int(seg_end   * 1e9),
+                prefix,
+            )
+            shutil.copy2(path, dst)
 
     return tmp
 
@@ -238,7 +247,7 @@ class Router(SimpleHTTPRequestHandler):
         try:
             output_path = os.path.join(output_tmp.name, 'video.mkv')
             transcode_to_video(
-                stage_tmp.name, start_ts, end_ts, ARCHIVE_SEGMENT_SEC,
+                stage_tmp.name, start_ts, end_ts,
                 VIDEO_FILL_COLOR, output_path,
                 default_width=VIDEO_DEFAULT_WIDTH,
                 default_height=VIDEO_DEFAULT_HEIGHT,

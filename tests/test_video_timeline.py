@@ -1,12 +1,14 @@
 """
 Unit tests for _build_timeline() in video_transcode.py.
 
-No ffmpeg, Docker, or live pipelines required.  _query_file_info is mocked
-to return a fixed (duration_s, width, height, fps_str) tuple.
+No ffmpeg, Docker, or live pipelines required.
 
 Model: _build_timeline returns a list of TimelineItem (one per overlapping
 segment, no gap items).  Gaps are implicit — the base color video fills them
 in transcode_to_video.
+
+All files in the stage directory must have timestamps in their filenames.
+Files without recognized timestamps are skipped.
 
 Each item has:
   path           – file path
@@ -24,18 +26,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
 from video_transcode import _build_timeline, TimelineItem  # noqa: E402
 
 SEGMENT_SEC = 600
-DURATION_S  = float(SEGMENT_SEC)
-WIDTH, HEIGHT = 1920, 1080
-FPS_STR = '25/1'
-
-
-def _mock_info(path):
-    """Always report a full 600-second segment."""
-    return DURATION_S, WIDTH, HEIGHT, FPS_STR
 
 
 def _make_seg(directory, index, age_seconds=0):
-    """Write a fake unnamed segment and set its mtime."""
+    """Write a fake unnamed segment (no timestamp in name) and set its mtime."""
     path = os.path.join(str(directory), f'stream-{index:05d}.mkv')
     with open(path, 'wb') as fh:
         fh.write(b'fake')
@@ -67,14 +61,12 @@ class TestEmptyStageDir:
 
     def test_returns_empty_list(self, tmp_path):
         now = time.time()
-        tl = _build_timeline(str(tmp_path), now - 300, now, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 300, now)
         assert tl == []
 
     def test_returns_empty_list_any_range(self, tmp_path):
         now = time.time()
-        tl = _build_timeline(str(tmp_path), now - 1800, now, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 1800, now)
         assert tl == []
 
 
@@ -85,17 +77,15 @@ class TestSingleSegmentFillsRange:
     def test_one_item_returned(self, tmp_path):
         now = time.time()
         _make_renamed(tmp_path, now - 700, now - 100)
-        tl = _build_timeline(str(tmp_path), now - 600, now - 200, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 600, now - 200)
         assert len(tl) == 1
 
-    def test_no_offset_when_segment_starts_before_window(self, tmp_path):
+    def test_offset_nonzero_when_segment_starts_before_window(self, tmp_path):
         now = time.time()
         seg_start = now - 700
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = now - 600  # 100 s into the segment
-        tl = _build_timeline(str(tmp_path), req_start, now - 200, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), req_start, now - 200)
         assert tl[0].offset_s == pytest.approx(100.0, abs=0.01)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
 
@@ -103,8 +93,7 @@ class TestSingleSegmentFillsRange:
         now = time.time()
         seg_start = now - 600
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
-        tl = _build_timeline(str(tmp_path), seg_start, now - 100, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), seg_start, now - 100)
         assert tl[0].offset_s == pytest.approx(0.0, abs=0.001)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
 
@@ -117,10 +106,7 @@ class TestGapsAtEdges:
         now = time.time()
         seg_start = now - 400
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
-        req_start = now - 600  # 200 s before segment starts
-        req_end   = now - 100
-        tl = _build_timeline(str(tmp_path), req_start, req_end, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 600, now - 100)
         assert len(tl) == 1
         assert tl[0].path is not None
 
@@ -129,17 +115,14 @@ class TestGapsAtEdges:
         seg_start = now - 400
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = now - 600  # 200 s before segment
-        tl = _build_timeline(str(tmp_path), req_start, now - 100, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), req_start, now - 100)
         assert tl[0].output_start_s == pytest.approx(200.0, abs=0.1)
 
     def test_one_item_with_trailing_gap(self, tmp_path):
         now = time.time()
         seg_start = now - 900
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
-        req_end = now  # 300 s after segment ends
-        tl = _build_timeline(str(tmp_path), seg_start, req_end, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), seg_start, now)
         assert len(tl) == 1
         assert tl[0].path is not None
 
@@ -147,8 +130,7 @@ class TestGapsAtEdges:
         now = time.time()
         seg_start = now - 900
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
-        tl = _build_timeline(str(tmp_path), seg_start, now, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), seg_start, now)
         assert tl[0].offset_s == pytest.approx(0.0, abs=0.001)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
 
@@ -161,8 +143,7 @@ class TestGapBetweenSegments:
         now = time.time()
         _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
         _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
-        tl = _build_timeline(str(tmp_path), now - 1400, now, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 1400, now)
         assert len(tl) == 2
 
     def test_second_item_output_start_nonzero(self, tmp_path):
@@ -170,8 +151,7 @@ class TestGapBetweenSegments:
         _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
         _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
         req_start = now - 1400
-        tl = _build_timeline(str(tmp_path), req_start, now - 100, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), req_start, now - 100)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
         # second segment starts 800 s after req_start
         assert tl[1].output_start_s == pytest.approx(800.0, abs=0.1)
@@ -180,8 +160,7 @@ class TestGapBetweenSegments:
         now = time.time()
         _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
         _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
-        tl = _build_timeline(str(tmp_path), now - 1400, now - 100, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 1400, now - 100)
         assert tl[0].output_start_s < tl[1].output_start_s
 
 
@@ -194,8 +173,7 @@ class TestClipOffset:
         seg_start = now - 800
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = seg_start + 200  # 200 s into the segment
-        tl = _build_timeline(str(tmp_path), req_start, seg_start + 500,
-                             SEGMENT_SEC, _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), req_start, seg_start + 500)
         assert tl[0].offset_s == pytest.approx(200.0, abs=0.001)
 
     def test_output_start_zero_when_request_starts_mid_segment(self, tmp_path):
@@ -203,36 +181,32 @@ class TestClipOffset:
         seg_start = now - 800
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = seg_start + 200
-        tl = _build_timeline(str(tmp_path), req_start, seg_start + 500,
-                             SEGMENT_SEC, _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), req_start, seg_start + 500)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
 
     def test_zero_offset_when_segment_starts_within_window(self, tmp_path):
         now = time.time()
         seg_start = now - 400
         _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
-        req_start = now - 600
-        tl = _build_timeline(str(tmp_path), req_start, now, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 600, now)
         assert tl[0].offset_s == pytest.approx(0.0, abs=0.001)
 
 
-# ── unnamed segments (mtime-based start) ─────────────────────────────────────
+# ── files without timestamps are ignored ─────────────────────────────────────
 
-class TestUnnamedSegmentMtimeStart:
+class TestUnnamedFilesIgnored:
 
-    def test_unnamed_segment_included_in_range(self, tmp_path):
+    def test_unnamed_file_not_included(self, tmp_path):
+        """Files without timestamp in name are skipped."""
         _make_seg(tmp_path, 0, age_seconds=100)
         now = time.time()
-        tl = _build_timeline(str(tmp_path), now - 200, now, SEGMENT_SEC,
-                             _query_info=_mock_info)
-        assert len(tl) == 1
-
-    def test_unnamed_segment_excluded_when_range_before_it(self, tmp_path):
-        _make_seg(tmp_path, 0, age_seconds=0)
-        mtime = os.path.getmtime(
-            os.path.join(str(tmp_path), 'stream-00000.mkv'))
-        req_end = mtime - SEGMENT_SEC - 10
-        tl = _build_timeline(str(tmp_path), 0, req_end, SEGMENT_SEC,
-                             _query_info=_mock_info)
+        tl = _build_timeline(str(tmp_path), now - 200, now)
         assert tl == []
+
+    def test_mix_named_and_unnamed(self, tmp_path):
+        """Unnamed files are skipped; renamed files are included normally."""
+        now = time.time()
+        _make_seg(tmp_path, 0, age_seconds=100)
+        _make_renamed(tmp_path, now - 200, now - 200 + SEGMENT_SEC)
+        tl = _build_timeline(str(tmp_path), now - 200, now)
+        assert len(tl) == 1

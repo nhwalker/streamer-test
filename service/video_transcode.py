@@ -9,17 +9,20 @@ that exactly covers the requested time window:
     the end are cut off implicitly when the base video ends
   - the output is always a complete, decodable Matroska file
 
+All files in the stage directory must have timestamps in their filenames
+(as produced by stage_segments in web_server.py).  Files without recognized
+timestamps are ignored.
+
 Requires: ffmpeg and ffprobe available in PATH.
 
 Public API:
-    transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
+    transcode_to_video(stage_dir, start_ts, end_ts,
                        fill_color_argb, output_path,
                        default_width, default_height)
 """
 import json
 import os
 import subprocess
-import time
 from dataclasses import dataclass
 
 from archive_times import parse_segment_times
@@ -61,87 +64,37 @@ def _query_file_info(path):
 
 # ── Timeline builder ──────────────────────────────────────────────────────────
 
-def _build_timeline(stage_dir, start_ts, end_ts, segment_sec, _query_info=None):
+def _build_timeline(stage_dir, start_ts, end_ts):
     """Build an ordered list of TimelineItem covering [start_ts, end_ts].
 
-    Each item represents a file segment that overlaps the window.  Gaps are
-    implicit: the base color video in transcode_to_video fills them.
-
-    Segments starting before start_ts have offset_s > 0; their leading
-    pre-window content is trimmed by transcode_to_video.  Segments extending
-    past end_ts are cut off automatically when the base video ends.
+    All files are expected to have timestamps in their names (as produced by
+    stage_segments).  Files without a recognized timestamp pattern are skipped.
 
     Returns [] when no segments overlap (pure color output).
-
-    _query_info is injectable for unit testing (defaults to _query_file_info).
     """
-    if _query_info is None:
-        _query_info = _query_file_info
-
-    all_files = [
-        os.path.join(stage_dir, f)
-        for f in os.listdir(stage_dir)
-        if f.endswith('.mkv')
-    ]
-
-    if not all_files:
-        return []
-
-    file_info = {path: _query_info(path) for path in all_files}
-
-    renamed = []
-    unnamed = []
-    for path in all_files:
-        times = parse_segment_times(os.path.basename(path))
-        if times:
-            renamed.append((times[0], path))
-        else:
-            unnamed.append(path)
-
-    renamed.sort(key=lambda x: x[0])
-    unnamed.sort(key=os.path.getmtime)
-
-    segments = [(seg_start, path) for seg_start, path in renamed]
-
-    last_known_end = None
-    if renamed:
-        last_start, last_path = renamed[-1]
-        last_known_end = last_start + file_info[last_path][0]
-
-    for i, path in enumerate(unnamed):
-        mtime = os.path.getmtime(path)
-        seg_start = (
-            last_known_end if i == 0 and last_known_end is not None
-            else mtime - segment_sec if i == 0
-            else os.path.getmtime(unnamed[i - 1])
-        )
-        segments.append((seg_start, path))
-
-    segments.sort(key=lambda x: x[0])
-
     timeline = []
-    for seg_start, path in segments:
-        dur_s = file_info[path][0]
-        if dur_s == 0:
-            dur_s = max(0.0, time.time() - seg_start)
-        seg_end = seg_start + dur_s
-
+    for fname in os.listdir(stage_dir):
+        if not fname.endswith('.mkv'):
+            continue
+        times = parse_segment_times(fname)
+        if times is None:
+            continue
+        seg_start, seg_end = times
         if seg_start >= end_ts or seg_end <= start_ts:
             continue
-
         clip_start = max(seg_start, start_ts)
         timeline.append(TimelineItem(
-            path           = path,
+            path           = os.path.join(stage_dir, fname),
             offset_s       = clip_start - seg_start,
             output_start_s = clip_start - start_ts,
         ))
-
+    timeline.sort(key=lambda x: x.output_start_s)
     return timeline
 
 
 # ── ffmpeg assembly ───────────────────────────────────────────────────────────
 
-def transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
+def transcode_to_video(stage_dir, start_ts, end_ts,
                        fill_color_argb, output_path,
                        default_width=1920, default_height=1080,
                        _query_info=None):
@@ -155,8 +108,7 @@ def transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
     if _query_info is None:
         _query_info = _query_file_info
 
-    timeline = _build_timeline(
-        stage_dir, start_ts, end_ts, segment_sec, _query_info=_query_info)
+    timeline = _build_timeline(stage_dir, start_ts, end_ts)
 
     width, height, fps_str = default_width, default_height, _DEFAULT_FPS
     for item in timeline:
@@ -178,11 +130,10 @@ def transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
 
     filters = []
 
-    base_filter = (
+    filters.append(
         f'color=c={color}:s={size}:r={fps_str}'
         f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
     )
-    filters.append(base_filter)
 
     for i, item in enumerate(timeline):
         label = f'[c{i}]'
@@ -199,12 +150,9 @@ def transcode_to_video(stage_dir, start_ts, end_ts, segment_sec,
 
     prev = 'base'
     for i in range(len(timeline)):
-        src   = f'[{prev}]' if prev == 'base' else prev
-        clip  = f'[c{i}]'
-        if i < len(timeline) - 1:
-            out = f'[t{i}]'
-        else:
-            out = '[out]'
+        src  = f'[{prev}]' if prev == 'base' else prev
+        clip = f'[c{i}]'
+        out  = '[out]' if i == len(timeline) - 1 else f'[t{i}]'
         filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
         prev = f'[t{i}]'
 
