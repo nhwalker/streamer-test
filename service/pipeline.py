@@ -283,9 +283,13 @@ def main():
         t = msg.type
         if t == Gst.MessageType.EOS:
             print('[service] EOS received')
-            # Rename the last fragment — format-location won't fire for it.
+            # Rename the last fragment — format-location-full won't fire for it.
             if _fragment_starts:
-                _rename_fragment(max(_fragment_starts), int(time.time() * 1e9))
+                ok, pos = pipeline.query_position(Gst.Format.TIME)
+                end_ns = (pipeline.get_base_time() + pos
+                          if ok and pos != Gst.CLOCK_TIME_NONE
+                          else int(time.time() * 1e9))
+                _rename_fragment(max(_fragment_starts), end_ns)
             loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
