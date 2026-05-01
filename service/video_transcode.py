@@ -32,10 +32,13 @@ _DEFAULT_FPS = '25/1'
 
 def _detect_encoder_args():
     """Return ffmpeg output-encoder args for the best available video encoder."""
-    result = subprocess.run(
-        ['ffmpeg', '-hide_banner', '-encoders'],
-        capture_output=True, text=True, timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        return ['-c:v', 'libx264', '-preset', 'ultrafast']
     encoders = result.stdout
     if 'libx264' in encoders:
         return ['-c:v', 'libx264', '-preset', 'ultrafast']
