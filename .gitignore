@@ -5,3 +5,8 @@ Dockerfile.buildtest
 
 __pycache__/
 *.pyc
+
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
