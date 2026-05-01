@@ -132,13 +132,20 @@ def stage_segments(archive_dir, start_ts, end_ts):
 
     for path, seg_start, seg_end in renamed:
         if seg_start < end_ts and seg_end > start_ts:
-            shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
+            try:
+                shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
+            except FileNotFoundError:
+                pass  # purge deleted it between glob and copy; skip it
 
     # The active (currently-writing) segment is the highest-named unnamed
     # file.  Its start time equals the end of the last completed segment —
     # the same boundary pipeline.py will use when it finalizes the file.
     # Without a completed predecessor we have no reliable start time, so
     # any other unnamed files (orphans from crashed runs) are dropped.
+    #
+    # If a segment rollover fires between our glob and this copy the file
+    # may no longer exist; skip it silently — the output gets a gap at the
+    # trailing edge which the base color video fills.
     if unnamed and renamed:
         active    = max(unnamed)
         seg_start = renamed[-1][2]
@@ -151,7 +158,10 @@ def stage_segments(archive_dir, start_ts, end_ts):
                 int(seg_end   * 1e9),
                 prefix,
             )
-            shutil.copy2(active, dst)
+            try:
+                shutil.copy2(active, dst)
+            except FileNotFoundError:
+                pass  # rollover fired between glob and copy; skip it
 
     return tmp
 
