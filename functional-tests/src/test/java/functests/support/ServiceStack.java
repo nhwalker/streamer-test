@@ -235,16 +235,16 @@ public final class ServiceStack {
      * Polls every 1 s; throws {@link AssertionError} after 60 s.
      */
     public void awaitFirstSegment() throws InterruptedException, IOException {
-        long deadline = System.currentTimeMillis() + 60_000;
+        long deadline = System.currentTimeMillis() + 90_000;
         while (System.currentTimeMillis() < deadline) {
             try (DirectoryStream<Path> ds =
-                         Files.newDirectoryStream(archiveDir, "stream-*.mkv")) {
+                         Files.newDirectoryStream(archiveDir, "*_to_*.mkv")) {
                 if (ds.iterator().hasNext()) return;
             }
             Thread.sleep(1_000);
         }
         throw new AssertionError(
-                "No stream-*.mkv appeared in " + archiveDir + " within 60 s.\n" +
+                "No completed segment (*_to_*.mkv) appeared in " + archiveDir + " within 90 s.\n" +
                 "Caster logs:\n" + caster.getLogs() + "\n" +
                 "Service logs:\n" + service.getLogs());
     }

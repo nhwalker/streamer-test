@@ -30,6 +30,23 @@ from archive_times import parse_segment_times
 _DEFAULT_FPS = '25/1'
 
 
+def _detect_encoder_args():
+    """Return ffmpeg output-encoder args for the best available video encoder."""
+    result = subprocess.run(
+        ['ffmpeg', '-hide_banner', '-encoders'],
+        capture_output=True, text=True, timeout=10,
+    )
+    encoders = result.stdout
+    if 'libx264' in encoders:
+        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+    if 'mpeg4' in encoders:
+        return ['-c:v', 'mpeg4', '-q:v', '5']
+    return ['-c:v', 'ffv1']
+
+
+_ENCODER_ARGS = _detect_encoder_args()
+
+
 @dataclass
 class TimelineItem:
     path:           str
@@ -163,11 +180,8 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
         )
 
     cmd += ['-filter_complex', ';'.join(filters)]
-    cmd += ['-map', '[out]', '-c:v', 'libx264', '-preset', 'ultrafast', output_path]
+    cmd += ['-map', '[out]'] + _ENCODER_ARGS + [output_path]
 
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f'ffmpeg failed (exit {result.returncode}): '
-            f'{result.stderr.decode(errors="replace")[-1000:]}'
-        )
+        raise RuntimeError(f'ffmpeg failed (exit {result.returncode})')

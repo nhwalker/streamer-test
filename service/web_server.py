@@ -279,7 +279,8 @@ class Router(SimpleHTTPRequestHandler):
             with open(output_path, 'rb') as fh:
                 shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
         except Exception as exc:
-            self.send_error(500, str(exc))
+            print(f'[video] transcode error: {exc}', flush=True)
+            self.send_error(500, 'Internal server error')
         finally:
             stage_tmp.cleanup()
             output_tmp.cleanup()
