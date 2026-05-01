@@ -173,11 +173,9 @@ def main():
     archive.set_property('max-size-time', segment_ns)
 
     # ── Rename completed segments to embed their recording timestamps
-    # Preferred: format-location-full provides the first GstSample of each new
-    # fragment; base_time + buf.pts gives the wall-clock time of that actual
-    # frame, so end(N) = start(N+1) in stream time and duration is exact.
-    # Fallback: format-location + time.time() if the fuller signal is absent.
-    # The last fragment is renamed on EOS using time.time() in both cases.
+    # format-location-full fires at the start of each new fragment; base_time +
+    # buf.pts gives the wall-clock time of that frame, so end(N) = start(N+1)
+    # in stream time and duration is exact.  The last fragment is renamed on EOS.
     _fragment_starts = {}  # fragment_id -> start nanoseconds
 
     def _rename_fragment(frag_id, end_ns):
@@ -204,23 +202,9 @@ def main():
         _fragment_starts[fragment_id] = now_ns
         return None
 
-    def _on_format_location(_splitmux, fragment_id):
-        now_ns = int(time.time() * 1e9)
-        _rename_fragment(fragment_id - 1, now_ns)
-        _fragment_starts[fragment_id] = now_ns
-        return None
-
-    try:
-        archive.connect('format-location-full', _on_format_location_full)
-        print('[service] archive: using format-location-full (PTS-based timestamps)',
-              flush=True)
-    except TypeError:
-        # format-location-full is required; hard-fail so CI catches missing support
-        # archive.connect('format-location', _on_format_location)
-        print('[service] FATAL: format-location-full signal not available on this '
-              'GStreamer build; cannot record accurate segment timestamps',
-              file=sys.stderr, flush=True)
-        sys.exit(1)
+    archive.connect('format-location-full', _on_format_location_full)
+    print('[service] archive: using format-location-full (PTS-based timestamps)',
+          flush=True)
 
     # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
     crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
