@@ -8,6 +8,7 @@ WebRTC signalling server for that stream.  All other paths are served as static
 files from WEB_DIR.
 
 GET /archive?start=<timestamp>&end=<timestamp>
+GET /archive?last=<duration>
   Returns a zip of the .mkv segments whose recorded time overlaps the requested
   window.  The active (currently-writing) segment is included when the window
   extends past the last completed segment; its bytes are read as-is (Matroska
@@ -18,6 +19,12 @@ GET /archive?start=<timestamp>&end=<timestamp>
     - ISO 8601 datetime with optional timezone (Z or ±HH:MM).
       When no timezone is given, UTC is assumed.
       Examples: 2024-01-15T10:30:00Z  2024-01-15T10:30:00+05:00  2024-01-15T10:30:00
+
+  <duration> is a number followed by a unit character:
+      30s   30 seconds
+      60m   60 minutes
+      1.5h  1.5 hours
+  end is set to now; start is computed as now − duration.
 
 Environment variables:
   WEB_PORT            HTTP listening port         (8080)
@@ -40,6 +47,20 @@ ARCHIVE_DIR         = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 
 ROUTED_PATHS = {'/top', '/bottom'}
+
+
+_DURATION_UNITS = {'s': 1, 'm': 60, 'h': 3600}
+
+
+def parse_duration(s):
+    """Parse a duration string into seconds (float).
+
+    Format: a number followed by a unit character: s (seconds), m (minutes),
+    or h (hours).  Examples: '30s', '60m', '1.5h'.
+    """
+    if not s or s[-1] not in _DURATION_UNITS:
+        raise ValueError(f'invalid duration {s!r}: must end with s, m, or h')
+    return float(s[:-1]) * _DURATION_UNITS[s[-1]]
 
 
 def parse_timestamp(s):
@@ -120,10 +141,17 @@ class Router(SimpleHTTPRequestHandler):
     def _handle_archive(self):
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         try:
-            start_ts = parse_timestamp(params['start'][0])
-            end_ts   = parse_timestamp(params['end'][0])
-        except (KeyError, ValueError, IndexError):
-            self.send_error(400, 'start and end must be epoch seconds or ISO 8601 timestamps')
+            if 'last' in params:
+                end_ts   = time.time()
+                start_ts = end_ts - parse_duration(params['last'][0])
+            elif 'start' in params and 'end' in params:
+                start_ts = parse_timestamp(params['start'][0])
+                end_ts   = parse_timestamp(params['end'][0])
+            else:
+                self.send_error(400, 'provide last=<duration> or both start=<ts> and end=<ts>')
+                return
+        except (ValueError, IndexError):
+            self.send_error(400, 'invalid parameter value')
             return
 
         tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)

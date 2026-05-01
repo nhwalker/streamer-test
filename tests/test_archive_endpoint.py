@@ -13,13 +13,50 @@ import zipfile
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from web_server import parse_timestamp, stage_segments, zip_segments  # noqa: E402
+from web_server import parse_duration, parse_timestamp, stage_segments, zip_segments  # noqa: E402
 
 SEGMENT_SEC = 600
 
 # Reference UTC epoch for 2024-01-15 10:30:00 UTC
 _REF_DT  = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
 _REF_EPS = _REF_DT.timestamp()
+
+
+class TestParseDuration:
+
+    def test_seconds(self):
+        assert parse_duration('30s') == 30.0
+
+    def test_minutes(self):
+        assert parse_duration('60m') == 3600.0
+
+    def test_hours(self):
+        assert parse_duration('1.5h') == pytest.approx(5400.0)
+
+    def test_fractional_seconds(self):
+        assert parse_duration('0.5s') == pytest.approx(0.5)
+
+    def test_fractional_minutes(self):
+        assert parse_duration('1.5m') == pytest.approx(90.0)
+
+    def test_integer_hours(self):
+        assert parse_duration('2h') == 7200.0
+
+    def test_unknown_unit_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration('30x')
+
+    def test_no_unit_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration('30')
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration('')
+
+    def test_non_numeric_value_raises(self):
+        with pytest.raises(ValueError):
+            parse_duration('abcs')
 
 
 class TestParseTimestamp:
