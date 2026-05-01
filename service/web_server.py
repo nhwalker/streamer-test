@@ -20,7 +20,6 @@ Environment variables:
   ARCHIVE_SEGMENT_SEC Nominal segment duration    (600)
 """
 import glob
-import io
 import os
 import shutil
 import tempfile
@@ -71,13 +70,11 @@ def stage_segments(archive_dir, start_ts, end_ts, segment_sec):
     return tmp
 
 
-def zip_segments(stage_dir):
-    """Zip all .mkv files in stage_dir and return the bytes."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+def zip_segments(stage_dir, zip_path):
+    """Write all .mkv files in stage_dir into a zip archive at zip_path."""
+    with zipfile.ZipFile(zip_path, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(glob.glob(os.path.join(stage_dir, '*.mkv'))):
             zf.write(path, os.path.basename(path))
-    return buf.getvalue()
 
 
 class Router(SimpleHTTPRequestHandler):
@@ -108,16 +105,18 @@ class Router(SimpleHTTPRequestHandler):
 
         tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)
         try:
-            zip_data = zip_segments(tmp.name)
+            zip_path = os.path.join(tmp.name, '_archive.zip')
+            zip_segments(tmp.name, zip_path)
+            zip_size = os.path.getsize(zip_path)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Disposition', 'attachment; filename="archive.zip"')
+            self.send_header('Content-Length', str(zip_size))
+            self.end_headers()
+            with open(zip_path, 'rb') as fh:
+                shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
         finally:
             tmp.cleanup()
-
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/zip')
-        self.send_header('Content-Disposition', 'attachment; filename="archive.zip"')
-        self.send_header('Content-Length', str(len(zip_data)))
-        self.end_headers()
-        self.wfile.write(zip_data)
 
     def log_message(self, fmt, *args):
         pass  # suppress per-request access logs

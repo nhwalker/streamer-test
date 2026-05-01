@@ -3,7 +3,6 @@ Unit tests for stage_segments() and zip_segments() in web_server.py.
 
 No Docker, GStreamer, or live HTTP server required.
 """
-import io
 import os
 import sys
 import time
@@ -116,16 +115,17 @@ class TestStageSegments:
 class TestZipSegments:
 
     def test_empty_directory_produces_valid_empty_zip(self, tmp_path):
-        data = zip_segments(str(tmp_path))
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zip_path = str(tmp_path / 'out.zip')
+        zip_segments(str(tmp_path), zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
             assert zf.namelist() == []
 
     def test_single_file_roundtrip(self, tmp_path):
         content = b'hello mkv'
-        path = tmp_path / 'stream-00000.mkv'
-        path.write_bytes(content)
-        data = zip_segments(str(tmp_path))
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        (tmp_path / 'stream-00000.mkv').write_bytes(content)
+        zip_path = str(tmp_path / 'out.zip')
+        zip_segments(str(tmp_path), zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
             assert zf.namelist() == ['stream-00000.mkv']
             assert zf.read('stream-00000.mkv') == content
 
@@ -133,14 +133,25 @@ class TestZipSegments:
         files = {'stream-00000.mkv': b'aaa', 'stream-00001.mkv': b'bbb', 'stream-00002.mkv': b'ccc'}
         for name, content in files.items():
             (tmp_path / name).write_bytes(content)
-        data = zip_segments(str(tmp_path))
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zip_path = str(tmp_path / 'out.zip')
+        zip_segments(str(tmp_path), zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
             assert set(zf.namelist()) == set(files)
             for name, content in files.items():
                 assert zf.read(name) == content
 
-    def test_returns_bytes(self, tmp_path):
-        assert isinstance(zip_segments(str(tmp_path)), bytes)
+    def test_zip_not_included_in_itself(self, tmp_path):
+        # _archive.zip lives alongside the .mkv files; it must not appear in the zip
+        (tmp_path / 'stream-00000.mkv').write_bytes(b'data')
+        zip_path = str(tmp_path / '_archive.zip')
+        zip_segments(str(tmp_path), zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            assert '_archive.zip' not in zf.namelist()
+
+    def test_writes_to_disk(self, tmp_path):
+        zip_path = str(tmp_path / 'out.zip')
+        zip_segments(str(tmp_path), zip_path)
+        assert os.path.isfile(zip_path)
 
 
 # ── integration: stage → zip ──────────────────────────────────────────────────
@@ -155,10 +166,10 @@ class TestStageAndZip:
         now = time.time()
         tmp = stage_segments(str(tmp_path), now - 30, now + 1, SEGMENT_SEC)
         try:
-            zip_data = zip_segments(tmp.name)
+            zip_path = os.path.join(tmp.name, '_archive.zip')
+            zip_segments(tmp.name, zip_path)
+            with zipfile.ZipFile(zip_path) as zf:
+                assert 'stream-00000.mkv' in zf.namelist()
+                assert zf.read('stream-00000.mkv') == content
         finally:
             tmp.cleanup()
-
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-            assert 'stream-00000.mkv' in zf.namelist()
-            assert zf.read('stream-00000.mkv') == content
