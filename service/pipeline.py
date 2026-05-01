@@ -27,6 +27,10 @@ Environment variables:
   ARCHIVE_DIR            output dir for .mkv segments     (/archive)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds       (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps     (6000)
+  ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
+                         exceeds this many bytes; 0 = unlimited          (0)
+  ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
+                         0 = unlimited                                    (0)
 
   SIGNALLING_PORT        service's browser-facing signalling port (8443)
                          top-half  stream uses SIGNALLING_PORT+1  (8444)
@@ -40,6 +44,7 @@ import signal
 import sys
 
 import gi
+from archive_purge import purge_archive
 gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
@@ -51,6 +56,8 @@ CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
+ARCHIVE_MAX_BYTES     = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
+ARCHIVE_MAX_AGE_DAYS  = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 
 SIG_PORT              = os.environ.get('SIGNALLING_PORT', '8443')
 SIG_PORT_TOP          = str(int(SIG_PORT) + 1)
@@ -265,6 +272,15 @@ def main():
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT,  on_signal)
+
+    if ARCHIVE_MAX_BYTES or ARCHIVE_MAX_AGE_DAYS:
+        purge_archive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES, ARCHIVE_MAX_AGE_DAYS)
+
+        def _purge_tick():
+            purge_archive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES, ARCHIVE_MAX_AGE_DAYS)
+            return True  # reschedule
+
+        GLib.timeout_add_seconds(ARCHIVE_SEGMENT_SEC, _purge_tick)
 
     try:
         loop.run()
