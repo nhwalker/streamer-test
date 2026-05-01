@@ -14,6 +14,13 @@ GET /archive?last=<duration>
   extends past the last completed segment; its bytes are read as-is (Matroska
   streaming format is valid at any truncation point).
 
+GET /video?start=<timestamp>&end=<timestamp>
+GET /video?last=<duration>
+  Returns a single .mkv covering exactly the requested window.  Segments are
+  clipped to the window boundaries; any missing coverage (gaps at the edges or
+  in the middle) is filled with solid VIDEO_FILL_COLOR frames.  Requests longer
+  than 12 hours are rejected with 400.
+
   <timestamp> accepts:
     - Unix epoch seconds as a number (integer or float)
     - ISO 8601 datetime with optional timezone (Z or ±HH:MM).
@@ -27,10 +34,13 @@ GET /archive?last=<duration>
   end is set to now; start is computed as now − duration.
 
 Environment variables:
-  WEB_PORT            HTTP listening port         (8080)
-  WEB_DIR             Static file root            (/var/www/html)
-  ARCHIVE_DIR         Directory of .mkv segments  (/archive)
-  ARCHIVE_SEGMENT_SEC Nominal segment duration    (600)
+  WEB_PORT             HTTP listening port              (8080)
+  WEB_DIR              Static file root                 (/var/www/html)
+  ARCHIVE_DIR          Directory of .mkv segments       (/archive)
+  ARCHIVE_SEGMENT_SEC  Nominal segment duration         (600)
+  VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
+  VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
+  VIDEO_DEFAULT_HEIGHT Output height when no segments   (1080)
 """
 import datetime
 import glob
@@ -43,10 +53,15 @@ import zipfile
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 from archive_times import parse_segment_times
+from video_transcode import transcode_to_video
 
-WEB_DIR             = os.environ.get('WEB_DIR', '/var/www/html')
-ARCHIVE_DIR         = os.environ.get('ARCHIVE_DIR', '/archive')
-ARCHIVE_SEGMENT_SEC = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
+WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
+ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')
+ARCHIVE_SEGMENT_SEC  = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
+VIDEO_FILL_COLOR     = int(os.environ.get('VIDEO_FILL_COLOR', '0xFF000000'), 16)
+VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
+VIDEO_DEFAULT_HEIGHT = int(os.environ.get('VIDEO_DEFAULT_HEIGHT', '1080'))
+VIDEO_MAX_SEC        = 12 * 3600
 
 ROUTED_PATHS = {'/top', '/bottom'}
 
@@ -152,8 +167,11 @@ class Router(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
 
     def do_GET(self):
-        if urllib.parse.urlparse(self.path).path == '/archive':
+        path = urllib.parse.urlparse(self.path).path
+        if path == '/archive':
             self._handle_archive()
+        elif path == '/video':
+            self._handle_video()
         else:
             super().do_GET()
 
@@ -194,6 +212,50 @@ class Router(SimpleHTTPRequestHandler):
                 shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
         finally:
             tmp.cleanup()
+
+    def _handle_video(self):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            if 'last' in params:
+                end_ts   = time.time()
+                start_ts = end_ts - parse_duration(params['last'][0])
+            elif 'start' in params and 'end' in params:
+                start_ts = parse_timestamp(params['start'][0])
+                end_ts   = parse_timestamp(params['end'][0])
+            else:
+                self.send_error(400, 'provide last=<duration> or both start=<ts> and end=<ts>')
+                return
+        except (ValueError, IndexError):
+            self.send_error(400, 'invalid parameter value')
+            return
+
+        if end_ts - start_ts > VIDEO_MAX_SEC:
+            self.send_error(400, 'requested range exceeds 12-hour maximum')
+            return
+
+        stage_tmp  = stage_segments(ARCHIVE_DIR, start_ts, end_ts, ARCHIVE_SEGMENT_SEC)
+        output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
+        try:
+            output_path = os.path.join(output_tmp.name, 'video.mkv')
+            transcode_to_video(
+                stage_tmp.name, start_ts, end_ts, ARCHIVE_SEGMENT_SEC,
+                VIDEO_FILL_COLOR, output_path,
+                default_width=VIDEO_DEFAULT_WIDTH,
+                default_height=VIDEO_DEFAULT_HEIGHT,
+            )
+            video_size = os.path.getsize(output_path)
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/x-matroska')
+            self.send_header('Content-Disposition', 'attachment; filename="video.mkv"')
+            self.send_header('Content-Length', str(video_size))
+            self.end_headers()
+            with open(output_path, 'rb') as fh:
+                shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
+        except Exception as exc:
+            self.send_error(500, str(exc))
+        finally:
+            stage_tmp.cleanup()
+            output_tmp.cleanup()
 
     def log_message(self, fmt, *args):
         pass  # suppress per-request access logs
