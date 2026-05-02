@@ -159,12 +159,18 @@ class LiveFeedColorTest {
         assumeTrue(flipStartEpoch > 0,
                 "Flip test did not record timestamps — wrong execution order?");
 
-        // Request the video clip covering the flip window (generous +5 s buffer).
+        // Wait for the GStreamer pipeline to flush and seal the current MKV cluster.
+        // x264enc writes keyframes every ~1 s (key-int-max=30); matroskamux seals a
+        // cluster on each keyframe. Without this sleep the in-progress cluster that
+        // holds the most-recent blue frames may not yet be written to disk.
+        Thread.sleep(5_000);
+
+        // Request the video clip covering the flip window (generous +10 s buffer).
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
         String videoUrl = stack.baseUrl()
-                + "/video?start=" + flipStartEpoch + "&end=" + (flipEndEpoch + 5);
+                + "/video?start=" + flipStartEpoch + "&end=" + (flipEndEpoch + 10);
         HttpResponse<byte[]> resp = httpClient.send(
                 HttpRequest.newBuilder(URI.create(videoUrl))
                            .GET()
@@ -222,10 +228,23 @@ class LiveFeedColorTest {
             boolean sawBlue = frames.stream()
                     .anyMatch(rgb -> rgb[0] < 60  && rgb[1] < 60 && rgb[2] > 200);
 
+            // Build a compact sample of the first 40 frames for failure messages.
+            StringBuilder sample = new StringBuilder();
+            int limit = Math.min(40, frames.size());
+            for (int i = 0; i < limit; i++) {
+                double[] f = frames.get(i);
+                sample.append(String.format("[%.0f,%.0f,%.0f]", f[0], f[1], f[2]));
+                if (i < limit - 1) sample.append(", ");
+            }
+
             assertTrue(sawRed,
-                    "No red frame found in archived video (" + frames.size() + " frames sampled)");
+                    "No red frame (R>200,G<60,B<60) in archived video. "
+                    + "url=" + videoUrl + " frames=" + frames.size()
+                    + " sample=" + sample);
             assertTrue(sawBlue,
-                    "No blue frame found in archived video (" + frames.size() + " frames sampled)");
+                    "No blue frame (R<60,G<60,B>200) in archived video. "
+                    + "url=" + videoUrl + " frames=" + frames.size()
+                    + " sample=" + sample);
 
         } finally {
             Files.deleteIfExists(videoFile);
