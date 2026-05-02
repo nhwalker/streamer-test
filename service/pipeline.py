@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 """
-pipeline.py -- desktop-stream-service: webrtcsrc ingress -> tee -> archive + WebRTC.
+pipeline.py -- desktop-stream-service: ingress -> tee -> archive + WebRTC.
 
-webrtcsrc (connects to caster's signalling server) -> videoconvert -> tee
+Two ingress modes, selected by CASTER_HOST:
+
+  Caster mode (CASTER_HOST set):
+    webrtcsrc (connects to caster's signalling server) -> videoconvert -> tee
+
+  Host mode (CASTER_HOST empty):
+    ximagesrc -> videorate -> videoscale -> videoconvert -> tee
+
+Either way, the tee fans out identically:
   tee. -> encoder -> h264parse -> splitmuxsink matroskamux    (archive)
   tee. -> tee_webrtc
             tee_webrtc. -> webrtcsink (full)                  (browser, per-peer encode)
             tee_webrtc. -> videocrop (bottom) -> webrtcsink   (top half)
             tee_webrtc. -> videocrop (top)    -> webrtcsink   (bottom half)
 
-The service's webrtcsrc dials the caster's gst-webrtc-signalling-server.
-webrtcsink (service-side) handles per-browser encoding and adaptive bitrate
-for viewers automatically; the caster's webrtcsink does the same for the
-ingest leg.  No manual RTCP feedback loop is needed.
-
-webrtcsrc has a dynamic src pad; a pad-added handler links the first video
-pad to the videoconvert → tee chain.
-
-The archive branch re-encodes from the decoded raw video webrtcsrc provides.
-nvh264enc is preferred when a GPU is present; x264enc is the software fallback.
-
 Environment variables:
-  CASTER_HOST            caster hostname / IP (required)
-  CASTER_SIGNALLING_PORT caster's signalling server port  (8443)
+  CASTER_HOST            caster hostname / IP; empty = host mode  ("")
+  CASTER_SIGNALLING_PORT caster's signalling server port          (8443)
 
-  ARCHIVE_DIR            output dir for .mkv segments     (/archive)
-  ARCHIVE_SEGMENT_SEC    segment duration in seconds       (600)
-  ARCHIVE_BITRATE        archive H.264 bitrate in kbps     (6000)
-  ARCHIVE_PREFIX         filename prefix for segments      (stream)
+  DISPLAY                X11 display for host mode                (:0)
+  STREAM_WIDTH           capture width for host mode              (1920)
+  STREAM_HEIGHT          capture height for host mode             (1080)
+  STREAM_FRAMERATE       frames per second for host mode          (30)
+
+  ARCHIVE_DIR            output dir for .mkv segments             (/archive)
+  ARCHIVE_SEGMENT_SEC    segment duration in seconds              (600)
+  ARCHIVE_BITRATE        archive H.264 bitrate in kbps            (6000)
+  ARCHIVE_PREFIX         filename prefix for segments             (stream)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
                          exceeds this many bytes; 0 = unlimited          (0)
   ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
@@ -55,6 +57,12 @@ from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_versi
 CASTER_HOST           = os.environ.get('CASTER_HOST', '')
 CASTER_SIG_PORT       = os.environ.get('CASTER_SIGNALLING_PORT', '8443')
 CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
+
+HOST_MODE             = not bool(CASTER_HOST)
+DISPLAY               = os.environ.get('DISPLAY', ':0')
+WIDTH                 = os.environ.get('STREAM_WIDTH', '1920')
+HEIGHT                = os.environ.get('STREAM_HEIGHT', '1080')
+FRAMERATE             = os.environ.get('STREAM_FRAMERATE', '30')
 
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
@@ -96,20 +104,27 @@ def build_archive_encoder():
 
 
 def main():
-    if not CASTER_HOST:
-        print('[service] ERROR: CASTER_HOST is required '
-              '(IP/hostname of the caster)', file=sys.stderr)
+    if not HOST_MODE and not CASTER_HOST:
+        # Shouldn't be reached given HOST_MODE logic, but guard anyway.
+        print('[service] ERROR: CASTER_HOST is required in caster mode',
+              file=sys.stderr)
         sys.exit(1)
 
     Gst.init(None)
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-    caster_sig_uri  = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
     archive_pattern = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-%05d.mkv')
 
     print('[service] Starting stream service:', flush=True)
-    print(f'  Caster signalling : {caster_sig_uri}')
+    if HOST_MODE:
+        print(f'  Mode              : host (X11 direct capture)')
+        print(f'  Display           : {DISPLAY}')
+        print(f'  Resolution        : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
+    else:
+        caster_sig_uri = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
+        print(f'  Mode              : caster')
+        print(f'  Caster signalling : {caster_sig_uri}')
     print(f'  Archive           : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Archive bitrate   : {ARCHIVE_BITRATE} kbps')
     print(f'  Signalling /      : ws://127.0.0.1:{SIG_PORT}')
@@ -133,8 +148,7 @@ def main():
         pipeline.add(el)
         return el
 
-    # ── Ingress from caster (dynamic src pad)
-    wsrc      = make('webrtcsrc',    'wsrc')
+    # ── Ingress source + videoconvert + tee (mode-dependent)
     vconvert  = make('videoconvert', 'vconvert')
     tee       = make('tee',          't')
 
@@ -160,9 +174,26 @@ def main():
     crop_bot   = make('videocrop',   'crop_bot')
     ws_bot     = make('webrtcsink',  'ws_bot')
 
-    # ── Configure webrtcsrc (connects to caster's signalling server)
-    wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
-    wsrc.get_property('signaller').set_property('producer-peer-id', CASTER_PEER_ID)
+    # ── Configure ingress source
+    if HOST_MODE:
+        xsrc      = make('ximagesrc',   'xsrc')
+        vrate     = make('videorate',   'vrate')
+        vscale    = make('videoscale',  'vscale')
+        xsrc.set_property('display-name', DISPLAY)
+        xsrc.set_property('use-damage', False)
+        xsrc.link_filtered(
+            vrate,
+            Gst.Caps.from_string(f'video/x-raw,framerate={FRAMERATE}/1'),
+        )
+        vrate.link(vscale)
+        vscale.link_filtered(
+            vconvert,
+            Gst.Caps.from_string(f'video/x-raw,width={WIDTH},height={HEIGHT}'),
+        )
+    else:
+        wsrc = make('webrtcsrc', 'wsrc')
+        wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
+        wsrc.get_property('signaller').set_property('producer-peer-id', CASTER_PEER_ID)
 
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
@@ -216,7 +247,7 @@ def main():
             sink.set_property('stun-server', STUN)
 
     # ── Static links: vconvert -> tee -> archive + webrtc branches
-    vconvert.link(tee)
+    vconvert.link(tee)  # host mode: xsrc→vrate→vscale→vconvert already linked above
 
     tee.link(q_arch)
     q_arch.link(arch_enc)
@@ -245,25 +276,26 @@ def main():
     q_bot.link(crop_bot)
     crop_bot.link(ws_bot)
 
-    # ── Dynamic src pad from webrtcsrc → videoconvert
-    vconvert_sink = vconvert.get_static_pad('sink')
+    # ── Dynamic src pad from webrtcsrc → videoconvert (caster mode only)
+    if not HOST_MODE:
+        vconvert_sink = vconvert.get_static_pad('sink')
 
-    def on_pad_added(_, pad):
-        if pad.get_direction() != Gst.PadDirection.SRC:
-            return
-        caps_str = pad.query_caps(None).to_string()
-        if 'video' not in caps_str:
-            return
-        if vconvert_sink.is_linked():
-            return
-        ret = pad.link(vconvert_sink)
-        if ret != Gst.PadLinkReturn.OK:
-            print(f'[service] ERROR: webrtcsrc pad link failed: {ret}',
-                  file=sys.stderr)
-        else:
-            print('[service] webrtcsrc → videoconvert linked', flush=True)
+        def on_pad_added(_, pad):
+            if pad.get_direction() != Gst.PadDirection.SRC:
+                return
+            caps_str = pad.query_caps(None).to_string()
+            if 'video' not in caps_str:
+                return
+            if vconvert_sink.is_linked():
+                return
+            ret = pad.link(vconvert_sink)
+            if ret != Gst.PadLinkReturn.OK:
+                print(f'[service] ERROR: webrtcsrc pad link failed: {ret}',
+                      file=sys.stderr)
+            else:
+                print('[service] webrtcsrc → videoconvert linked', flush=True)
 
-    wsrc.connect('pad-added', on_pad_added)
+        wsrc.connect('pad-added', on_pad_added)
 
     # ── TURN: injected per-webrtcbin instance when it is created
     if TURN:
