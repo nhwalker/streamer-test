@@ -7,65 +7,72 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    html, body { height: 100%; }
+
     body {
+      display: flex;
+      flex-direction: column;
       background: #111;
       color: #ddd;
       font-family: system-ui, sans-serif;
       font-size: 14px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
+    }
+
+    #header {
+      flex: 0 0 auto;
+      padding: 0 1em;
+      line-height: 2.2;
+      background: #1a1a1a;
+      border-bottom: 1px solid #333;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #video-area {
+      flex: 1 1 0;
+      min-height: 0;
+      position: relative;
+      background: #000;
     }
 
     #status {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
       padding: 0.75em 1.25em;
       background: rgba(255,255,255,0.07);
       border-radius: 6px;
-      margin-bottom: 1em;
       max-width: 480px;
       text-align: center;
       line-height: 1.5;
+      white-space: nowrap;
+      z-index: 1;
     }
 
     #status.error { color: #f88; background: rgba(255,80,80,0.12); }
     #status.hidden { display: none; }
 
     video {
-      max-width: 100vw;
-      max-height: 100vh;
       display: block;
-      background: #000;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
     }
-
-    #metrics {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      display: flex;
-      gap: 2em;
-      padding: 0.35em 1em;
-      background: rgba(0,0,0,0.6);
-      backdrop-filter: blur(6px);
-      font-size: 13px;
-      font-variant-numeric: tabular-nums;
-      z-index: 10;
-      pointer-events: none;
-    }
-    #metrics.hidden { display: none; }
-    .metric-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; margin-right: 0.4em; }
-    .metric-value { font-weight: 600; }
   </style>
 </head>
 <body>
-  <div id="metrics" class="hidden">
-    <span><span class="metric-label">FPS</span><span class="metric-value" id="m-fps">--</span></span>
-    <span><span class="metric-label">Latency</span><span class="metric-value" id="m-lat">--</span></span>
+  <div id="header">
+    Desktop: <span id="m-name">--</span>
+    &nbsp;&nbsp;FPS: <span id="m-fps">--</span>
+    &nbsp;&nbsp;Latency (secs): <span id="m-lat">--</span>
   </div>
-  <p id="status">Connecting to signalling server…</p>
-  <video id="stream" autoplay playsinline muted></video>
+  <div id="video-area">
+    <p id="status">Connecting to signalling server…</p>
+    <video id="stream" autoplay playsinline muted></video>
+  </div>
 
   <!--
     The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
@@ -139,9 +146,11 @@
     const turnUser = params.get('turn_user');
     const turnCred = params.get('turn_cred');
 
-    const video   = document.getElementById('stream');
-    const status  = document.getElementById('status');
-    const metrics = document.getElementById('metrics');
+    const video  = document.getElementById('stream');
+    const status = document.getElementById('status');
+
+    document.getElementById('m-name').textContent =
+      sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
 
     const setStatus = (msg, isError = false) => {
       status.textContent = msg;
@@ -177,10 +186,10 @@
               }
             }
           });
-          const latMs = window._captureMs != null ? Date.now() - window._captureMs : null;
           document.getElementById('m-fps').textContent = fps != null ? fps.toFixed(1) : '--';
-          document.getElementById('m-lat').textContent = latMs != null ? `${Math.round(latMs)} ms` : '--';
-          if (latMs != null) metrics.classList.remove('hidden');
+          document.getElementById('m-lat').textContent = window._captureMs != null
+            ? ((Date.now() - window._captureMs) / 1000).toFixed(3)
+            : '--';
         } catch (_) {}
       }, 1000);
     }
@@ -188,8 +197,9 @@
     function stopMetrics() {
       clearInterval(_metricsTimer);
       _metricsTimer = null;
-      metrics.classList.add('hidden');
       window._captureMs = null;
+      document.getElementById('m-fps').textContent = '--';
+      document.getElementById('m-lat').textContent = '--';
     }
 
     setStatus(`Connecting to ${sigUrl} …`);

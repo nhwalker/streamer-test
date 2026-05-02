@@ -158,25 +158,37 @@ abstract class AbstractLiveFeedColorTest {
     @Test
     @Order(0)
     @DisplayName("Live stream latency is below threshold")
-    @Description("Reads the capture timestamp delivered by the service's WebRTC data channel "
-            + "and asserts the wall-clock delta to Date.now() is below MAX_LATENCY_MS. "
-            + "The service stamps each frame at capture time and relays it every 200 ms; "
-            + "the browser stores the most recent value in window._captureMs.")
+    @Description("Reads the latency value rendered in the page header (#m-lat, in seconds) "
+            + "and asserts it is below MAX_LATENCY_MS. The header shows "
+            + "'Latency (secs): <value>' where value is updated every second from the "
+            + "capture timestamp delivered by the service's WebRTC data channel.")
     void latencyIsBelowThreshold() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 30_000;
+        String latText = null;
         while (System.currentTimeMillis() < deadline) {
-            Object ts = js().executeScript("return window._captureMs || null;");
-            if (ts instanceof Number) break;
+            Object text = js().executeScript(
+                    "const el = document.getElementById('m-lat');"
+                    + "return el ? el.textContent.trim() : null;");
+            if (text instanceof String s && !s.equals("--")) {
+                latText = s;
+                break;
+            }
             Thread.sleep(200);
         }
+        assertNotNull(latText,
+                "Latency element (#m-lat) did not update from '--' within 30 s");
 
-        Object latencyObj = js().executeScript(
-                "return window._captureMs != null ? Date.now() - window._captureMs : null;");
-        assertNotNull(latencyObj,
-                "Data-channel timestamp (window._captureMs) not received within 30 s");
-        long latency = ((Number) latencyObj).longValue();
-        assertTrue(latency < MAX_LATENCY_MS,
-                "End-to-end latency " + latency + " ms exceeds threshold " + MAX_LATENCY_MS + " ms");
+        double latencySecs;
+        try {
+            latencySecs = Double.parseDouble(latText);
+        } catch (NumberFormatException e) {
+            fail("Could not parse latency value '" + latText + "' from #m-lat element");
+            return;
+        }
+        long latencyMs = Math.round(latencySecs * 1000);
+        assertTrue(latencyMs < MAX_LATENCY_MS,
+                "End-to-end latency " + latencyMs + " ms (" + latText + " s) "
+                + "exceeds threshold " + MAX_LATENCY_MS + " ms");
     }
 
     // ── Test 1: live flip verification ────────────────────────────────────────
