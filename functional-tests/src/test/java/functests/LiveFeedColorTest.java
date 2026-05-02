@@ -236,6 +236,16 @@ class LiveFeedColorTest {
             assertFalse(frames.isEmpty(),
                     "ffmpeg produced no PNG frames from the video clip");
 
+            // Dump ALL frame RGB averages to stdout so the failure is self-diagnosable
+            // in the CI log even without the Allure HTML report.
+            System.out.println("[LiveFeedColorTest] video=" + videoUrl
+                    + " frames=" + frames.size());
+            for (int i = 0; i < frames.size(); i++) {
+                double[] f = frames.get(i);
+                System.out.printf("[LiveFeedColorTest] frame%04d R=%.0f G=%.0f B=%.0f%n",
+                        i + 1, f[0], f[1], f[2]);
+            }
+
             // Predominantly-red: red is at least 2× both green and blue,
             // and at least 100/255 in absolute terms. Loose enough to tolerate
             // YUV→RGB rounding, motion blur on the X11 buffer, and h264
