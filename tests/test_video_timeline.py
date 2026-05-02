@@ -28,6 +28,17 @@ from video_transcode import _build_timeline, TimelineItem  # noqa: E402
 SEGMENT_SEC = 600
 
 
+@pytest.fixture(autouse=True)
+def _mock_video_file_info(monkeypatch):
+    """Stub out ffprobe so unit tests work without ffprobe installed.
+
+    Returns valid dimensions for every path so that synthetic test files
+    (containing b'fake') are included in the timeline rather than filtered.
+    """
+    import video_transcode as _vt
+    monkeypatch.setattr(_vt, '_query_file_info', lambda _path: (600.0, 1280, 720, '25/1'))
+
+
 def _make_seg(directory, index, age_seconds=0):
     """Write a fake unnamed segment (no timestamp in name) and set its mtime."""
     path = os.path.join(str(directory), f'stream-{index:05d}.mkv')

@@ -30,6 +30,26 @@ from archive_times import parse_segment_times
 _DEFAULT_FPS = '25/1'
 
 
+def _detect_encoder_args():
+    """Return ffmpeg output-encoder args for the best available video encoder."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+    encoders = result.stdout
+    if 'libx264' in encoders:
+        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+    if 'mpeg4' in encoders:
+        return ['-c:v', 'mpeg4', '-q:v', '5']
+    return ['-c:v', 'ffv1']
+
+
+_ENCODER_ARGS = _detect_encoder_args()
+
+
 @dataclass
 class TimelineItem:
     path:           str
@@ -64,14 +84,19 @@ def _query_file_info(path):
 
 # ── Timeline builder ──────────────────────────────────────────────────────────
 
-def _build_timeline(stage_dir, start_ts, end_ts):
+def _build_timeline(stage_dir, start_ts, end_ts, _query_info=None):
     """Build an ordered list of TimelineItem covering [start_ts, end_ts].
 
     All files are expected to have timestamps in their names (as produced by
     stage_segments).  Files without a recognized timestamp pattern are skipped.
+    Files that ffprobe cannot decode (e.g. an in-progress active segment with
+    only an EBML header and no frames yet) are also skipped so that ffmpeg
+    does not receive an unreadable input.
 
     Returns [] when no segments overlap (pure color output).
     """
+    if _query_info is None:
+        _query_info = _query_file_info
     timeline = []
     for fname in os.listdir(stage_dir):
         if not fname.endswith('.mkv'):
@@ -82,9 +107,13 @@ def _build_timeline(stage_dir, start_ts, end_ts):
         seg_start, seg_end = times
         if seg_start >= end_ts or seg_end <= start_ts:
             continue
+        fpath = os.path.join(stage_dir, fname)
+        _, w, h, _ = _query_info(fpath)
+        if w == 0 or h == 0:
+            continue  # unreadable or header-only segment — skip
         clip_start = max(seg_start, start_ts)
         timeline.append(TimelineItem(
-            path           = os.path.join(stage_dir, fname),
+            path           = fpath,
             offset_s       = clip_start - seg_start,
             output_start_s = clip_start - start_ts,
         ))
@@ -108,7 +137,7 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
     if _query_info is None:
         _query_info = _query_file_info
 
-    timeline = _build_timeline(stage_dir, start_ts, end_ts)
+    timeline = _build_timeline(stage_dir, start_ts, end_ts, _query_info)
 
     width, height, fps_str = default_width, default_height, _DEFAULT_FPS
     for item in timeline:
@@ -130,44 +159,41 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
 
     filters = []
 
-    filters.append(
-        f'color=c={color}:s={size}:r={fps_str}'
-        f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
-    )
+    if timeline:
+        filters.append(
+            f'color=c={color}:s={size}:r={fps_str}'
+            f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
+        )
 
-    for i, item in enumerate(timeline):
-        label = f'[c{i}]'
-        y     = item.output_start_s
-        if item.offset_s > 0:
-            filters.append(
-                f'[{i}:v]trim=start={item.offset_s:.6f}'
-                f',setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
-            )
-        else:
-            filters.append(
-                f'[{i}:v]setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
-            )
+        for i, item in enumerate(timeline):
+            label = f'[c{i}]'
+            y     = item.output_start_s
+            if item.offset_s > 0:
+                filters.append(
+                    f'[{i}:v]trim=start={item.offset_s:.6f}'
+                    f',setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
+                )
+            else:
+                filters.append(
+                    f'[{i}:v]setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
+                )
 
-    prev = 'base'
-    for i in range(len(timeline)):
-        src  = f'[{prev}]' if prev == 'base' else prev
-        clip = f'[c{i}]'
-        out  = '[out]' if i == len(timeline) - 1 else f'[t{i}]'
-        filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
-        prev = f'[t{i}]'
-
-    if not timeline:
+        prev = 'base'
+        for i in range(len(timeline)):
+            src  = f'[{prev}]' if prev == 'base' else prev
+            clip = f'[c{i}]'
+            out  = '[out]' if i == len(timeline) - 1 else f'[t{i}]'
+            filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
+            prev = f'[t{i}]'
+    else:
         filters.append(
             f'color=c={color}:s={size}:r={fps_str}'
             f':duration={total_dur:.6f},setpts=PTS-STARTPTS[out]'
         )
 
     cmd += ['-filter_complex', ';'.join(filters)]
-    cmd += ['-map', '[out]', '-c:v', 'libx264', '-preset', 'ultrafast', output_path]
+    cmd += ['-map', '[out]'] + _ENCODER_ARGS + [output_path]
 
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f'ffmpeg failed (exit {result.returncode}): '
-            f'{result.stderr.decode(errors="replace")[-1000:]}'
-        )
+        raise RuntimeError(f'ffmpeg failed (exit {result.returncode})')
