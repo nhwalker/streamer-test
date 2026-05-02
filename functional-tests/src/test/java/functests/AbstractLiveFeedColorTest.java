@@ -104,6 +104,7 @@ abstract class AbstractLiveFeedColorTest {
         Thread.sleep(1_000); // let OS reclaim host ports and Xvfb socket
 
         stack = ServiceStack.create(archiveSegmentSec());
+        stack.awaitFirstSegment(); // ensure ≥1 completed segment before tests run
 
         // Paint the display red before opening the browser so the first frame is red.
         stack.setDesktopColor("#ff0000");
