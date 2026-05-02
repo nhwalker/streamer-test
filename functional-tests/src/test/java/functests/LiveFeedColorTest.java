@@ -11,6 +11,7 @@ import org.openqa.selenium.chrome.ChromeOptions;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -19,11 +20,17 @@ import java.net.http.HttpResponse;
 import java.nio.file.*;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -267,6 +274,156 @@ class LiveFeedColorTest {
                  .sorted(Comparator.reverseOrder())
                  .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
         }
+    }
+
+    // ── Test 3: archive segment names + color check ───────────────────────────
+
+    @Test
+    @Order(3)
+    @DisplayName("Archive ZIP has valid segment names and contains both red and blue frames")
+    @Description("Downloads the last 120 s of archive, verifies every MKV entry name matches "
+            + "the expected timestamp format and that segments are in chronological order, "
+            + "then extracts frames from each segment in turn and asserts both red and blue "
+            + "frames are present across the full sequence.")
+    void archiveEndpointSegmentNamesAndColorFlips() throws Exception {
+        assumeTrue(flipStartEpoch > 0,
+                "Flip test did not record timestamps — wrong execution order?");
+
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        String archiveUrl = stack.baseUrl() + "/archive?last=120s";
+        HttpResponse<byte[]> resp = httpClient.send(
+                HttpRequest.newBuilder(URI.create(archiveUrl))
+                           .GET()
+                           .timeout(Duration.ofSeconds(30))
+                           .build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+
+        assertEquals(200, resp.statusCode(), "Expected 200 from /archive");
+
+        // ── Extract and validate segment names ────────────────────────────────
+        // Expected format: {prefix}_{YYYYMMDD-HHMMSS.SSS}_to_{YYYYMMDD-HHMMSS.SSS}.mkv
+        Pattern segPattern = Pattern.compile(
+                "^\\w+_(\\d{8}-\\d{6}\\.\\d{3})_to_(\\d{8}-\\d{6}\\.\\d{3})\\.mkv$");
+        DateTimeFormatter segFmt = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS")
+                .withZone(ZoneOffset.UTC);
+
+        List<Map.Entry<String, byte[]>> segments = new ArrayList<>();
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(resp.body()))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                String name = entry.getName();
+                if (name.endsWith(".mkv")) {
+                    Matcher m = segPattern.matcher(name);
+                    assertTrue(m.matches(),
+                            "Segment name does not match expected format: " + name);
+                    segments.add(Map.entry(name, zis.readAllBytes()));
+                }
+            }
+        }
+        assertFalse(segments.isEmpty(),
+                "Archive ZIP contained no .mkv segments for ?last=120s");
+
+        // Entries are already sorted lexicographically (== chronologically) by the
+        // server, but sort explicitly to guarantee ordering for assertions below.
+        segments.sort(Map.Entry.comparingByKey());
+
+        // Verify timestamps are plausible and segments do not overlap.
+        Instant requestTime = Instant.now();
+        Instant windowStart = requestTime.minusSeconds(180); // 120 s window + 60 s tolerance
+        Instant prevEnd     = null;
+        for (Map.Entry<String, byte[]> seg : segments) {
+            Matcher m = segPattern.matcher(seg.getKey());
+            assertTrue(m.matches()); // already checked above; re-match for groups
+            Instant segStart = Instant.from(segFmt.parse(m.group(1)));
+            Instant segEnd   = Instant.from(segFmt.parse(m.group(2)));
+
+            assertTrue(segEnd.isAfter(segStart),
+                    "Segment end is not after start: " + seg.getKey());
+            assertFalse(segStart.isBefore(windowStart),
+                    "Segment start is outside the request window: " + seg.getKey()
+                    + " (earliest expected: " + windowStart + ")");
+            assertFalse(segStart.isAfter(requestTime.plusSeconds(60)),
+                    "Segment start timestamp is suspiciously in the future: " + seg.getKey());
+            if (prevEnd != null) {
+                assertFalse(segStart.isBefore(prevEnd.minusMillis(500)),
+                        "Segment overlaps its predecessor by >500 ms: " + seg.getKey()
+                        + " (prev ended " + prevEnd + ", this starts " + segStart + ")");
+            }
+            prevEnd = segEnd;
+        }
+
+        // ── Extract frames from each segment and scan for red / blue ─────────
+        boolean sawRed  = false;
+        boolean sawBlue = false;
+        List<double[]> allFrames = new ArrayList<>();
+
+        for (Map.Entry<String, byte[]> seg : segments) {
+            Path segFile     = Files.createTempFile("arcseg-", ".mkv");
+            Path segFrameDir = Files.createTempDirectory("arcseg-frames-");
+            try {
+                Files.write(segFile, seg.getValue());
+
+                Process ffmpeg;
+                try {
+                    ffmpeg = new ProcessBuilder(
+                            "ffmpeg", "-hide_banner", "-y",
+                            "-i", segFile.toString(),
+                            "-vf", "fps=4,scale=64:36",
+                            segFrameDir.resolve("frame%04d.png").toString())
+                            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                            .redirectError(ProcessBuilder.Redirect.DISCARD)
+                            .start();
+                } catch (IOException e) {
+                    assumeTrue(false, "ffmpeg not available on test host: " + e.getMessage());
+                    return;
+                }
+                assertTrue(ffmpeg.waitFor(30, TimeUnit.SECONDS),
+                        "ffmpeg timed out on segment " + seg.getKey());
+
+                try (DirectoryStream<Path> ds = Files.newDirectoryStream(segFrameDir, "*.png")) {
+                    for (Path png : ds) {
+                        BufferedImage img = ImageIO.read(png.toFile());
+                        if (img != null) {
+                            double[] rgb = averageRgb(img);
+                            allFrames.add(rgb);
+                            if (rgb[0] >= 100 && rgb[0] >= 2 * rgb[1] && rgb[0] >= 2 * rgb[2])
+                                sawRed  = true;
+                            if (rgb[2] >= 100 && rgb[2] >= 2 * rgb[0] && rgb[2] >= 2 * rgb[1])
+                                sawBlue = true;
+                        }
+                    }
+                }
+            } finally {
+                Files.deleteIfExists(segFile);
+                Files.walk(segFrameDir)
+                     .sorted(Comparator.reverseOrder())
+                     .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
+            }
+        }
+
+        StringBuilder sample = new StringBuilder();
+        int limit = Math.min(60, allFrames.size());
+        for (int i = 0; i < limit; i++) {
+            double[] f = allFrames.get(i);
+            sample.append(String.format("[%.0f,%.0f,%.0f]", f[0], f[1], f[2]));
+            if (i < limit - 1) sample.append(", ");
+        }
+
+        String svcLogs = stack.serviceLogs();
+        String svcTail = svcLogs.substring(Math.max(0, svcLogs.length() - 3000));
+        List<String> segNames = segments.stream().map(Map.Entry::getKey).toList();
+        assertTrue(sawRed,
+                "No predominantly-red frame across archive segments. "
+                + "url=" + archiveUrl + " segments=" + segNames
+                + " frames=" + allFrames.size()
+                + " sample=" + sample + "\nservice logs (tail):\n" + svcTail);
+        assertTrue(sawBlue,
+                "No predominantly-blue frame across archive segments. "
+                + "url=" + archiveUrl + " segments=" + segNames
+                + " frames=" + allFrames.size()
+                + " sample=" + sample + "\nservice logs (tail):\n" + svcTail);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
