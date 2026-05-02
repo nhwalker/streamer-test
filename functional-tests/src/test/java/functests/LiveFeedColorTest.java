@@ -173,12 +173,8 @@ class LiveFeedColorTest {
         // cluster on each keyframe boundary.
         Thread.sleep(5_000);
 
-        // Request the last 120 s of archive.  Using ?last= (relative to server now)
-        // rather than exact epoch timestamps avoids a class of failures where the
-        // flip window straddles an active-segment boundary: a 120 s window always
-        // spans multiple completed 20 s segments, so _build_timeline always finds
-        // readable files via ffprobe even if the active segment is still open.
-        // The flip test ran ~33 s ago (28 s flips + 5 s sleep), well within 120 s.
+        // Request the last 120 s of archive.  The flip test ran ~33 s ago
+        // (28 s flips + 5 s sleep), well within the 120 s window.
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -235,16 +231,6 @@ class LiveFeedColorTest {
             }
             assertFalse(frames.isEmpty(),
                     "ffmpeg produced no PNG frames from the video clip");
-
-            // Dump ALL frame RGB averages to stdout so the failure is self-diagnosable
-            // in the CI log even without the Allure HTML report.
-            System.out.println("[LiveFeedColorTest] video=" + videoUrl
-                    + " frames=" + frames.size());
-            for (int i = 0; i < frames.size(); i++) {
-                double[] f = frames.get(i);
-                System.out.printf("[LiveFeedColorTest] frame%04d R=%.0f G=%.0f B=%.0f%n",
-                        i + 1, f[0], f[1], f[2]);
-            }
 
             // Predominantly-red: red is at least 2× both green and blue,
             // and at least 100/255 in absolute terms. Loose enough to tolerate
