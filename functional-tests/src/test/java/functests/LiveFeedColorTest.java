@@ -161,26 +161,28 @@ class LiveFeedColorTest {
     @Test
     @Order(2)
     @DisplayName("Archived video contains both red and blue frames")
-    @Description("Downloads the /video clip covering the flip window, extracts frames "
-            + "at 2 fps via ffmpeg, and asserts at least one red and one blue frame are present.")
+    @Description("Downloads the last 120 s of archived video via /video?last=120s after "
+            + "the flip test, then extracts frames with ffmpeg and asserts at least one "
+            + "predominantly-red and one predominantly-blue frame are present.")
     void videoEndpointContainsColorFlips() throws Exception {
         assumeTrue(flipStartEpoch > 0,
                 "Flip test did not record timestamps — wrong execution order?");
 
         // Wait for the GStreamer pipeline to flush and seal the current MKV cluster.
         // x264enc writes keyframes every ~1 s (key-int-max=30); matroskamux seals a
-        // cluster on each keyframe. Without this sleep the in-progress cluster
-        // holding the most-recent frames may not yet be on disk.
+        // cluster on each keyframe boundary.
         Thread.sleep(5_000);
 
-        // Request the video clip covering the flip window. flipEndEpoch was set
-        // after a 3 s solid-red hold, so end=flipEndEpoch is guaranteed to be
-        // inside the post-flip red period.
+        // Request the last 120 s of archive.  Using ?last= (relative to server now)
+        // rather than exact epoch timestamps avoids a class of failures where the
+        // flip window straddles an active-segment boundary: a 120 s window always
+        // spans multiple completed 20 s segments, so _build_timeline always finds
+        // readable files via ffprobe even if the active segment is still open.
+        // The flip test ran ~33 s ago (28 s flips + 5 s sleep), well within 120 s.
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
-        String videoUrl = stack.baseUrl()
-                + "/video?start=" + flipStartEpoch + "&end=" + flipEndEpoch;
+        String videoUrl = stack.baseUrl() + "/video?last=120s";
         HttpResponse<byte[]> resp = httpClient.send(
                 HttpRequest.newBuilder(URI.create(videoUrl))
                            .GET()
@@ -204,13 +206,14 @@ class LiveFeedColorTest {
         try {
             Files.write(videoFile, videoBytes);
 
-            // Extract 2 frames per second at small resolution to keep ImageIO fast.
+            // Extract 4 fps at small scale — with a 120 s window that's ~480 frames,
+            // enough to reliably catch a 1.5 s hold of each color.
             Process ffmpeg;
             try {
                 ffmpeg = new ProcessBuilder(
                         "ffmpeg", "-hide_banner", "-y",
                         "-i", videoFile.toString(),
-                        "-vf", "fps=30,scale=64:36",
+                        "-vf", "fps=4,scale=64:36",
                         frameDir.resolve("frame%04d.png").toString())
                         .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                         .redirectError(ProcessBuilder.Redirect.DISCARD)
