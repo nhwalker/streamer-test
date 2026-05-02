@@ -4,14 +4,12 @@
 # Starts services in order and waits on all of them:
 #   1. gst-webrtc-signalling-server x3  (background, :SIGNALLING_PORT, +1, +2)
 #   2. web_server.py                    (background, :WEB_PORT, serves /var/www/html)
-#   3. pipeline.py                      (background, connects to caster + serves browsers)
+#   3. pipeline.py                      (background, host or caster mode, serves browsers)
+#
+# Mode is selected by CASTER_HOST:
+#   CASTER_HOST set   -> caster mode: ingest stream from a remote caster via webrtcsrc
+#   CASTER_HOST empty -> host mode:   capture X11 directly via ximagesrc
 set -euo pipefail
-
-# ── Config sanity ─────────────────────────────────────────────────────────────
-if [ -z "${CASTER_HOST:-}" ]; then
-    echo "[service] ERROR: CASTER_HOST is required (IP/hostname of the caster)"
-    exit 1
-fi
 
 mkdir -p "${ARCHIVE_DIR}"
 
@@ -25,6 +23,21 @@ if command -v nvidia-smi &>/dev/null; then
         || echo "  (nvidia-smi present but query failed)"
 else
     echo "[service] No NVIDIA GPU detected (software decode + encode will be used)."
+fi
+
+# ── Mode selection ────────────────────────────────────────────────────────────
+if [ -z "${CASTER_HOST:-}" ]; then
+    echo "[service] Mode: host (X11 direct capture on ${DISPLAY})"
+    if ! gst-launch-1.0 ximagesrc num-buffers=1 ! fakesink sync=false 2>/dev/null; then
+        echo "[service] ERROR: Cannot access X display '${DISPLAY}'."
+        echo "  * On the host run:  xhost +local:docker"
+        echo "  * Run container with: -e DISPLAY=\$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro"
+        echo "  * If using Xauthority: -v \"\$HOME/.Xauthority:/root/.Xauthority:ro\" -e XAUTHORITY=/root/.Xauthority"
+        exit 1
+    fi
+    echo "[service] X11 display OK."
+else
+    echo "[service] Mode: caster (ingest from ${CASTER_HOST}:${CASTER_SIGNALLING_PORT})"
 fi
 
 # ── Signalling servers (full / top / bottom) ─────────────────────────────────
@@ -76,7 +89,11 @@ echo "│                                                     │"
 echo "│  Signalling / : ws://${HOST_IP}:${SIGNALLING_PORT}  "
 echo "│  Signalling /top    : ws://${HOST_IP}:${SIG_PORT_TOP}    "
 echo "│  Signalling /bottom : ws://${HOST_IP}:${SIG_PORT_BOTTOM} "
-echo "│  Caster    : ws://${CASTER_HOST}:${CASTER_SIGNALLING_PORT} (ingest)  "
+if [ -z "${CASTER_HOST:-}" ]; then
+echo "│  Ingest    : X11 display ${DISPLAY} (host mode)       "
+else
+echo "│  Ingest    : ws://${CASTER_HOST}:${CASTER_SIGNALLING_PORT} (caster)  "
+fi
 echo "│  Archive   : ${ARCHIVE_DIR}                         "
 echo "└─────────────────────────────────────────────────────┘"
 echo ""

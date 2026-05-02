@@ -8,13 +8,13 @@ import org.junit.jupiter.api.Order;
 import java.time.Duration;
 import java.time.Instant;
 
-@Order(3)
-@DisplayName("Video endpoint — caster mode (GET /video)")
-class VideoEndpointTest extends AbstractVideoEndpointTest {
+@Order(9)
+@DisplayName("Video endpoint — host mode (GET /video)")
+class HostVideoEndpointTest extends AbstractVideoEndpointTest {
 
     @BeforeAll
     static void setup() throws Exception {
-        stack      = ServiceStack.getInstance();
+        stack      = ServiceStack.getHostInstance();
         stack.awaitFirstSegment();
         setupEpoch = Instant.now().getEpochSecond();
         client     = java.net.http.HttpClient.newBuilder()
