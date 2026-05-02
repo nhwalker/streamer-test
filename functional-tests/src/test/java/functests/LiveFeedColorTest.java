@@ -280,11 +280,11 @@ class LiveFeedColorTest {
 
     @Test
     @Order(3)
-    @DisplayName("Archive ZIP has valid segment names and contains both red and blue frames")
-    @Description("Downloads the last 120 s of archive, verifies every MKV entry name matches "
-            + "the expected timestamp format and that segments are in chronological order, "
-            + "then extracts frames from each segment in turn and asserts both red and blue "
-            + "frames are present across the full sequence.")
+    @DisplayName("Archive ZIP has valid segment names and flips in the correct order")
+    @Description("Downloads the archive for the exact flip window, verifies every MKV entry "
+            + "name matches the expected timestamp format and segments are in chronological "
+            + "order, then extracts frames from each segment in turn and asserts the color "
+            + "run sequence matches exactly: red, blue, red × 10 alternating flips.")
     void archiveEndpointSegmentNamesAndColorFlips() throws Exception {
         assumeTrue(flipStartEpoch > 0,
                 "Flip test did not record timestamps — wrong execution order?");
@@ -292,7 +292,12 @@ class LiveFeedColorTest {
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
-        String archiveUrl = stack.baseUrl() + "/archive?last=120s";
+        // Request the precise flip window so we can assert an exact color sequence.
+        // flipStartEpoch is 1 s before the first flip; pad by 5 s each side for
+        // segment-boundary alignment.
+        String archiveUrl = stack.baseUrl() + "/archive"
+                + "?start=" + (flipStartEpoch - 5)
+                + "&end="   + (flipEndEpoch   + 5);
         HttpResponse<byte[]> resp = httpClient.send(
                 HttpRequest.newBuilder(URI.create(archiveUrl))
                            .GET()
@@ -322,30 +327,32 @@ class LiveFeedColorTest {
                 }
             }
         }
-        assertFalse(segments.isEmpty(),
-                "Archive ZIP contained no .mkv segments for ?last=120s");
+        assertFalse(segments.isEmpty(), "Archive ZIP contained no .mkv segments");
 
         // Entries are already sorted lexicographically (== chronologically) by the
         // server, but sort explicitly to guarantee ordering for assertions below.
         segments.sort(Map.Entry.comparingByKey());
 
         // Verify timestamps are plausible and segments do not overlap.
-        Instant requestTime = Instant.now();
-        Instant windowStart = requestTime.minusSeconds(180); // 120 s window + 60 s tolerance
+        // The request window is [flipStartEpoch-5, flipEndEpoch+5]; a segment that
+        // starts up to one full segment duration (20 s) before the window start is
+        // still legitimately included because it overlaps the window.
+        Instant windowStart = Instant.ofEpochSecond(flipStartEpoch - 25);
+        Instant windowEnd   = Instant.ofEpochSecond(flipEndEpoch   + 65);
         Instant prevEnd     = null;
         for (Map.Entry<String, byte[]> seg : segments) {
             Matcher m = segPattern.matcher(seg.getKey());
-            assertTrue(m.matches()); // already checked above; re-match for groups
+            assertTrue(m.matches());
             Instant segStart = Instant.from(segFmt.parse(m.group(1)));
             Instant segEnd   = Instant.from(segFmt.parse(m.group(2)));
 
             assertTrue(segEnd.isAfter(segStart),
                     "Segment end is not after start: " + seg.getKey());
             assertFalse(segStart.isBefore(windowStart),
-                    "Segment start is outside the request window: " + seg.getKey()
+                    "Segment start is too far before the request window: " + seg.getKey()
                     + " (earliest expected: " + windowStart + ")");
-            assertFalse(segStart.isAfter(requestTime.plusSeconds(60)),
-                    "Segment start timestamp is suspiciously in the future: " + seg.getKey());
+            assertFalse(segStart.isAfter(windowEnd),
+                    "Segment start timestamp is after the request window end: " + seg.getKey());
             if (prevEnd != null) {
                 assertFalse(segStart.isBefore(prevEnd.minusMillis(500)),
                         "Segment overlaps its predecessor by >500 ms: " + seg.getKey()
@@ -354,9 +361,10 @@ class LiveFeedColorTest {
             prevEnd = segEnd;
         }
 
-        // ── Extract frames from each segment and scan for red / blue ─────────
-        boolean sawRed  = false;
-        boolean sawBlue = false;
+        // ── Extract frames, build color-run sequence ──────────────────────────
+        // Classify each frame as "red", "blue", or null (transition / unclear).
+        // Collapse consecutive identical non-null classifications into runs.
+        List<String> colorRuns = new ArrayList<>();
         List<double[]> allFrames = new ArrayList<>();
 
         for (Map.Entry<String, byte[]> seg : segments) {
@@ -382,17 +390,24 @@ class LiveFeedColorTest {
                 assertTrue(ffmpeg.waitFor(30, TimeUnit.SECONDS),
                         "ffmpeg timed out on segment " + seg.getKey());
 
+                // Sort PNGs by name so frames are in temporal order within each segment.
+                List<Path> pngs = new ArrayList<>();
                 try (DirectoryStream<Path> ds = Files.newDirectoryStream(segFrameDir, "*.png")) {
-                    for (Path png : ds) {
-                        BufferedImage img = ImageIO.read(png.toFile());
-                        if (img != null) {
-                            double[] rgb = averageRgb(img);
-                            allFrames.add(rgb);
-                            if (rgb[0] >= 100 && rgb[0] >= 2 * rgb[1] && rgb[0] >= 2 * rgb[2])
-                                sawRed  = true;
-                            if (rgb[2] >= 100 && rgb[2] >= 2 * rgb[0] && rgb[2] >= 2 * rgb[1])
-                                sawBlue = true;
-                        }
+                    for (Path p : ds) pngs.add(p);
+                }
+                pngs.sort(Comparator.comparing(p -> p.getFileName().toString()));
+
+                for (Path png : pngs) {
+                    BufferedImage img = ImageIO.read(png.toFile());
+                    if (img == null) continue;
+                    double[] rgb = averageRgb(img);
+                    allFrames.add(rgb);
+                    String color =
+                            (rgb[0] >= 100 && rgb[0] >= 2 * rgb[1] && rgb[0] >= 2 * rgb[2]) ? "red"  :
+                            (rgb[2] >= 100 && rgb[2] >= 2 * rgb[0] && rgb[2] >= 2 * rgb[1]) ? "blue" : null;
+                    if (color != null
+                            && (colorRuns.isEmpty() || !color.equals(colorRuns.get(colorRuns.size() - 1)))) {
+                        colorRuns.add(color);
                     }
                 }
             } finally {
@@ -403,27 +418,21 @@ class LiveFeedColorTest {
             }
         }
 
-        StringBuilder sample = new StringBuilder();
-        int limit = Math.min(60, allFrames.size());
-        for (int i = 0; i < limit; i++) {
-            double[] f = allFrames.get(i);
-            sample.append(String.format("[%.0f,%.0f,%.0f]", f[0], f[1], f[2]));
-            if (i < limit - 1) sample.append(", ");
-        }
+        // ── Assert exact flip sequence ────────────────────────────────────────
+        // The display starts red (set in @BeforeAll), then the 10 flips alternate
+        // starting with blue.  Expected run sequence:
+        //   red, blue, red, blue, red, blue, red, blue, red, blue, red  (11 runs)
+        List<String> expected = List.of(
+                "red", "blue", "red", "blue", "red",
+                "blue", "red", "blue", "red", "blue", "red");
 
         String svcLogs = stack.serviceLogs();
         String svcTail = svcLogs.substring(Math.max(0, svcLogs.length() - 3000));
-        List<String> segNames = segments.stream().map(Map.Entry::getKey).toList();
-        assertTrue(sawRed,
-                "No predominantly-red frame across archive segments. "
-                + "url=" + archiveUrl + " segments=" + segNames
+        assertEquals(expected, colorRuns,
+                "Color run sequence does not match expected 10-flip pattern. "
+                + "segments=" + segments.stream().map(Map.Entry::getKey).toList()
                 + " frames=" + allFrames.size()
-                + " sample=" + sample + "\nservice logs (tail):\n" + svcTail);
-        assertTrue(sawBlue,
-                "No predominantly-blue frame across archive segments. "
-                + "url=" + archiveUrl + " segments=" + segNames
-                + " frames=" + allFrames.size()
-                + " sample=" + sample + "\nservice logs (tail):\n" + svcTail);
+                + "\nservice logs (tail):\n" + svcTail);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
