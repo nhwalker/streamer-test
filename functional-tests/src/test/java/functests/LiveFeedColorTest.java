@@ -3,25 +3,41 @@ package functests;
 import functests.support.ServiceStack;
 import io.qameta.allure.Allure;
 import io.qameta.allure.Description;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.*;
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.chrome.ChromeDriver;
 import org.openqa.selenium.chrome.ChromeOptions;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.*;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 @DisplayName("Live feed color verification")
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class LiveFeedColorTest {
 
     private static ServiceStack stack;
     private static WebDriver    driver;
+
+    // Timestamps bracketing the flip test; set by videoFollowsTenColorFlips().
+    private static volatile long flipStartEpoch;
+    private static volatile long flipEndEpoch;
 
     // Canvas-based frame capture: returns {stage, width, height, avgR, avgG, avgB, avgA,
     // readyState, currentTime} or an error dict when the video is not yet decodable.
@@ -68,7 +84,7 @@ class LiveFeedColorTest {
                 "--allow-loopback-for-peer-connection"
         );
         driver = new ChromeDriver(opts);
-        driver.manage().timeouts().pageLoadTimeout(java.time.Duration.ofSeconds(30));
+        driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
 
         String url = stack.baseUrl() + "/?signalling=ws://localhost:" + stack.wsPort()
                 + buildTurnParams();
@@ -97,7 +113,10 @@ class LiveFeedColorTest {
         }
     }
 
+    // ── Test 1: live flip verification ────────────────────────────────────────
+
     @Test
+    @Order(1)
     @DisplayName("Video follows 10 desktop color flips")
     @Description("Alternates the desktop color between blue and red 10 times and "
             + "verifies the live WebRTC feed matches each new color within 3 seconds.")
@@ -111,6 +130,10 @@ class LiveFeedColorTest {
             "#ff0000", "#0000ff", "#ff0000", "#0000ff", "#ff0000"
         };
 
+        // Bracket the flip test with epoch timestamps so the archive test can
+        // request exactly this window from the /video endpoint.
+        flipStartEpoch = Instant.now().getEpochSecond() - 1;
+
         for (int i = 0; i < 10; i++) {
             final String colorName = colorNames[i];
             final String hexColor  = hexColors[i];
@@ -120,6 +143,95 @@ class LiveFeedColorTest {
                 awaitColor(colorName, 3_000);
                 return null;
             });
+        }
+
+        flipEndEpoch = Instant.now().getEpochSecond() + 2;
+    }
+
+    // ── Test 2: archived video color check ────────────────────────────────────
+
+    @Test
+    @Order(2)
+    @DisplayName("Archived video contains both red and blue frames")
+    @Description("Downloads the /video clip covering the flip window, extracts frames "
+            + "at 2 fps via ffmpeg, and asserts at least one red and one blue frame are present.")
+    void videoEndpointContainsColorFlips() throws Exception {
+        assumeTrue(flipStartEpoch > 0,
+                "Flip test did not record timestamps — wrong execution order?");
+
+        // Request the video clip covering the flip window (generous +5 s buffer).
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+        String videoUrl = stack.baseUrl()
+                + "/video?start=" + flipStartEpoch + "&end=" + (flipEndEpoch + 5);
+        HttpResponse<byte[]> resp = httpClient.send(
+                HttpRequest.newBuilder(URI.create(videoUrl))
+                           .GET()
+                           .timeout(Duration.ofSeconds(120))
+                           .build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+
+        assertEquals(200, resp.statusCode(),
+                "Expected 200 from /video, got " + resp.statusCode());
+
+        byte[] videoBytes = resp.body();
+        assertTrue(videoBytes.length > 4, "Video response body is too short");
+        // Sanity-check EBML magic bytes.
+        assertEquals(0x1A, videoBytes[0] & 0xFF, "Expected EBML magic byte 0");
+        assertEquals(0x45, videoBytes[1] & 0xFF, "Expected EBML magic byte 1");
+        assertEquals(0xDF, videoBytes[2] & 0xFF, "Expected EBML magic byte 2");
+        assertEquals(0xA3, videoBytes[3] & 0xFF, "Expected EBML magic byte 3");
+
+        Path videoFile = Files.createTempFile("flip-video-", ".mkv");
+        Path frameDir  = Files.createTempDirectory("flip-frames-");
+        try {
+            Files.write(videoFile, videoBytes);
+
+            // Extract 2 frames per second at small resolution to keep ImageIO fast.
+            Process ffmpeg;
+            try {
+                ffmpeg = new ProcessBuilder(
+                        "ffmpeg", "-hide_banner", "-y",
+                        "-i", videoFile.toString(),
+                        "-vf", "fps=2,scale=64:36",
+                        frameDir.resolve("frame%04d.png").toString())
+                        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                        .redirectError(ProcessBuilder.Redirect.DISCARD)
+                        .start();
+            } catch (IOException e) {
+                assumeTrue(false, "ffmpeg not available on test host: " + e.getMessage());
+                return;
+            }
+            assertTrue(ffmpeg.waitFor(60, TimeUnit.SECONDS),
+                    "ffmpeg frame extraction did not complete within 60 s");
+
+            // Read every extracted PNG and compute average R, G, B.
+            List<double[]> frames = new ArrayList<>();
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(frameDir, "*.png")) {
+                for (Path png : ds) {
+                    BufferedImage img = ImageIO.read(png.toFile());
+                    if (img != null) frames.add(averageRgb(img));
+                }
+            }
+            assertFalse(frames.isEmpty(),
+                    "ffmpeg produced no PNG frames from the video clip");
+
+            boolean sawRed  = frames.stream()
+                    .anyMatch(rgb -> rgb[0] > 200 && rgb[1] < 60 && rgb[2] < 60);
+            boolean sawBlue = frames.stream()
+                    .anyMatch(rgb -> rgb[0] < 60  && rgb[1] < 60 && rgb[2] > 200);
+
+            assertTrue(sawRed,
+                    "No red frame found in archived video (" + frames.size() + " frames sampled)");
+            assertTrue(sawBlue,
+                    "No blue frame found in archived video (" + frames.size() + " frames sampled)");
+
+        } finally {
+            Files.deleteIfExists(videoFile);
+            Files.walk(frameDir)
+                 .sorted(Comparator.reverseOrder())
+                 .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
         }
     }
 
@@ -153,6 +265,21 @@ class LiveFeedColorTest {
             case "blue" -> avgR < 60  && avgG < 60 && avgB > 200;
             default     -> false;
         };
+    }
+
+    private static double[] averageRgb(BufferedImage img) {
+        long r = 0, g = 0, b = 0;
+        int w = img.getWidth(), h = img.getHeight();
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int px = img.getRGB(x, y);
+                r += (px >> 16) & 0xFF;
+                g += (px >>  8) & 0xFF;
+                b +=  px        & 0xFF;
+            }
+        }
+        long n = (long) w * h;
+        return new double[]{(double) r / n, (double) g / n, (double) b / n};
     }
 
     private static double num(Object v) {

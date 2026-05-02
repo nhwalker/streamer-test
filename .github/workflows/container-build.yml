@@ -330,6 +330,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
             xvfb \
+            ffmpeg \
             google-chrome-stable \
             x11-apps \
             coturn
