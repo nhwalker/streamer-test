@@ -21,8 +21,11 @@ import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import org.junit.jupiter.api.Order;
+
 import static org.junit.jupiter.api.Assertions.*;
 
+@Order(2)
 @DisplayName("Archive endpoint (GET /archive)")
 class ArchiveEndpointTest {
 

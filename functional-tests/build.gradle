@@ -49,6 +49,8 @@ test {
     useJUnitPlatform()
     testLogging {
         events 'passed', 'skipped', 'failed'
+        showStandardStreams = true
+        exceptionFormat = 'full'
     }
     // Keep all test classes in one JVM so the ServiceStack singleton is shared.
     forkEvery = 0

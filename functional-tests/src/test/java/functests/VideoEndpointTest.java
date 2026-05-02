@@ -16,8 +16,11 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 
+import org.junit.jupiter.api.Order;
+
 import static org.junit.jupiter.api.Assertions.*;
 
+@Order(3)
 @DisplayName("Video endpoint (GET /video)")
 class VideoEndpointTest {
 

@@ -17,8 +17,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.junit.jupiter.api.Order;
+
 import static org.junit.jupiter.api.Assertions.*;
 
+@Order(1)
 @DisplayName("Static endpoints (/, /top, /bottom)")
 class StaticEndpointTest {
 

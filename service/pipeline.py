@@ -173,10 +173,12 @@ def main():
     archive.set_property('max-size-time', segment_ns)
 
     # ── Rename completed segments to embed their recording timestamps
-    # format-location-full fires at the start of each new fragment; base_time +
-    # buf.pts gives the wall-clock time of that frame, so end(N) = start(N+1)
-    # in stream time and duration is exact.  The last fragment is renamed on EOS.
-    _fragment_starts = {}  # fragment_id -> start nanoseconds
+    # GStreamer's internal clock and Python's time.time() may use different
+    # reference points (host CLOCK_MONOTONIC vs container-scoped monotonic).
+    # Avoid the mismatch entirely by stamping segments with time.time() at
+    # callback invocation.  The end of one fragment == start of the next
+    # because both reads happen in the same callback call.
+    _fragment_starts = {}  # fragment_id -> start nanoseconds (Unix wall-clock)
 
     def _rename_fragment(frag_id, end_ns):
         if frag_id not in _fragment_starts:
@@ -193,11 +195,7 @@ def main():
                   file=sys.stderr, flush=True)
 
     def _on_format_location_full(_splitmux, fragment_id, first_sample):
-        buf = first_sample.get_buffer()
-        pts = buf.pts
-        now_ns = (pipeline.get_base_time() + pts
-                  if pts != Gst.CLOCK_TIME_NONE
-                  else int(time.time() * 1e9))
+        now_ns = time.time_ns()
         _rename_fragment(fragment_id - 1, now_ns)
         _fragment_starts[fragment_id] = now_ns
         return None
@@ -223,7 +221,15 @@ def main():
     tee.link(q_arch)
     q_arch.link(arch_enc)
     arch_enc.link(arch_h264)
-    arch_h264.link(archive)
+    # Explicitly negotiate AVCC (length-prefixed) format so matroskamux writes
+    # SPS/PPS in CodecPrivate and NALUs as length-prefixed — without this,
+    # some GStreamer versions negotiate byte-stream (Annex B) format, which
+    # lands in an AVCC-container without proper CodecPrivate, breaking ffprobe
+    # and ffmpeg decoding of the archived segments.
+    arch_h264.link_filtered(
+        archive,
+        Gst.Caps.from_string('video/x-h264, stream-format=avc, alignment=au'),
+    )
 
     tee.link(q_webrtc)
     q_webrtc.link(tee_webrtc)
@@ -285,10 +291,7 @@ def main():
             print('[service] EOS received')
             # Rename the last fragment — format-location-full won't fire for it.
             if _fragment_starts:
-                ok, pos = pipeline.query_position(Gst.Format.TIME)
-                end_ns = (pipeline.get_base_time() + pos
-                          if ok and pos != Gst.CLOCK_TIME_NONE
-                          else int(time.time() * 1e9))
+                end_ns = time.time_ns()
                 _rename_fragment(max(_fragment_starts), end_ns)
             loop.quit()
         elif t == Gst.MessageType.ERROR:

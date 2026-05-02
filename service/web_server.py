@@ -154,7 +154,7 @@ def stage_segments(archive_dir, start_ts, end_ts):
         active    = max(unnamed)
         seg_start = renamed[-1][2]
         seg_end   = now
-        if seg_start < end_ts and seg_end > start_ts:
+        if seg_start < end_ts and seg_end > start_ts and seg_end - seg_start >= 1.0:
             prefix = os.path.basename(active).rsplit('-', 1)[0]
             dst = renamed_segment_path(
                 os.path.join(tmp.name, os.path.basename(active)),
