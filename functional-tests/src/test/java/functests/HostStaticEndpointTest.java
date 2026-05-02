@@ -7,14 +7,13 @@ import org.junit.jupiter.api.Order;
 
 import java.time.Duration;
 
-@Order(2)
-@DisplayName("Archive endpoint — caster mode (GET /archive)")
-class ArchiveEndpointTest extends AbstractArchiveEndpointTest {
+@Order(7)
+@DisplayName("Static endpoints — host mode (/, /top, /bottom)")
+class HostStaticEndpointTest extends AbstractStaticEndpointTest {
 
     @BeforeAll
-    static void setup() throws Exception {
-        stack = ServiceStack.getInstance();
-        stack.awaitFirstSegment();
+    static void setup() {
+        stack  = ServiceStack.getHostInstance();
         client = java.net.http.HttpClient.newBuilder()
                                          .connectTimeout(Duration.ofSeconds(10))
                                          .build();

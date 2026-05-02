@@ -18,18 +18,28 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Owns the Xvfb process, caster container, and service container for one test
- * class.  Two usage patterns are supported:
+ * Owns the Xvfb process, optional caster container, and service container for
+ * one test class.  Two modes and two usage patterns are supported:
  *
+ * <h3>Modes</h3>
  * <ul>
- *   <li><b>Singleton</b> — {@link #getInstance()} returns a lazily-created
- *       default instance (20 s archive segments).  Used by the static endpoint
- *       tests which share one stack for the whole suite.</li>
- *   <li><b>Per-class</b> — {@link #create(int)} starts a fresh instance with
- *       a custom {@code archiveSegmentSec}.  The caller is responsible for
- *       calling {@link #stop()} in {@code @AfterAll}.  Call
- *       {@link #closeAndReset()} first to tear down the singleton (if any)
- *       before starting a new instance on the same host ports.</li>
+ *   <li><b>Caster mode</b> — starts a caster container (X11 capture → WebRTC
+ *       producer) and a service container that ingests from it.</li>
+ *   <li><b>Host mode</b> — starts only the service container, which captures
+ *       X11 directly (no caster).  {@code CASTER_HOST} is left unset.</li>
+ * </ul>
+ *
+ * <h3>Usage patterns</h3>
+ * <ul>
+ *   <li><b>Singleton</b> — {@link #getInstance()} / {@link #getHostInstance()}
+ *       return lazily-created instances (20 s archive segments).  Used by the
+ *       endpoint tests which share one stack for the whole suite.</li>
+ *   <li><b>Per-class</b> — {@link #create(int)} / {@link #createHostMode(int)}
+ *       start a fresh instance with a custom {@code archiveSegmentSec}.  The
+ *       caller is responsible for calling {@link #stop()} in {@code @AfterAll}.
+ *       Call {@link #closeAndReset()} first to tear down the caster-mode
+ *       singleton (if any) before starting a new instance on the same host
+ *       ports.</li>
  * </ul>
  *
  * Both containers run with network_mode=host, matching the proven Python test
@@ -58,24 +68,38 @@ public final class ServiceStack {
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
             Pattern.CASE_INSENSITIVE);
 
-    // ── Singleton ─────────────────────────────────────────────────────────────
+    // ── Singletons ────────────────────────────────────────────────────────────
     private static volatile ServiceStack INSTANCE;
+    private static volatile ServiceStack HOST_INSTANCE;
 
+    /** Returns the lazily-created caster-mode singleton (20 s segments). */
     public static ServiceStack getInstance() {
         if (INSTANCE == null) {
             synchronized (ServiceStack.class) {
                 if (INSTANCE == null) {
-                    INSTANCE = new ServiceStack(20);
+                    INSTANCE = new ServiceStack(20, false);
                 }
             }
         }
         return INSTANCE;
     }
 
+    /** Returns the lazily-created host-mode singleton (20 s segments). */
+    public static ServiceStack getHostInstance() {
+        if (HOST_INSTANCE == null) {
+            synchronized (ServiceStack.class) {
+                if (HOST_INSTANCE == null) {
+                    HOST_INSTANCE = new ServiceStack(20, true);
+                }
+            }
+        }
+        return HOST_INSTANCE;
+    }
+
     /**
-     * Stops the singleton (if one exists) and clears the reference so that
-     * {@link #getInstance()} or {@link #create(int)} can start a fresh stack.
-     * Safe to call when no singleton exists.
+     * Stops the caster-mode singleton (if one exists) and clears the reference
+     * so that {@link #getInstance()} or {@link #create(int)} can start a fresh
+     * stack.  Safe to call when no singleton exists.
      */
     public static synchronized void closeAndReset() {
         ServiceStack inst = INSTANCE;
@@ -84,39 +108,67 @@ public final class ServiceStack {
     }
 
     /**
-     * Creates and starts a non-singleton {@link ServiceStack} with the given
-     * archive segment duration.  The caller owns the returned instance and must
-     * call {@link #stop()} when done (typically from {@code @AfterAll}).  A JVM
-     * shutdown hook is also registered as a safety net.
+     * Stops the host-mode singleton (if one exists) and clears the reference.
+     * Safe to call when no singleton exists.
+     */
+    public static synchronized void closeHostAndReset() {
+        ServiceStack inst = HOST_INSTANCE;
+        HOST_INSTANCE = null;
+        if (inst != null) inst.stop();
+    }
+
+    /**
+     * Creates and starts a non-singleton caster-mode {@link ServiceStack} with
+     * the given archive segment duration.  The caller owns the returned instance
+     * and must call {@link #stop()} when done (typically from {@code @AfterAll}).
+     * A JVM shutdown hook is also registered as a safety net.
      */
     public static ServiceStack create(int archiveSegmentSec) {
-        ServiceStack s = new ServiceStack(archiveSegmentSec);
+        ServiceStack s = new ServiceStack(archiveSegmentSec, false);
+        Runtime.getRuntime().addShutdownHook(new Thread(s::stop));
+        return s;
+    }
+
+    /**
+     * Creates and starts a non-singleton host-mode {@link ServiceStack} with
+     * the given archive segment duration.  The caller owns the returned instance
+     * and must call {@link #stop()} when done (typically from {@code @AfterAll}).
+     * A JVM shutdown hook is also registered as a safety net.
+     */
+    public static ServiceStack createHostMode(int archiveSegmentSec) {
+        ServiceStack s = new ServiceStack(archiveSegmentSec, true);
         Runtime.getRuntime().addShutdownHook(new Thread(s::stop));
         return s;
     }
 
     // ── Infrastructure handles ────────────────────────────────────────────────
-    private final Process             xvfbProcess;
-    private final GenericContainer<?> caster;
-    private final GenericContainer<?> service;
-    private final Path                archiveDir;
-    private volatile Process          colorWindow;
-    private final AtomicBoolean       stopped = new AtomicBoolean(false);
+    private final boolean              hostMode;
+    private final Process              xvfbProcess;
+    private final GenericContainer<?>  caster;   // null in host mode
+    private final GenericContainer<?>  service;
+    private final Path                 archiveDir;
+    private volatile Process           colorWindow;
+    private final AtomicBoolean        stopped = new AtomicBoolean(false);
 
     // ── Construction / start ─────────────────────────────────────────────────
     @SuppressWarnings("resource")
-    private ServiceStack(int archiveSegmentSec) {
+    private ServiceStack(int archiveSegmentSec, boolean hostMode) {
+        this.hostMode = hostMode;
         try {
             // 1. Xvfb
             xvfbProcess = startXvfb();
 
-            // 2. Caster
-            caster = buildCaster();
-            caster.start();
-            Thread.sleep(1_000); // let webrtcsink register as producer
+            // 2. Caster (skipped in host mode)
+            if (hostMode) {
+                caster = null;
+            } else {
+                caster = buildCaster();
+                caster.start();
+                Thread.sleep(1_000); // let webrtcsink register as producer
+            }
 
-            // 3. Extract peer ID
-            String peerId = extractCasterPeerId();
+            // 3. Extract peer ID (caster mode only)
+            String peerId = hostMode ? null : extractCasterPeerId();
 
             // 4. Archive dir
             archiveDir = Files.createTempDirectory("service-archive-");
@@ -124,7 +176,9 @@ public final class ServiceStack {
                     PosixFilePermissions.fromString("rwxrwxrwx"));
 
             // 5. Service
-            service = buildService(peerId, archiveSegmentSec);
+            service = hostMode
+                    ? buildServiceHostMode(archiveSegmentSec)
+                    : buildService(peerId, archiveSegmentSec);
             service.start();
 
             // 6. Poll HTTP until ready
@@ -191,7 +245,7 @@ public final class ServiceStack {
                 "Caster logs:\n" + caster.getLogs());
     }
 
-    // ── Service container ─────────────────────────────────────────────────────
+    // ── Service container (caster mode) ──────────────────────────────────────
     @SuppressWarnings("resource")
     private GenericContainer<?> buildService(String peerId, int archiveSegmentSec) {
         GenericContainer<?> c = new GenericContainer<>(SERVICE_IMAGE)
@@ -204,6 +258,32 @@ public final class ServiceStack {
                 .withEnv("ARCHIVE_SEGMENT_SEC", String.valueOf(archiveSegmentSec))
                 .withEnv("ARCHIVE_DIR", "/archive")
                 .withEnv("WEB_PORT", String.valueOf(HTTP_PORT))
+                .withFileSystemBind(archiveDir.toString(), "/archive")
+                .waitingFor(Wait.forLogMessage(".*web server on port.*", 1)
+                        .withStartupTimeout(Duration.ofSeconds(120)));
+        if (!TURN_SERVER.isEmpty()) {
+            c = c.withEnv("GST_WEBRTC_TURN_SERVER", TURN_SERVER);
+        }
+        return c;
+    }
+
+    // ── Service container (host mode — no CASTER_HOST, X11 mounted) ──────────
+    @SuppressWarnings("resource")
+    private GenericContainer<?> buildServiceHostMode(int archiveSegmentSec) {
+        GenericContainer<?> c = new GenericContainer<>(SERVICE_IMAGE)
+                .withNetworkMode("host")
+                .withEnv("DISPLAY", ":99")
+                .withEnv("STREAM_WIDTH", "1280")
+                .withEnv("STREAM_HEIGHT", "720")
+                .withEnv("STREAM_FRAMERATE", "30")
+                .withEnv("SIGNALLING_PORT", String.valueOf(WS_PORT))
+                .withEnv("CROP_HEIGHT", "360")
+                .withEnv("ARCHIVE_SEGMENT_SEC", String.valueOf(archiveSegmentSec))
+                .withEnv("ARCHIVE_DIR", "/archive")
+                .withEnv("WEB_PORT", String.valueOf(HTTP_PORT))
+                .withFileSystemBind("/tmp/.X11-unix", "/tmp/.X11-unix")
+                .withCreateContainerCmdModifier(cmd ->
+                        cmd.getHostConfig().withIpcMode("host"))
                 .withFileSystemBind(archiveDir.toString(), "/archive")
                 .waitingFor(Wait.forLogMessage(".*web server on port.*", 1)
                         .withStartupTimeout(Duration.ofSeconds(120)));
@@ -240,7 +320,9 @@ public final class ServiceStack {
 
         stopColorWindow();
         try { service.stop(); } catch (Exception ignored) {}
-        try { caster.stop();  } catch (Exception ignored) {}
+        if (caster != null) {
+            try { caster.stop(); } catch (Exception ignored) {}
+        }
 
         xvfbProcess.destroy();
         try {
@@ -317,9 +399,10 @@ public final class ServiceStack {
             }
             Thread.sleep(1_000);
         }
+        String casterInfo = caster != null ? "Caster logs:\n" + caster.getLogs() + "\n" : "";
         throw new AssertionError(
                 "No completed segment (*_to_*.mkv) appeared in " + archiveDir + " within 90 s.\n" +
-                "Caster logs:\n" + caster.getLogs() + "\n" +
+                casterInfo +
                 "Service logs:\n" + service.getLogs());
     }
 }
