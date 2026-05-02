@@ -122,6 +122,12 @@
             });
           }
         });
+        pc.addEventListener('datachannel', function (e) {
+          if (e.channel.label !== 'ts') return;
+          e.channel.addEventListener('message', function (m) {
+            try { window._captureMs = JSON.parse(m.data).t; } catch (_) {}
+          });
+        });
         return pc;
       }
       PatchedRPC.prototype = _OrigRPC.prototype;
@@ -168,7 +174,11 @@
         }
         let latSecs = null;
         if (metadata.captureTime != null) {
+          // abs-capture-time RTP extension: true per-frame latency
           latSecs = (now - metadata.captureTime) / 1000;
+        } else if (window._captureMs != null) {
+          // data-channel fallback: ~200 ms granularity, still accurate enough
+          latSecs = (Date.now() - window._captureMs) / 1000;
         }
         document.getElementById('m-fps').textContent = fps != null ? fps.toFixed(1) : '--';
         document.getElementById('m-lat').textContent = latSecs != null ? latSecs.toFixed(3) : '--';
@@ -184,6 +194,7 @@
       }
       _prevFrames = 0;
       _prevFrameTime = 0;
+      window._captureMs = null;
       document.getElementById('m-fps').textContent = '--';
       document.getElementById('m-lat').textContent = '--';
     }

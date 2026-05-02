@@ -42,6 +42,7 @@ Environment variables:
   GST_WEBRTC_STUN_SERVER optional STUN URI                        ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
 """
+import json as _json
 import os
 import signal
 import struct
@@ -306,6 +307,24 @@ def main():
         if STUN:
             sink.set_property('stun-server', STUN)
 
+    # ── Data-channel relay: service → browser ────────────────────────────────
+    # Sends the capture timestamp (ms since Unix epoch) every 200 ms over a
+    # WebRTC data channel named 'ts'.  This is the fallback latency signal used
+    # by the browser when abs-capture-time is not available via requestVideoFrameCallback.
+    _browser_channels = {}
+
+    def _on_browser_consumer_added(_sink, peer_id, webrtcbin):
+        ch = webrtcbin.emit('create-data-channel', 'ts',
+                            Gst.Structure.new_empty('config'))
+        _browser_channels[peer_id] = ch
+
+    def _on_browser_consumer_removed(_sink, peer_id, _webrtcbin):
+        _browser_channels.pop(peer_id, None)
+
+    for _s in (ws_full, ws_top, ws_bot):
+        _s.connect('consumer-added',   _on_browser_consumer_added)
+        _s.connect('consumer-removed', _on_browser_consumer_removed)
+
     # ── Static links: vconvert -> tee -> archive + webrtc branches
     vconvert.link(tee)  # host mode: xsrc→vrate→vscale→vconvert already linked above
 
@@ -428,6 +447,19 @@ def main():
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT,  on_signal)
+
+    def _relay_ts():
+        ns = _capture_state['ns']
+        if _browser_channels and ns:
+            msg = _json.dumps({'t': ns // 1_000_000})
+            for ch in list(_browser_channels.values()):
+                try:
+                    ch.emit('send-string', msg)
+                except Exception:
+                    pass
+        return True  # reschedule
+
+    GLib.timeout_add(200, _relay_ts)
 
     if ARCHIVE_MAX_BYTES or ARCHIVE_MAX_AGE_DAYS:
         purge_archive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES, ARCHIVE_MAX_AGE_DAYS)
