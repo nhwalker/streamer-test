@@ -28,20 +28,29 @@ from dataclasses import dataclass
 from archive_times import parse_segment_times
 
 _DEFAULT_FPS = '25/1'
+_ARCHIVE_BITRATE = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
 
 
 def _detect_encoder_args():
     """Return ffmpeg output-encoder args for the best available video encoder."""
+    bitrate = str(_ARCHIVE_BITRATE)
     try:
         result = subprocess.run(
             ['ffmpeg', '-hide_banner', '-encoders'],
             capture_output=True, text=True, timeout=10,
         )
     except FileNotFoundError:
-        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+        return ['-c:v', 'libx264', '-preset', 'fast',
+                '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k',
+                '-bufsize', f'{_ARCHIVE_BITRATE * 2}k']
     encoders = result.stdout
+    if 'h264_nvenc' in encoders:
+        return ['-c:v', 'h264_nvenc', '-preset', 'p4',
+                '-rc', 'vbr', '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k']
     if 'libx264' in encoders:
-        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+        return ['-c:v', 'libx264', '-preset', 'fast',
+                '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k',
+                '-bufsize', f'{_ARCHIVE_BITRATE * 2}k']
     if 'mpeg4' in encoders:
         return ['-c:v', 'mpeg4', '-q:v', '5']
     return ['-c:v', 'ffv1']
