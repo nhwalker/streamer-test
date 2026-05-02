@@ -227,6 +227,7 @@ public final class ServiceStack {
 
     // ── Public API ────────────────────────────────────────────────────────────
     public String baseUrl()     { return "http://localhost:" + HTTP_PORT; }
+    public String serviceLogs() { return service.getLogs(); }
     public int    wsPort()      { return WS_PORT; }
     public int    wsPortTop()   { return WS_PORT_TOP; }
     public int    wsPortBottom(){ return WS_PORT_BOTTOM; }

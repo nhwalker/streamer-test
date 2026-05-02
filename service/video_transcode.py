@@ -189,4 +189,7 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
 
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
-        raise RuntimeError(f'ffmpeg failed (exit {result.returncode})')
+        stderr = result.stderr.decode('utf-8', errors='replace')[-2000:]
+        raise RuntimeError(
+            f'ffmpeg failed (exit {result.returncode}): {stderr}'
+        )

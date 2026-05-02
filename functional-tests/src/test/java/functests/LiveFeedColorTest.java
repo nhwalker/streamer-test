@@ -250,14 +250,16 @@ class LiveFeedColorTest {
                 if (i < limit - 1) sample.append(", ");
             }
 
+            String svcLogs = stack.serviceLogs();
+            String svcTail = svcLogs.substring(Math.max(0, svcLogs.length() - 3000));
             assertTrue(sawRed,
                     "No predominantly-red frame in archived video. "
                     + "url=" + videoUrl + " frames=" + frames.size()
-                    + " sample=" + sample);
+                    + " sample=" + sample + "\nservice logs (tail):\n" + svcTail);
             assertTrue(sawBlue,
                     "No predominantly-blue frame in archived video. "
                     + "url=" + videoUrl + " frames=" + frames.size()
-                    + " sample=" + sample);
+                    + " sample=" + sample + "\nservice logs (tail):\n" + svcTail);
 
         } finally {
             Files.deleteIfExists(videoFile);

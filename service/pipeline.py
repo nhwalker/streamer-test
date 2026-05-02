@@ -223,7 +223,15 @@ def main():
     tee.link(q_arch)
     q_arch.link(arch_enc)
     arch_enc.link(arch_h264)
-    arch_h264.link(archive)
+    # Explicitly negotiate AVCC (length-prefixed) format so matroskamux writes
+    # SPS/PPS in CodecPrivate and NALUs as length-prefixed — without this,
+    # some GStreamer versions negotiate byte-stream (Annex B) format, which
+    # lands in an AVCC-container without proper CodecPrivate, breaking ffprobe
+    # and ffmpeg decoding of the archived segments.
+    arch_h264.link_filtered(
+        archive,
+        Gst.Caps.from_string('video/x-h264, stream-format=avc, alignment=au'),
+    )
 
     tee.link(q_webrtc)
     q_webrtc.link(tee_webrtc)
