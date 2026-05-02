@@ -84,14 +84,19 @@ def _query_file_info(path):
 
 # ── Timeline builder ──────────────────────────────────────────────────────────
 
-def _build_timeline(stage_dir, start_ts, end_ts):
+def _build_timeline(stage_dir, start_ts, end_ts, _query_info=None):
     """Build an ordered list of TimelineItem covering [start_ts, end_ts].
 
     All files are expected to have timestamps in their names (as produced by
     stage_segments).  Files without a recognized timestamp pattern are skipped.
+    Files that ffprobe cannot decode (e.g. an in-progress active segment with
+    only an EBML header and no frames yet) are also skipped so that ffmpeg
+    does not receive an unreadable input.
 
     Returns [] when no segments overlap (pure color output).
     """
+    if _query_info is None:
+        _query_info = _query_file_info
     timeline = []
     for fname in os.listdir(stage_dir):
         if not fname.endswith('.mkv'):
@@ -102,9 +107,13 @@ def _build_timeline(stage_dir, start_ts, end_ts):
         seg_start, seg_end = times
         if seg_start >= end_ts or seg_end <= start_ts:
             continue
+        fpath = os.path.join(stage_dir, fname)
+        _, w, h, _ = _query_info(fpath)
+        if w == 0 or h == 0:
+            continue  # unreadable or header-only segment — skip
         clip_start = max(seg_start, start_ts)
         timeline.append(TimelineItem(
-            path           = os.path.join(stage_dir, fname),
+            path           = fpath,
             offset_s       = clip_start - seg_start,
             output_start_s = clip_start - start_ts,
         ))
@@ -128,7 +137,7 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
     if _query_info is None:
         _query_info = _query_file_info
 
-    timeline = _build_timeline(stage_dir, start_ts, end_ts)
+    timeline = _build_timeline(stage_dir, start_ts, end_ts, _query_info)
 
     width, height, fps_str = default_width, default_height, _DEFAULT_FPS
     for item in timeline:
