@@ -115,6 +115,12 @@
             });
           }
         });
+        pc.addEventListener('datachannel', function (e) {
+          if (e.channel.label !== 'ts') return;
+          e.channel.addEventListener('message', function (m) {
+            try { window._captureMs = JSON.parse(m.data).t; } catch (_) {}
+          });
+        });
         return pc;
       }
       PatchedRPC.prototype = _OrigRPC.prototype;
@@ -158,7 +164,7 @@
         }
         try {
           const stats = await pc.getStats();
-          let fps = null, latMs = null;
+          let fps = null;
           stats.forEach(r => {
             if (r.type === 'inbound-rtp' && r.kind === 'video') {
               if (r.framesPerSecond != null) {
@@ -169,18 +175,12 @@
                 _prevFrames = r.framesDecoded;
                 _prevFrameTime = r.timestamp;
               }
-              if (latMs === null && r.jitterBufferDelay != null && r.jitterBufferEmittedCount > 0) {
-                latMs = (r.jitterBufferDelay / r.jitterBufferEmittedCount) * 1000;
-              }
-            }
-            // RTCP round-trip time: prefer half-RTT as a one-way latency estimate
-            if (r.type === 'remote-inbound-rtp' && r.kind === 'video' && r.roundTripTime != null) {
-              latMs = r.roundTripTime * 500;
             }
           });
+          const latMs = window._captureMs != null ? Date.now() - window._captureMs : null;
           document.getElementById('m-fps').textContent = fps != null ? fps.toFixed(1) : '--';
           document.getElementById('m-lat').textContent = latMs != null ? `${Math.round(latMs)} ms` : '--';
-          metrics.classList.remove('hidden');
+          if (latMs != null) metrics.classList.remove('hidden');
         } catch (_) {}
       }, 1000);
     }
@@ -189,6 +189,7 @@
       clearInterval(_metricsTimer);
       _metricsTimer = null;
       metrics.classList.add('hidden');
+      window._captureMs = null;
     }
 
     setStatus(`Connecting to ${sigUrl} …`);

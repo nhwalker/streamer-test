@@ -42,6 +42,7 @@ Environment variables:
   GST_WEBRTC_STUN_SERVER optional STUN URI                        ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
 """
+import json as _json
 import os
 import signal
 import sys
@@ -195,6 +196,36 @@ def main():
         wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
         wsrc.get_property('signaller').set_property('producer-peer-id', CASTER_PEER_ID)
 
+    # ── Capture timestamp: probe (host mode) or relay from caster (caster mode)
+    _capture_ms = 0
+
+    if HOST_MODE:
+        def _on_capture_buffer(_pad, _info):
+            nonlocal _capture_ms
+            _capture_ms = time.time_ns() // 1_000_000
+            return Gst.PadProbeReturn.OK
+
+        vconvert.get_static_pad('sink').add_probe(
+            Gst.PadProbeType.BUFFER, _on_capture_buffer)
+    else:
+        def _on_caster_ts(_channel, msg):
+            nonlocal _capture_ms
+            try:
+                _capture_ms = _json.loads(msg)['t']
+            except Exception:
+                pass
+
+        def _on_wsrc_dc(_wb, channel):
+            if channel.get_property('label') == 'ts':
+                channel.connect('on-message-string', _on_caster_ts)
+
+        def _on_wsrc_element_added(_bin, _sub_bin, element):
+            factory = element.get_factory()
+            if factory and factory.get_name() == 'webrtcbin':
+                element.connect('on-data-channel', _on_wsrc_dc)
+
+        wsrc.connect('deep-element-added', _on_wsrc_element_added)
+
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
     # independently decodable without seeking to the start.
@@ -313,6 +344,21 @@ def main():
 
         pipeline.connect('deep-element-added', on_deep_element_added)
 
+    # ── Data channels: relay capture timestamp to each browser peer ──────────
+    _browser_channels = {}  # peer_id -> GstWebRTCDataChannel
+
+    def _on_browser_consumer_added(_sink, peer_id, webrtcbin):
+        ch = webrtcbin.emit('create-data-channel', 'ts',
+                            Gst.Structure.new_empty('config'))
+        _browser_channels[peer_id] = ch
+
+    def _on_browser_consumer_removed(_sink, peer_id, _webrtcbin):
+        _browser_channels.pop(peer_id, None)
+
+    for _sink in (ws_full, ws_top, ws_bot):
+        _sink.connect('consumer-added',   _on_browser_consumer_added)
+        _sink.connect('consumer-removed', _on_browser_consumer_removed)
+
     loop = GLib.MainLoop()
     bus  = pipeline.get_bus()
     bus.add_signal_watch()
@@ -352,6 +398,18 @@ def main():
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT,  on_signal)
+
+    def _relay_ts():
+        if _browser_channels and _capture_ms:
+            msg = _json.dumps({'t': _capture_ms})
+            for ch in list(_browser_channels.values()):
+                try:
+                    ch.emit('send-string', msg)
+                except Exception:
+                    pass
+        return True  # reschedule
+
+    GLib.timeout_add(200, _relay_ts)
 
     if ARCHIVE_MAX_BYTES or ARCHIVE_MAX_AGE_DAYS:
         purge_archive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES, ARCHIVE_MAX_AGE_DAYS)

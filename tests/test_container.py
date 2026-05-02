@@ -13,10 +13,15 @@ Level 2 (TestWebRTCStream): drives a headless Chrome browser to load the
 """
 import asyncio
 import re
+import time
 
 import pytest
 import requests
 import websockets
+
+# Maximum acceptable end-to-end capture→render latency in milliseconds.
+# Increase if running on very slow CI hardware.
+MAX_LATENCY_MS = 1000
 
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -327,6 +332,28 @@ class TestWebRTCStream:
                 f"from the red Xvfb root. Last sample: {last_stats}"
             )
 
+    def test_latency(self, streaming_container, _caster, _service, browser, turn_params):
+        """
+        Verify end-to-end capture→render latency is below MAX_LATENCY_MS.
+
+        The service embeds a capture timestamp in every video frame via a WebRTC
+        data channel.  The browser stores the most recent timestamp in
+        window._captureMs.  Latency = Date.now() - window._captureMs measures
+        the full wall-clock delta from screen capture to the JS measurement point.
+
+        Both containers and Chrome run on the same host (host-network mode) so
+        their clocks are identical — no NTP skew between machines.
+        """
+        http_port, ws_port = streaming_container
+        _wait_for_playing(browser, http_port, ws_port, turn_params)
+        _wait_for_capture_ts(browser)
+        latency = browser.execute_script(
+            "return Date.now() - (window._captureMs || 0);"
+        )
+        assert latency < MAX_LATENCY_MS, (
+            f"End-to-end latency {latency} ms exceeds threshold {MAX_LATENCY_MS} ms"
+        )
+
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -391,6 +418,17 @@ def _capture_frame(browser):
 
     WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(frame_ready)
     return last
+
+
+def _wait_for_capture_ts(driver, timeout=30):
+    """Poll until the data channel has delivered a capture timestamp."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ts = driver.execute_script("return window._captureMs || null;")
+        if ts is not None:
+            return int(ts)
+        time.sleep(0.5)
+    pytest.fail(f"Data-channel timestamp not received within {timeout}s")
 
 
 # ── Level 3: split-stream playback + dimensions ───────────────────────────────
