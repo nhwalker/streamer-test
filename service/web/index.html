@@ -39,14 +39,11 @@
       background: #000;
     }
   </style>
-</head>
-<body>
-  <p id="status">Connecting to signalling server…</p>
-  <video id="stream" autoplay playsinline muted></video>
 
   <!--
-    The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
-    so it must be loaded as a classic script before the inline script runs.
+    gstwebrtc-api 0.12.x reads window.gstWebRTCConfig on load (not a constructor).
+    Compute signalling URL and ICE servers from query params here, before the
+    script tag, so the singleton picks them up at initialisation time.
 
     Query parameters:
       ?signalling=ws://host:8443   Override the signalling server URL.
@@ -54,9 +51,36 @@
                                      /        -> ws://<hostname>:8443  (full stream)
                                      /top     -> ws://<hostname>:8444  (top half)
                                      /bottom  -> ws://<hostname>:8445  (bottom half)
-      ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
-                                     browser and container are on different hosts.
+      ?stun=stun.l.google.com:19302  Add a STUN server.
+      ?turn_uri / ?turn_user / ?turn_cred  Add a TURN server.
   -->
+  <script>
+    (function () {
+      var params   = new URLSearchParams(window.location.search);
+      var path     = window.location.pathname.replace(/\/$/, '');
+      var sigPort  = path === '/top' ? 8444 : path === '/bottom' ? 8445 : 8443;
+      var sigUrl   = params.get('signalling') ||
+                     ('ws://' + window.location.hostname + ':' + sigPort);
+      var stunUrl  = params.get('stun');
+      var turnUri  = params.get('turn_uri');
+      var turnUser = params.get('turn_user');
+      var turnCred = params.get('turn_cred');
+
+      var iceServers = [];
+      if (stunUrl) iceServers.push({ urls: 'stun:' + stunUrl });
+      if (turnUri) iceServers.push({
+        urls: turnUri,
+        username: turnUser || undefined,
+        credential: turnCred || undefined,
+      });
+
+      window.gstWebRTCConfig = {
+        signalingServerUrl: sigUrl,
+        webrtcConfig: iceServers.length > 0 ? { iceServers: iceServers } : undefined,
+      };
+    })();
+  </script>
+
   <!--
     GStreamer's webrtcbin uses ssrc-level MSID (a=ssrc:... msid:...) rather than
     the Unified-Plan m-line-level attribute (a=msid:).  Chrome's Unified-Plan
@@ -80,9 +104,7 @@
             ? e.streams[0]
             : new MediaStream([e.track]);
           // Chrome's autoplay policy rejects play() without a user gesture
-          // unless the element is muted.  The stream has no audio track so
-          // muting is harmless; belt-and-suspenders in case the attribute
-          // was stripped or overridden.
+          // unless the element is muted.
           vid.muted = true;
           var p = vid.play();
           if (p && typeof p.catch === 'function') {
@@ -97,71 +119,62 @@
       window.RTCPeerConnection = PatchedRPC;
     })();
   </script>
+
   <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
+</head>
+<body>
+  <p id="status">Connecting to signalling server…</p>
+  <video id="stream" autoplay playsinline muted></video>
+
   <script>
-    const params   = new URLSearchParams(window.location.search);
-    const path     = window.location.pathname.replace(/\/$/, '');
-    const sigPort  = path === '/top' ? 8444 : path === '/bottom' ? 8445 : 8443;
-    const sigUrl   = params.get('signalling') ??
-                     `ws://${window.location.hostname}:${sigPort}`;
-    const stunUrl  = params.get('stun');
-    const turnUri  = params.get('turn_uri');
-    const turnUser = params.get('turn_user');
-    const turnCred = params.get('turn_cred');
+    var video  = document.getElementById('stream');
+    var status = document.getElementById('status');
+    var sigUrl = window.gstWebRTCConfig.signalingServerUrl;
 
-    const video  = document.getElementById('stream');
-    const status = document.getElementById('status');
-
-    const setStatus = (msg, isError = false) => {
+    var setStatus = function (msg, isError) {
       status.textContent = msg;
       status.className   = isError ? 'error' : '';
     };
 
-    setStatus(`Connecting to ${sigUrl} …`);
+    setStatus('Connecting to ' + sigUrl + ' …');
 
-    const iceServers = [];
-    if (stunUrl) iceServers.push({ urls: `stun:${stunUrl}` });
-    if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
-
-    const api = new GstWebRTCAPI({
-      signalingServerUrl: sigUrl,
-      // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
-      webrtcConfig: { iceServers },
-    });
+    // gstwebrtc-api 0.12.x exposes a singleton, not a constructor.
+    var api = window.gstWebRTCAPI;
 
     api.registerProducersListener({
-      producerAdded(producer) {
-        setStatus(`Producer found (${producer.id}) — starting stream…`);
+      producerAdded: function (producer) {
+        setStatus('Producer found (' + producer.id + ') — starting stream…');
 
-        const session = api.createConsumerSession(producer.id);
+        var session = api.createConsumerSession(producer.id);
         if (!session) {
           setStatus('Failed to create consumer session.', true);
           return;
         }
 
-        session.element = video;
-
-        session.addEventListener('error', (e) => {
-          setStatus(`Stream error: ${e.message ?? e}`, true);
+        session.addEventListener('error', function (e) {
+          setStatus('Stream error: ' + (e.message || e), true);
         });
 
-        session.addEventListener('closed', () => {
-          setStatus('Stream ended.');
-          video.srcObject = null;
+        session.addEventListener('stateChanged', function () {
+          var s = session.state;
+          if (s === 'stopped' || s === 'closed' || s === null) {
+            setStatus('Stream ended.');
+            video.srcObject = null;
+          }
         });
 
-        const hideBanner = () => { status.className = 'hidden'; };
+        var hideBanner = function () { status.className = 'hidden'; };
         if (!video.paused && video.videoWidth > 0) {
           hideBanner();
         } else {
-          video.addEventListener('playing', hideBanner, { once: true });
+          video.addEventListener('playing',    hideBanner, { once: true });
           video.addEventListener('loadeddata', hideBanner, { once: true });
         }
 
         session.connect();
       },
 
-      producerRemoved(_producer) {
+      producerRemoved: function (_producer) {
         setStatus('Producer disconnected. Waiting for stream…');
         video.srcObject = null;
       },

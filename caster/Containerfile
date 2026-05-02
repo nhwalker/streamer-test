@@ -3,33 +3,33 @@
 FROM streamer-base:latest AS base
 
 # ─── Runtime Stage ───────────────────────────────────────────────────────────
-FROM registry.access.redhat.com/ubi10/ubi:latest
+FROM registry.access.redhat.com/ubi9/ubi:latest
 
-# ── Repos: Rocky 10 + EPEL10 + RPM Fusion Free (for x264enc) ────────────────
+# ── Repos: Rocky 9 + EPEL9 + RPM Fusion Free (for x264enc) ────────────────
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
-    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
     && printf '%s\n' \
-        '[rocky10-baseos]' \
-        'name=Rocky Linux 10 - BaseOS' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        '[rocky9-baseos]' \
+        'name=Rocky Linux 9 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-appstream]' \
-        'name=Rocky Linux 10 - AppStream' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        '[rocky9-appstream]' \
+        'name=Rocky Linux 9 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
-        > /etc/yum.repos.d/rocky10-supplement.repo \
+        > /etc/yum.repos.d/rocky9-supplement.repo \
     && dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
-        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm \
     && dnf clean all
 
 # ── GStreamer runtime packages ──────────────────────────────────────────────
@@ -67,7 +67,7 @@ COPY --from=base /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
 
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
 
-# ── Replace RHEL10's webrtcbin/dtls/sctp/srtp with our libsrtp2+libnice build ─
+# ── Replace RHEL9's webrtcbin/dtls/sctp/srtp with our libsrtp2+libnice build ─
 COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
 COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so   /usr/lib64/gstreamer-1.0/libgstdtls.so
 COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so   /usr/lib64/gstreamer-1.0/libgstsctp.so
@@ -75,6 +75,9 @@ COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so   /usr/lib64/g
 COPY --from=base /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so*     /usr/lib64/
 COPY --from=base /opt/gst-nvcodec/lib/libgstwebrtcnice-1.0.so* /usr/lib64/
 COPY --from=base /opt/gst-nvcodec/lib/libgstsctp-1.0.so*       /usr/lib64/
+# libgstwebrtcnice was linked against libnice 0.1.21 (built from source in base);
+# overwrite EPEL9's 0.1.19 so nice_candidate_stun_server_address resolves at runtime.
+COPY --from=base /usr/lib64/libnice.so* /usr/lib64/
 RUN ldconfig
 
 # ── Signalling server binary (caster runs its own for the service to connect) ─

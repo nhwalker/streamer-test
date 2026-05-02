@@ -1,6 +1,6 @@
 # X11 Desktop Streaming via WebRTC
 
-Streams a Linux desktop (X11) to any modern web browser in real time, with sub-second latency and efficient video compression. Packaged as a single container image based on Red Hat UBI 10.
+Streams a Linux desktop (X11) to any modern web browser in real time, with sub-second latency and efficient video compression. Packaged as a single container image based on Red Hat UBI 9.
 
 ---
 
@@ -91,9 +91,9 @@ Before two WebRTC peers can exchange video, they need to exchange a small amount
 
 The signalling server (`gst-webrtc-signalling-server`) is a lightweight WebSocket server that acts as a message broker for this exchange. It does **not** carry video — only the setup handshake. Once the peers are connected, the server plays no further role.
 
-### UBI 10 (Universal Base Image)
+### UBI 9 (Universal Base Image)
 
-Red Hat's UBI 10 is a freely redistributable container base image derived from Red Hat Enterprise Linux 10. It provides a stable, enterprise-grade foundation with a consistent package set and long-term security support — suitable for production deployments. RHEL 10 ships GStreamer 1.24.x, which drives the version pinning for the Rust plugins described in the [Build process](#build-process) section.
+Red Hat's UBI 9 is a freely redistributable container base image derived from Red Hat Enterprise Linux 9. It provides a stable, enterprise-grade foundation with a consistent package set and long-term security support — suitable for production deployments. RHEL 9 ships GStreamer 1.22.x, which drives the version pinning for the Rust plugins described in the [Build process](#build-process) section.
 
 ---
 
@@ -109,7 +109,7 @@ graph TD
         X11 -->|"exposes"| sock
     end
 
-    subgraph container["Docker Container (UBI 10)"]
+    subgraph container["Docker Container (UBI 9)"]
         direction TB
         gst["GStreamer Pipeline\nximagesrc → encode → webrtcsink"]
         sig["Signalling Server\ngst-webrtc-signalling-server\nws://0.0.0.0:8443"]
@@ -233,12 +233,12 @@ The container uses a two-stage build to keep the final image small. The build st
 
 ```mermaid
 flowchart TD
-    subgraph build["Build Stage (UBI 10 + Rust + Meson + Node.js)"]
+    subgraph build["Build Stage (UBI 9 + Rust + Meson + Node.js)"]
         direction TB
-        A["A: Install OS build deps\n(GStreamer 1.24 devel, meson, cmake,\nnpm, libsrtp-devel, libnice-devel)"]
-        A2["A2: Build usrsctp from source\n(cmake — not packaged in RHEL10/EPEL10)\n→ static lib linked into libgstsctp-1.0.so"]
+        A["A: Install OS build deps\n(GStreamer 1.22 devel, meson, cmake,\nnpm, libsrtp-devel, libnice-devel)"]
+        A2["A2: Build usrsctp from source\n(cmake — not packaged in RHEL9/EPEL9)\n→ static lib linked into libgstsctp-1.0.so"]
         B["B: Install Rust toolchain\n(rustup stable + cargo-c)"]
-        C["C: Clone + prefetch gst-plugins-rs @ 0.13.3\n(cargo fetch)"]
+        C["C: Clone + prefetch gst-plugins-rs @ 0.12.7\n(cargo fetch)"]
         D["D: Build all Rust plugins\n(cargo cinstall each cdylib)\n→ /opt/gst-rs/lib/gstreamer-1.0/*.so"]
         E["E: Build signalling server\n(cargo build --bin gst-webrtc-signalling-server)\n→ /opt/gst-webrtc-signalling-server"]
         F["F: Build gstwebrtc-api JS bundle\n(npm install && npm run build)\n→ /opt/gstwebrtc-api/"]
@@ -251,11 +251,11 @@ flowchart TD
         A --> G
     end
 
-    subgraph runtime["Runtime Stage (UBI 10)"]
+    subgraph runtime["Runtime Stage (UBI 9)"]
         direction TB
         H["Install system GStreamer packages\n(plugins-good, plugins-bad-free,\nlibnice, libnice-gstreamer1, libsrtp)"]
         I["COPY Rust plugins + nvcodec\n→ /usr/local/lib/gstreamer-1.0/\n(new — no system equivalent)"]
-        J["REPLACE system webrtcbin/dtls/sctp/srtp\n→ /usr/lib64/gstreamer-1.0/\n(overwrites broken RHEL10 builds)"]
+        J["REPLACE system webrtcbin/dtls/sctp/srtp\n→ /usr/lib64/gstreamer-1.0/\n(overwrites broken RHEL9 builds)"]
         K["COPY signalling server binary\n→ /usr/local/bin/"]
         L["COPY gstwebrtc-api + index.html\n→ /var/www/html/"]
         M["COPY entrypoint.sh + pipeline.py\n→ /usr/local/bin/"]
@@ -277,19 +277,19 @@ Four distinct components require source builds; the reasons are different in eac
 | Component | Why not use a package? |
 |---|---|
 | **gst-plugins-rs** (webrtcsink + all Rust plugins) | Never packaged for RHEL. No EPEL or Rocky equivalent exists. |
-| **usrsctp** | Not packaged in EPEL10 or Rocky 10. Required by GStreamer's SCTP plugin for WebRTC data channels. |
-| **GStreamer nvcodec** | NVIDIA hardware encoders are not included in any RHEL10 package. |
-| **GStreamer webrtcbin, dtls, sctp, srtp** | RHEL10's `gstreamer1-plugins-bad-free` is compiled **without libsrtp2** — DTLS-SRTP negotiation silently fails, making the packaged webrtcbin non-functional for WebRTC. |
+| **usrsctp** | Not packaged in EPEL9 or Rocky 9. Required by GStreamer's SCTP plugin for WebRTC data channels. |
+| **GStreamer nvcodec** | NVIDIA hardware encoders are not included in any RHEL9 package. |
+| **GStreamer webrtcbin, dtls, sctp, srtp** | RHEL9's `gstreamer1-plugins-bad-free` is compiled **without libsrtp2** — DTLS-SRTP negotiation silently fails, making the packaged webrtcbin non-functional for WebRTC. |
 
-**The webrtcbin problem in detail.** Red Hat builds `gstreamer1-plugins-bad-free` without `libsrtp2` because libsrtp is absent from RHEL10's base repositories (it lives in EPEL10, which Red Hat does not depend on during package builds). Without SRTP support, webrtcbin cannot complete DTLS negotiation — every incoming WebRTC session is silently dropped. The pipeline starts and appears healthy but no browser ever receives a frame. Building webrtcbin from the GStreamer monorepo source with `-Dsrtp=enabled -Ddtls=enabled -Dsctp=enabled` (and usrsctp statically linked in via the preceding cmake step) produces a fully functional WebRTC stack. The resulting `.so` files are copied over their system counterparts in `/usr/lib64/gstreamer-1.0/`, along with the rebuilt `libgstwebrtc-1.0.so` and `libgstwebrtcnice-1.0.so` companion libraries that the RHEL10 package omits entirely (it was built without libnice).
+**The webrtcbin problem in detail.** Red Hat builds `gstreamer1-plugins-bad-free` without `libsrtp2` because libsrtp is absent from RHEL9's base repositories (it lives in EPEL9, which Red Hat does not depend on during package builds). Without SRTP support, webrtcbin cannot complete DTLS negotiation — every incoming WebRTC session is silently dropped. The pipeline starts and appears healthy but no browser ever receives a frame. Building webrtcbin from the GStreamer monorepo source with `-Dsrtp=enabled -Ddtls=enabled -Dsctp=enabled` (and usrsctp statically linked in via the preceding cmake step) produces a fully functional WebRTC stack. The resulting `.so` files are copied over their system counterparts in `/usr/lib64/gstreamer-1.0/`, along with the rebuilt `libgstwebrtc-1.0.so` and `libgstwebrtcnice-1.0.so` companion libraries that the RHEL9 package omits entirely (it was built without libnice).
 
-**usrsctp.** The user-space SCTP library is the SCTP implementation GStreamer's data-channel code links against. It is absent from both EPEL10 and Rocky 10. Building it as a static library (`-Dsctp_build_shared_lib=OFF`) means the rebuilt `libgstsctp-1.0.so` bundles everything it needs with no new runtime dependency.
+**usrsctp.** The user-space SCTP library is the SCTP implementation GStreamer's data-channel code links against. It is absent from both EPEL9 and Rocky 9. Building it as a static library (`-Dsctp_build_shared_lib=OFF`) means the rebuilt `libgstsctp-1.0.so` bundles everything it needs with no new runtime dependency.
 
-**gst-plugins-rs.** The `webrtcsink` element and the WebSocket signalling server both live here. The Rust toolchain makes the build straightforward: `cargo cinstall` compiles every `cdylib` target in the workspace and drops the resulting `.so` files into the GStreamer plugin search path. Plugins whose native library dependencies are unavailable in RHEL10 (e.g. `gst-plugin-csound`) are silently skipped by the build loop without failing the overall build.
+**gst-plugins-rs.** The `webrtcsink` element and the WebSocket signalling server both live here. The Rust toolchain makes the build straightforward: `cargo cinstall` compiles every `cdylib` target in the workspace and drops the resulting `.so` files into the GStreamer plugin search path. Plugins whose native library dependencies are unavailable in RHEL9 (e.g. `gst-plugin-csound`) are silently skipped by the build loop without failing the overall build.
 
-### Why pin to gst-plugins-rs 0.13.3?
+### Why pin to gst-plugins-rs 0.12.7?
 
-The Rust GStreamer bindings (`gstreamer-rs`) must match the C GStreamer version on the system. RHEL10/UBI10 ships GStreamer 1.24.x. `gst-plugins-rs` 0.13.x targets `gstreamer-rs 0.23`, which requires GStreamer ≥ 1.24 — a precise match. The tag is set via the `GST_PLUGINS_RS_TAG` build argument; bump it to `0.14.x` once RHEL10 ships GStreamer ≥ 1.26.
+The Rust GStreamer bindings (`gstreamer-rs`) must match the C GStreamer version on the system. RHEL9/UBI9 ships GStreamer 1.22.x. `gst-plugins-rs` 0.12.x targets `gstreamer-rs 0.22`, which requires GStreamer ≥ 1.22 — a precise match. The tag is set via the `GST_PLUGINS_RS_TAG` build argument; bump it to `0.13.x` once RHEL9 ships GStreamer ≥ 1.24.
 
 The GStreamer monorepo is cloned at the exact version reported by `pkg-config --modversion gstreamer-1.0` in the builder, so the rebuilt plugins are always ABI-compatible with the system GStreamer libraries.
 
