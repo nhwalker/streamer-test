@@ -141,11 +141,19 @@ class LiveFeedColorTest {
             Allure.<Void>step("Flip " + flipNum + ": desktop → " + colorName, () -> {
                 stack.setDesktopColor(hexColor);
                 awaitColor(colorName, 3_000);
+                // Hold the color for at least 1.5 s after detection so the
+                // archive encoder (key-int-max=30, ~1 keyframe/s) captures
+                // each color in a sealed MKV cluster.
+                Thread.sleep(1_500);
                 return null;
             });
         }
 
-        flipEndEpoch = Instant.now().getEpochSecond() + 2;
+        // Final post-flip hold: keep desktop red for an additional 3 s so the
+        // archive has solid red trailing the flip sequence.
+        Thread.sleep(3_000);
+
+        flipEndEpoch = Instant.now().getEpochSecond();
     }
 
     // ── Test 2: archived video color check ────────────────────────────────────
@@ -161,16 +169,18 @@ class LiveFeedColorTest {
 
         // Wait for the GStreamer pipeline to flush and seal the current MKV cluster.
         // x264enc writes keyframes every ~1 s (key-int-max=30); matroskamux seals a
-        // cluster on each keyframe. Without this sleep the in-progress cluster that
-        // holds the most-recent blue frames may not yet be written to disk.
+        // cluster on each keyframe. Without this sleep the in-progress cluster
+        // holding the most-recent frames may not yet be on disk.
         Thread.sleep(5_000);
 
-        // Request the video clip covering the flip window (generous +10 s buffer).
+        // Request the video clip covering the flip window. flipEndEpoch was set
+        // after a 3 s solid-red hold, so end=flipEndEpoch is guaranteed to be
+        // inside the post-flip red period.
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
         String videoUrl = stack.baseUrl()
-                + "/video?start=" + flipStartEpoch + "&end=" + (flipEndEpoch + 10);
+                + "/video?start=" + flipStartEpoch + "&end=" + flipEndEpoch;
         HttpResponse<byte[]> resp = httpClient.send(
                 HttpRequest.newBuilder(URI.create(videoUrl))
                            .GET()
@@ -223,14 +233,18 @@ class LiveFeedColorTest {
             assertFalse(frames.isEmpty(),
                     "ffmpeg produced no PNG frames from the video clip");
 
-            boolean sawRed  = frames.stream()
-                    .anyMatch(rgb -> rgb[0] > 200 && rgb[1] < 60 && rgb[2] < 60);
-            boolean sawBlue = frames.stream()
-                    .anyMatch(rgb -> rgb[0] < 60  && rgb[1] < 60 && rgb[2] > 200);
+            // Predominantly-red: red is at least 2× both green and blue,
+            // and at least 100/255 in absolute terms. Loose enough to tolerate
+            // YUV→RGB rounding, motion blur on the X11 buffer, and h264
+            // chroma-subsampling. Same shape for blue.
+            boolean sawRed  = frames.stream().anyMatch(rgb ->
+                    rgb[0] >= 100 && rgb[0] >= 2 * rgb[1] && rgb[0] >= 2 * rgb[2]);
+            boolean sawBlue = frames.stream().anyMatch(rgb ->
+                    rgb[2] >= 100 && rgb[2] >= 2 * rgb[0] && rgb[2] >= 2 * rgb[1]);
 
-            // Build a compact sample of the first 40 frames for failure messages.
+            // Build a compact sample of the first 60 frames for failure messages.
             StringBuilder sample = new StringBuilder();
-            int limit = Math.min(40, frames.size());
+            int limit = Math.min(60, frames.size());
             for (int i = 0; i < limit; i++) {
                 double[] f = frames.get(i);
                 sample.append(String.format("[%.0f,%.0f,%.0f]", f[0], f[1], f[2]));
@@ -238,11 +252,11 @@ class LiveFeedColorTest {
             }
 
             assertTrue(sawRed,
-                    "No red frame (R>200,G<60,B<60) in archived video. "
+                    "No predominantly-red frame in archived video. "
                     + "url=" + videoUrl + " frames=" + frames.size()
                     + " sample=" + sample);
             assertTrue(sawBlue,
-                    "No blue frame (R<60,G<60,B>200) in archived video. "
+                    "No predominantly-blue frame in archived video. "
                     + "url=" + videoUrl + " frames=" + frames.size()
                     + " sample=" + sample);
 
