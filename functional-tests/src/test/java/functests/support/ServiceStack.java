@@ -13,14 +13,24 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Singleton that owns the Xvfb process, caster container, and service container
- * for the duration of the test run. Call {@link #getInstance()} from each test
- * class's {@code @BeforeAll}; the stack is started exactly once and torn down
- * via a JVM shutdown hook.
+ * Owns the Xvfb process, caster container, and service container for one test
+ * class.  Two usage patterns are supported:
+ *
+ * <ul>
+ *   <li><b>Singleton</b> — {@link #getInstance()} returns a lazily-created
+ *       default instance (20 s archive segments).  Used by the static endpoint
+ *       tests which share one stack for the whole suite.</li>
+ *   <li><b>Per-class</b> — {@link #create(int)} starts a fresh instance with
+ *       a custom {@code archiveSegmentSec}.  The caller is responsible for
+ *       calling {@link #stop()} in {@code @AfterAll}.  Call
+ *       {@link #closeAndReset()} first to tear down the singleton (if any)
+ *       before starting a new instance on the same host ports.</li>
+ * </ul>
  *
  * Both containers run with network_mode=host, matching the proven Python test
  * setup. The caster's signalling server uses port 8448 to avoid colliding with
@@ -55,11 +65,34 @@ public final class ServiceStack {
         if (INSTANCE == null) {
             synchronized (ServiceStack.class) {
                 if (INSTANCE == null) {
-                    INSTANCE = new ServiceStack();
+                    INSTANCE = new ServiceStack(20);
                 }
             }
         }
         return INSTANCE;
+    }
+
+    /**
+     * Stops the singleton (if one exists) and clears the reference so that
+     * {@link #getInstance()} or {@link #create(int)} can start a fresh stack.
+     * Safe to call when no singleton exists.
+     */
+    public static synchronized void closeAndReset() {
+        ServiceStack inst = INSTANCE;
+        INSTANCE = null;
+        if (inst != null) inst.stop();
+    }
+
+    /**
+     * Creates and starts a non-singleton {@link ServiceStack} with the given
+     * archive segment duration.  The caller owns the returned instance and must
+     * call {@link #stop()} when done (typically from {@code @AfterAll}).  A JVM
+     * shutdown hook is also registered as a safety net.
+     */
+    public static ServiceStack create(int archiveSegmentSec) {
+        ServiceStack s = new ServiceStack(archiveSegmentSec);
+        Runtime.getRuntime().addShutdownHook(new Thread(s::stop));
+        return s;
     }
 
     // ── Infrastructure handles ────────────────────────────────────────────────
@@ -68,10 +101,11 @@ public final class ServiceStack {
     private final GenericContainer<?> service;
     private final Path                archiveDir;
     private volatile Process          colorWindow;
+    private final AtomicBoolean       stopped = new AtomicBoolean(false);
 
     // ── Construction / start ─────────────────────────────────────────────────
     @SuppressWarnings("resource")
-    private ServiceStack() {
+    private ServiceStack(int archiveSegmentSec) {
         try {
             // 1. Xvfb
             xvfbProcess = startXvfb();
@@ -90,14 +124,11 @@ public final class ServiceStack {
                     PosixFilePermissions.fromString("rwxrwxrwx"));
 
             // 5. Service
-            service = buildService(peerId);
+            service = buildService(peerId, archiveSegmentSec);
             service.start();
 
             // 6. Poll HTTP until ready
             awaitHttpReady();
-
-            // 7. Shutdown hook
-            Runtime.getRuntime().addShutdownHook(new Thread(this::stop));
 
         } catch (Exception e) {
             throw new IllegalStateException("ServiceStack failed to start", e);
@@ -162,7 +193,7 @@ public final class ServiceStack {
 
     // ── Service container ─────────────────────────────────────────────────────
     @SuppressWarnings("resource")
-    private GenericContainer<?> buildService(String peerId) {
+    private GenericContainer<?> buildService(String peerId, int archiveSegmentSec) {
         GenericContainer<?> c = new GenericContainer<>(SERVICE_IMAGE)
                 .withNetworkMode("host")
                 .withEnv("CASTER_HOST", "127.0.0.1")
@@ -170,7 +201,7 @@ public final class ServiceStack {
                 .withEnv("CASTER_PEER_ID", peerId)
                 .withEnv("SIGNALLING_PORT", String.valueOf(WS_PORT))
                 .withEnv("CROP_HEIGHT", "360")
-                .withEnv("ARCHIVE_SEGMENT_SEC", "20")
+                .withEnv("ARCHIVE_SEGMENT_SEC", String.valueOf(archiveSegmentSec))
                 .withEnv("ARCHIVE_DIR", "/archive")
                 .withEnv("WEB_PORT", String.valueOf(HTTP_PORT))
                 .withFileSystemBind(archiveDir.toString(), "/archive")
@@ -204,7 +235,9 @@ public final class ServiceStack {
     }
 
     // ── Stop ─────────────────────────────────────────────────────────────────
-    private void stop() {
+    public void stop() {
+        if (!stopped.compareAndSet(false, true)) return;
+
         stopColorWindow();
         try { service.stop(); } catch (Exception ignored) {}
         try { caster.stop();  } catch (Exception ignored) {}
@@ -215,6 +248,9 @@ public final class ServiceStack {
         } catch (InterruptedException ignored) {
             Thread.currentThread().interrupt();
         }
+
+        // Remove stale socket so the next ServiceStack can start Xvfb on :99.
+        try { Files.deleteIfExists(Path.of("/tmp/.X11-unix/X99")); } catch (IOException ignored) {}
 
         if (archiveDir != null && Files.exists(archiveDir)) {
             try {
@@ -270,7 +306,7 @@ public final class ServiceStack {
 
     /**
      * Blocks until a {@code stream-*.mkv} file appears in the archive directory.
-     * Polls every 1 s; throws {@link AssertionError} after 60 s.
+     * Polls every 1 s; throws {@link AssertionError} after 90 s.
      */
     public void awaitFirstSegment() throws InterruptedException, IOException {
         long deadline = System.currentTimeMillis() + 90_000;

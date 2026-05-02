@@ -35,19 +35,40 @@ import java.util.zip.ZipInputStream;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-@DisplayName("Live feed color verification")
+/**
+ * Parameterisable live-feed color verification suite.
+ *
+ * <p>Concrete subclasses supply three parameters:
+ * <ul>
+ *   <li>{@link #numFlips()} — number of desktop color flips (must be even so
+ *       the sequence ends on red)</li>
+ *   <li>{@link #flipHoldMs()} — ms to hold each color after detection</li>
+ *   <li>{@link #archiveSegmentSec()} — ARCHIVE_SEGMENT_SEC for the service
+ *       container; controls how many completed segments exist during the test</li>
+ * </ul>
+ *
+ * <p>{@code @TestInstance(PER_CLASS)} is required so that {@code @BeforeAll}
+ * and {@code @AfterAll} run as instance methods and each concrete subclass gets
+ * its own isolated set of fields ({@code stack}, {@code driver}, etc.).
+ */
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-class LiveFeedColorTest {
+abstract class AbstractLiveFeedColorTest {
 
-    private static ServiceStack stack;
-    private static WebDriver    driver;
+    // ── Per-subclass instance state ───────────────────────────────────────────
+    ServiceStack stack;
+    WebDriver    driver;
 
-    // Timestamps bracketing the flip test; set by videoFollowsTenColorFlips().
-    private static volatile long flipStartEpoch;
-    private static volatile long flipEndEpoch;
+    // Set by @Order(1); read by @Order(2) and @Order(3).
+    long flipStartEpoch;
+    long flipEndEpoch;
 
-    // Canvas-based frame capture: returns {stage, width, height, avgR, avgG, avgB, avgA,
-    // readyState, currentTime} or an error dict when the video is not yet decodable.
+    // ── Parameters (supplied by subclasses) ───────────────────────────────────
+    protected abstract int  numFlips();
+    protected abstract long flipHoldMs();
+    protected abstract int  archiveSegmentSec();
+
+    // ── Canvas frame-capture script ───────────────────────────────────────────
     private static final String CAPTURE_SCRIPT =
         "const v = document.querySelector('video');" +
         "if (!v || !v.videoWidth || !v.videoHeight) {" +
@@ -73,9 +94,16 @@ class LiveFeedColorTest {
         "        avgR: r/n, avgG: g/n, avgB: b/n, avgA: a/n," +
         "        readyState: v.readyState, currentTime: v.currentTime};";
 
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     @BeforeAll
-    static void setup() throws Exception {
-        stack = ServiceStack.getInstance();
+    void setup() throws Exception {
+        // Stop the singleton (used by endpoint tests) and any previous LiveFeed
+        // stack, then start a fresh one with this subclass's segment duration.
+        ServiceStack.closeAndReset();
+        Thread.sleep(1_000); // let OS reclaim host ports and Xvfb socket
+
+        stack = ServiceStack.create(archiveSegmentSec());
 
         // Paint the display red before opening the browser so the first frame is red.
         stack.setDesktopColor("#ff0000");
@@ -111,12 +139,13 @@ class LiveFeedColorTest {
     }
 
     @AfterAll
-    static void teardown() {
+    void teardown() {
         if (driver != null) {
             try { driver.quit(); } catch (Exception ignored) {}
         }
         if (stack != null) {
             stack.stopColorWindow();
+            stack.stop();
         }
     }
 
@@ -124,40 +153,34 @@ class LiveFeedColorTest {
 
     @Test
     @Order(1)
-    @DisplayName("Video follows 10 desktop color flips")
-    @Description("Alternates the desktop color between blue and red 10 times and "
+    @DisplayName("Video follows desktop color flips")
+    @Description("Alternates the desktop color between blue and red numFlips() times and "
             + "verifies the live WebRTC feed matches each new color within 3 seconds.")
-    void videoFollowsTenColorFlips() throws Exception {
-        final String[] colorNames = {
-            "blue", "red", "blue", "red", "blue",
-            "red",  "blue", "red", "blue", "red"
-        };
-        final String[] hexColors = {
-            "#0000ff", "#ff0000", "#0000ff", "#ff0000", "#0000ff",
-            "#ff0000", "#0000ff", "#ff0000", "#0000ff", "#ff0000"
-        };
+    void videoFollowsColorFlips() throws Exception {
+        final int n = numFlips();
+        final String[] colorNames = new String[n];
+        final String[] hexColors  = new String[n];
+        for (int i = 0; i < n; i++) {
+            colorNames[i] = i % 2 == 0 ? "blue"    : "red";
+            hexColors[i]  = i % 2 == 0 ? "#0000ff" : "#ff0000";
+        }
 
-        // Bracket the flip test with epoch timestamps so the archive test can
-        // request exactly this window from the /video endpoint.
         flipStartEpoch = Instant.now().getEpochSecond() - 1;
 
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < n; i++) {
             final String colorName = colorNames[i];
             final String hexColor  = hexColors[i];
             final int    flipNum   = i + 1;
             Allure.<Void>step("Flip " + flipNum + ": desktop → " + colorName, () -> {
                 stack.setDesktopColor(hexColor);
                 awaitColor(colorName, 3_000);
-                // Hold the color for at least 1.5 s after detection so the
-                // archive encoder (key-int-max=30, ~1 keyframe/s) captures
-                // each color in a sealed MKV cluster.
-                Thread.sleep(1_500);
+                Thread.sleep(flipHoldMs());
                 return null;
             });
         }
 
-        // Final post-flip hold: keep desktop red for an additional 3 s so the
-        // archive has solid red trailing the flip sequence.
+        // Final post-flip hold: keep desktop red so the archive has solid red
+        // trailing the flip sequence and the MKV cluster is flushed.
         Thread.sleep(3_000);
 
         flipEndEpoch = Instant.now().getEpochSecond();
@@ -168,20 +191,16 @@ class LiveFeedColorTest {
     @Test
     @Order(2)
     @DisplayName("Archived video contains both red and blue frames")
-    @Description("Downloads the last 120 s of archived video via /video?last=120s after "
-            + "the flip test, then extracts frames with ffmpeg and asserts at least one "
-            + "predominantly-red and one predominantly-blue frame are present.")
+    @Description("Downloads the last 120 s of archived video via /video?last=120s, "
+            + "extracts frames with ffmpeg, and asserts at least one predominantly-red "
+            + "and one predominantly-blue frame are present.")
     void videoEndpointContainsColorFlips() throws Exception {
         assumeTrue(flipStartEpoch > 0,
                 "Flip test did not record timestamps — wrong execution order?");
 
         // Wait for the GStreamer pipeline to flush and seal the current MKV cluster.
-        // x264enc writes keyframes every ~1 s (key-int-max=30); matroskamux seals a
-        // cluster on each keyframe boundary.
         Thread.sleep(5_000);
 
-        // Request the last 120 s of archive.  The flip test ran ~33 s ago
-        // (28 s flips + 5 s sleep), well within the 120 s window.
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -198,7 +217,6 @@ class LiveFeedColorTest {
 
         byte[] videoBytes = resp.body();
         assertTrue(videoBytes.length > 4, "Video response body is too short");
-        // Sanity-check EBML magic bytes.
         assertEquals(0x1A, videoBytes[0] & 0xFF, "Expected EBML magic byte 0");
         assertEquals(0x45, videoBytes[1] & 0xFF, "Expected EBML magic byte 1");
         assertEquals(0xDF, videoBytes[2] & 0xFF, "Expected EBML magic byte 2");
@@ -209,8 +227,6 @@ class LiveFeedColorTest {
         try {
             Files.write(videoFile, videoBytes);
 
-            // Extract 4 fps at small scale — with a 120 s window that's ~480 frames,
-            // enough to reliably catch a 1.5 s hold of each color.
             Process ffmpeg;
             try {
                 ffmpeg = new ProcessBuilder(
@@ -228,7 +244,6 @@ class LiveFeedColorTest {
             assertTrue(ffmpeg.waitFor(60, TimeUnit.SECONDS),
                     "ffmpeg frame extraction did not complete within 60 s");
 
-            // Read every extracted PNG and compute average R, G, B.
             List<double[]> frames = new ArrayList<>();
             try (DirectoryStream<Path> ds = Files.newDirectoryStream(frameDir, "*.png")) {
                 for (Path png : ds) {
@@ -239,16 +254,11 @@ class LiveFeedColorTest {
             assertFalse(frames.isEmpty(),
                     "ffmpeg produced no PNG frames from the video clip");
 
-            // Predominantly-red: red is at least 2× both green and blue,
-            // and at least 100/255 in absolute terms. Loose enough to tolerate
-            // YUV→RGB rounding, motion blur on the X11 buffer, and h264
-            // chroma-subsampling. Same shape for blue.
             boolean sawRed  = frames.stream().anyMatch(rgb ->
                     rgb[0] >= 100 && rgb[0] >= 2 * rgb[1] && rgb[0] >= 2 * rgb[2]);
             boolean sawBlue = frames.stream().anyMatch(rgb ->
                     rgb[2] >= 100 && rgb[2] >= 2 * rgb[0] && rgb[2] >= 2 * rgb[1]);
 
-            // Build a compact sample of the first 60 frames for failure messages.
             StringBuilder sample = new StringBuilder();
             int limit = Math.min(60, frames.size());
             for (int i = 0; i < limit; i++) {
@@ -276,7 +286,7 @@ class LiveFeedColorTest {
         }
     }
 
-    // ── Test 3: archive segment names + color check ───────────────────────────
+    // ── Test 3: archive segment names + exact color-run sequence ─────────────
 
     @Test
     @Order(3)
@@ -284,7 +294,7 @@ class LiveFeedColorTest {
     @Description("Downloads the archive for the exact flip window, verifies every MKV entry "
             + "name matches the expected timestamp format and segments are in chronological "
             + "order, then extracts frames from each segment in turn and asserts the color "
-            + "run sequence matches exactly: red, blue, red × 10 alternating flips.")
+            + "run sequence matches the expected pattern for numFlips() flips.")
     void archiveEndpointSegmentNamesAndColorFlips() throws Exception {
         assumeTrue(flipStartEpoch > 0,
                 "Flip test did not record timestamps — wrong execution order?");
@@ -292,9 +302,6 @@ class LiveFeedColorTest {
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
-        // Request the precise flip window so we can assert an exact color sequence.
-        // flipStartEpoch is 1 s before the first flip; pad by 5 s each side for
-        // segment-boundary alignment.
         String archiveUrl = stack.baseUrl() + "/archive"
                 + "?start=" + (flipStartEpoch - 5)
                 + "&end="   + (flipEndEpoch   + 5);
@@ -308,7 +315,6 @@ class LiveFeedColorTest {
         assertEquals(200, resp.statusCode(), "Expected 200 from /archive");
 
         // ── Extract and validate segment names ────────────────────────────────
-        // Expected format: {prefix}_{YYYYMMDD-HHMMSS.SSS}_to_{YYYYMMDD-HHMMSS.SSS}.mkv
         Pattern segPattern = Pattern.compile(
                 "^\\w+_(\\d{8}-\\d{6}\\.\\d{3})_to_(\\d{8}-\\d{6}\\.\\d{3})\\.mkv$");
         DateTimeFormatter segFmt = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS")
@@ -328,16 +334,11 @@ class LiveFeedColorTest {
             }
         }
         assertFalse(segments.isEmpty(), "Archive ZIP contained no .mkv segments");
-
-        // Entries are already sorted lexicographically (== chronologically) by the
-        // server, but sort explicitly to guarantee ordering for assertions below.
         segments.sort(Map.Entry.comparingByKey());
 
-        // Verify timestamps are plausible and segments do not overlap.
-        // The request window is [flipStartEpoch-5, flipEndEpoch+5]; a segment that
-        // starts up to one full segment duration (20 s) before the window start is
-        // still legitimately included because it overlaps the window.
-        Instant windowStart = Instant.ofEpochSecond(flipStartEpoch - 25);
+        // A segment that overlaps the request window [flipStartEpoch-5, flipEndEpoch+5]
+        // may have started up to one full segment duration before the window start.
+        Instant windowStart = Instant.ofEpochSecond(flipStartEpoch - 5 - archiveSegmentSec());
         Instant windowEnd   = Instant.ofEpochSecond(flipEndEpoch   + 65);
         Instant prevEnd     = null;
         for (Map.Entry<String, byte[]> seg : segments) {
@@ -362,8 +363,6 @@ class LiveFeedColorTest {
         }
 
         // ── Extract frames, build color-run sequence ──────────────────────────
-        // Classify each frame as "red", "blue", or null (transition / unclear).
-        // Collapse consecutive identical non-null classifications into runs.
         List<String> colorRuns = new ArrayList<>();
         List<double[]> allFrames = new ArrayList<>();
 
@@ -390,7 +389,6 @@ class LiveFeedColorTest {
                 assertTrue(ffmpeg.waitFor(30, TimeUnit.SECONDS),
                         "ffmpeg timed out on segment " + seg.getKey());
 
-                // Sort PNGs by name so frames are in temporal order within each segment.
                 List<Path> pngs = new ArrayList<>();
                 try (DirectoryStream<Path> ds = Files.newDirectoryStream(segFrameDir, "*.png")) {
                     for (Path p : ds) pngs.add(p);
@@ -419,17 +417,19 @@ class LiveFeedColorTest {
         }
 
         // ── Assert exact flip sequence ────────────────────────────────────────
-        // The display starts red (set in @BeforeAll), then the 10 flips alternate
-        // starting with blue.  Expected run sequence:
-        //   red, blue, red, blue, red, blue, red, blue, red, blue, red  (11 runs)
-        List<String> expected = List.of(
-                "red", "blue", "red", "blue", "red",
-                "blue", "red", "blue", "red", "blue", "red");
+        // Display starts red (@BeforeAll), then numFlips() alternating flips starting
+        // with blue. numFlips() must be even so the sequence ends on red.
+        // Expected: [red, blue, red, blue, ..., red]  (numFlips()+1 entries)
+        List<String> expected = new ArrayList<>();
+        expected.add("red");
+        for (int i = 0; i < numFlips(); i++) {
+            expected.add(i % 2 == 0 ? "blue" : "red");
+        }
 
         String svcLogs = stack.serviceLogs();
         String svcTail = svcLogs.substring(Math.max(0, svcLogs.length() - 3000));
         assertEquals(expected, colorRuns,
-                "Color run sequence does not match expected 10-flip pattern. "
+                "Color run sequence does not match expected " + numFlips() + "-flip pattern. "
                 + "segments=" + segments.stream().map(Map.Entry::getKey).toList()
                 + " frames=" + allFrames.size()
                 + "\nservice logs (tail):\n" + svcTail);
@@ -437,8 +437,7 @@ class LiveFeedColorTest {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static void awaitColor(String colorName, long timeoutMs)
-            throws InterruptedException {
+    void awaitColor(String colorName, long timeoutMs) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         Map<?, ?> lastStats = null;
         while (System.currentTimeMillis() < deadline) {
@@ -467,7 +466,7 @@ class LiveFeedColorTest {
         };
     }
 
-    private static double[] averageRgb(BufferedImage img) {
+    static double[] averageRgb(BufferedImage img) {
         long r = 0, g = 0, b = 0;
         int w = img.getWidth(), h = img.getHeight();
         for (int y = 0; y < h; y++) {
@@ -486,17 +485,15 @@ class LiveFeedColorTest {
         return v instanceof Number ? ((Number) v).doubleValue() : 0.0;
     }
 
-    private static JavascriptExecutor js() {
+    private JavascriptExecutor js() {
         return (JavascriptExecutor) driver;
     }
 
     /** Converts GStreamer TURN URL to browser query params, or returns "". */
-    private static String buildTurnParams() {
+    static String buildTurnParams() {
         String gstTurn = System.getProperty("GST_WEBRTC_TURN_SERVER", "");
         if (gstTurn.isEmpty()) return "";
         try {
-            // GStreamer format: turn://user:cred@host:port
-            // Browser format:  ?turn_uri=turn:host:port&turn_user=user&turn_cred=cred
             URI uri = URI.create(gstTurn.replace("turn://", "http://"));
             String userInfo = uri.getUserInfo();
             int sep = userInfo.indexOf(':');
