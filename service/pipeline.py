@@ -173,10 +173,13 @@ def main():
     archive.set_property('max-size-time', segment_ns)
 
     # ── Rename completed segments to embed their recording timestamps
-    # format-location-full fires at the start of each new fragment; base_time +
-    # buf.pts gives the wall-clock time of that frame, so end(N) = start(N+1)
-    # in stream time and duration is exact.  The last fragment is renamed on EOS.
-    _fragment_starts = {}  # fragment_id -> start nanoseconds
+    # GStreamer's system clock uses CLOCK_MONOTONIC (nanoseconds since boot),
+    # but Python's time.time() uses CLOCK_REALTIME (Unix epoch).  Compute the
+    # offset once at pipeline start so all segment timestamps are in Unix
+    # wall-clock nanoseconds and match what stage_segments / _build_timeline
+    # expect.
+    _mono_to_real_ns = int((time.time() - time.monotonic()) * 1e9)
+    _fragment_starts = {}  # fragment_id -> start nanoseconds (wall-clock)
 
     def _rename_fragment(frag_id, end_ns):
         if frag_id not in _fragment_starts:
@@ -195,9 +198,10 @@ def main():
     def _on_format_location_full(_splitmux, fragment_id, first_sample):
         buf = first_sample.get_buffer()
         pts = buf.pts
-        now_ns = (pipeline.get_base_time() + pts
-                  if pts != Gst.CLOCK_TIME_NONE
-                  else int(time.time() * 1e9))
+        if pts != Gst.CLOCK_TIME_NONE:
+            now_ns = pipeline.get_base_time() + pts + _mono_to_real_ns
+        else:
+            now_ns = int(time.time() * 1e9)
         _rename_fragment(fragment_id - 1, now_ns)
         _fragment_starts[fragment_id] = now_ns
         return None
@@ -294,9 +298,10 @@ def main():
             # Rename the last fragment — format-location-full won't fire for it.
             if _fragment_starts:
                 ok, pos = pipeline.query_position(Gst.Format.TIME)
-                end_ns = (pipeline.get_base_time() + pos
-                          if ok and pos != Gst.CLOCK_TIME_NONE
-                          else int(time.time() * 1e9))
+                if ok and pos != Gst.CLOCK_TIME_NONE:
+                    end_ns = pipeline.get_base_time() + pos + _mono_to_real_ns
+                else:
+                    end_ns = int(time.time() * 1e9)
                 _rename_fragment(max(_fragment_starts), end_ns)
             loop.quit()
         elif t == Gst.MessageType.ERROR:
