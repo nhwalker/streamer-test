@@ -67,6 +67,7 @@ public final class ServiceStack {
     private final GenericContainer<?> caster;
     private final GenericContainer<?> service;
     private final Path                archiveDir;
+    private volatile Process          colorWindow;
 
     // ── Construction / start ─────────────────────────────────────────────────
     @SuppressWarnings("resource")
@@ -204,6 +205,7 @@ public final class ServiceStack {
 
     // ── Stop ─────────────────────────────────────────────────────────────────
     private void stop() {
+        stopColorWindow();
         try { service.stop(); } catch (Exception ignored) {}
         try { caster.stop();  } catch (Exception ignored) {}
 
@@ -229,6 +231,41 @@ public final class ServiceStack {
     public int    wsPortTop()   { return WS_PORT_TOP; }
     public int    wsPortBottom(){ return WS_PORT_BOTTOM; }
     public Path   archiveDir()  { return archiveDir; }
+
+    /**
+     * Paints the Xvfb display (:99) with the given hex color by launching
+     * an xlogo window that covers the entire screen. Terminates any
+     * previously launched color window first.
+     *
+     * @param hexColor X11 color string such as {@code "#ff0000"} or {@code "#0000ff"}
+     */
+    public void setDesktopColor(String hexColor) throws IOException {
+        stopColorWindow();
+        colorWindow = new ProcessBuilder(
+                "xlogo",
+                "-display", ":99",
+                "-geometry", "1280x720+0+0",
+                "-bg", hexColor,
+                "-fg", hexColor,
+                "-bw", "0")
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start();
+    }
+
+    /** Terminates the color window launched by {@link #setDesktopColor}, if any. */
+    public void stopColorWindow() {
+        Process p = colorWindow;
+        colorWindow = null;
+        if (p != null) {
+            p.destroy();
+            try {
+                if (!p.waitFor(2, TimeUnit.SECONDS)) p.destroyForcibly();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
 
     /**
      * Blocks until a {@code stream-*.mkv} file appears in the archive directory.
