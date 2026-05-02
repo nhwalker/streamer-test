@@ -195,7 +195,7 @@ def main():
                   file=sys.stderr, flush=True)
 
     def _on_format_location_full(_splitmux, fragment_id, first_sample):
-        now_ns = int(time.time() * 1e9)
+        now_ns = time.time_ns()
         _rename_fragment(fragment_id - 1, now_ns)
         _fragment_starts[fragment_id] = now_ns
         return None
@@ -291,7 +291,7 @@ def main():
             print('[service] EOS received')
             # Rename the last fragment — format-location-full won't fire for it.
             if _fragment_starts:
-                end_ns = int(time.time() * 1e9)
+                end_ns = time.time_ns()
                 _rename_fragment(max(_fragment_starts), end_ns)
             loop.quit()
         elif t == Gst.MessageType.ERROR:
