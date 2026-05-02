@@ -68,6 +68,9 @@ abstract class AbstractLiveFeedColorTest {
     protected abstract long flipHoldMs();
     protected abstract int  archiveSegmentSec();
 
+    /** Maximum acceptable end-to-end capture→render latency in milliseconds. */
+    static final int MAX_LATENCY_MS = 1000;
+
     // ── Canvas frame-capture script ───────────────────────────────────────────
     private static final String CAPTURE_SCRIPT =
         "const v = document.querySelector('video');" +
@@ -148,6 +151,32 @@ abstract class AbstractLiveFeedColorTest {
             stack.stopColorWindow();
             stack.stop();
         }
+    }
+
+    // ── Test 0: end-to-end latency check ─────────────────────────────────────
+
+    @Test
+    @Order(0)
+    @DisplayName("Live stream latency is below threshold")
+    @Description("Reads the capture timestamp delivered by the service's WebRTC data channel "
+            + "and asserts the wall-clock delta to Date.now() is below MAX_LATENCY_MS. "
+            + "The service stamps each frame at capture time and relays it every 200 ms; "
+            + "the browser stores the most recent value in window._captureMs.")
+    void latencyIsBelowThreshold() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (System.currentTimeMillis() < deadline) {
+            Object ts = js().executeScript("return window._captureMs || null;");
+            if (ts instanceof Number) break;
+            Thread.sleep(200);
+        }
+
+        Object latencyObj = js().executeScript(
+                "return window._captureMs != null ? Date.now() - window._captureMs : null;");
+        assertNotNull(latencyObj,
+                "Data-channel timestamp (window._captureMs) not received within 30 s");
+        long latency = ((Number) latencyObj).longValue();
+        assertTrue(latency < MAX_LATENCY_MS,
+                "End-to-end latency " + latency + " ms exceeds threshold " + MAX_LATENCY_MS + " ms");
     }
 
     // ── Test 1: live flip verification ────────────────────────────────────────
