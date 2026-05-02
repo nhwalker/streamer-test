@@ -194,7 +194,7 @@ class LiveFeedColorTest {
                 ffmpeg = new ProcessBuilder(
                         "ffmpeg", "-hide_banner", "-y",
                         "-i", videoFile.toString(),
-                        "-vf", "fps=2,scale=64:36",
+                        "-vf", "fps=30,scale=64:36",
                         frameDir.resolve("frame%04d.png").toString())
                         .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                         .redirectError(ProcessBuilder.Redirect.DISCARD)
