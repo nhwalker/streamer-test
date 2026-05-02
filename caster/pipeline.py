@@ -19,11 +19,9 @@ Environment variables:
   GST_WEBRTC_STUN_SERVER  optional STUN URI                    ("")
   GST_WEBRTC_TURN_SERVER  optional TURN URI                    ("")
 """
-import json
 import os
 import signal
 import sys
-import time
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -59,7 +57,7 @@ def main():
         f'! video/x-raw,framerate={FRAMERATE}/1 '
         f'! videoscale '
         f'! video/x-raw,width={WIDTH},height={HEIGHT} '
-        f'! videoconvert name=vc '
+        f'! videoconvert '
         f'! webrtcsink name=ws video-caps="video/x-h264"'
     )
 
@@ -73,29 +71,6 @@ def main():
     ws = pipeline.get_by_name('ws')
     ws.get_property('signaller').set_property('uri', sig_uri)
 
-    # ── Capture timestamp probe + data-channel relay to service ──────────────
-    _capture_ms = 0
-    vc = pipeline.get_by_name('vc')
-
-    def _on_buffer(_pad, _info):
-        nonlocal _capture_ms
-        _capture_ms = time.time_ns() // 1_000_000
-        return Gst.PadProbeReturn.OK
-
-    vc.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, _on_buffer)
-
-    _caster_channels = {}  # peer_id -> GstWebRTCDataChannel
-
-    def _on_consumer_added(_sink, peer_id, webrtcbin):
-        ch = webrtcbin.emit('create-data-channel', 'ts',
-                            Gst.Structure.new_empty('config'))
-        _caster_channels[peer_id] = ch
-
-    def _on_consumer_removed(_sink, peer_id, _webrtcbin):
-        _caster_channels.pop(peer_id, None)
-
-    ws.connect('consumer-added',   _on_consumer_added)
-    ws.connect('consumer-removed', _on_consumer_removed)
     if STUN:
         ws.set_property('stun-server', STUN)
 
@@ -147,18 +122,6 @@ def main():
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT,  on_signal)
-
-    def _broadcast_ts():
-        if _caster_channels:
-            msg = json.dumps({'t': _capture_ms})
-            for ch in list(_caster_channels.values()):
-                try:
-                    ch.emit('send-string', msg)
-                except Exception:
-                    pass
-        return True  # reschedule
-
-    GLib.timeout_add(200, _broadcast_ts)
 
     try:
         loop.run()

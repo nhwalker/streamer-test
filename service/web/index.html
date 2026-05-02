@@ -122,12 +122,6 @@
             });
           }
         });
-        pc.addEventListener('datachannel', function (e) {
-          if (e.channel.label !== 'ts') return;
-          e.channel.addEventListener('message', function (m) {
-            try { window._captureMs = JSON.parse(m.data).t; } catch (_) {}
-          });
-        });
         return pc;
       }
       PatchedRPC.prototype = _OrigRPC.prototype;
@@ -157,47 +151,39 @@
       status.className   = isError ? 'error' : '';
     };
 
-    let _metricsTimer = null;
+    let _rvcHandle = null;
     let _prevFrames = 0, _prevFrameTime = 0;
 
     function startMetrics() {
       stopMetrics();
-      const pc = window._streamPc;
-      if (!pc) return;
-      _prevFrames = 0;
-      _prevFrameTime = 0;
-      _metricsTimer = setInterval(async () => {
-        if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-          stopMetrics();
-          return;
+      function onFrame(now, metadata) {
+        let fps = null;
+        if (_prevFrameTime > 0 && metadata.presentedFrames != null) {
+          const dt = (now - _prevFrameTime) / 1000;
+          if (dt > 0) fps = (metadata.presentedFrames - _prevFrames) / dt;
         }
-        try {
-          const stats = await pc.getStats();
-          let fps = null;
-          stats.forEach(r => {
-            if (r.type === 'inbound-rtp' && r.kind === 'video') {
-              if (r.framesPerSecond != null) {
-                fps = r.framesPerSecond;
-              } else if (r.framesDecoded != null) {
-                const dt = (_prevFrameTime > 0) ? (r.timestamp - _prevFrameTime) / 1000 : 0;
-                if (dt > 0) fps = (r.framesDecoded - _prevFrames) / dt;
-                _prevFrames = r.framesDecoded;
-                _prevFrameTime = r.timestamp;
-              }
-            }
-          });
-          document.getElementById('m-fps').textContent = fps != null ? fps.toFixed(1) : '--';
-          document.getElementById('m-lat').textContent = window._captureMs != null
-            ? ((Date.now() - window._captureMs) / 1000).toFixed(3)
-            : '--';
-        } catch (_) {}
-      }, 1000);
+        if (metadata.presentedFrames != null) {
+          _prevFrames = metadata.presentedFrames;
+          _prevFrameTime = now;
+        }
+        let latSecs = null;
+        if (metadata.captureTime != null) {
+          latSecs = (now - metadata.captureTime) / 1000;
+        }
+        document.getElementById('m-fps').textContent = fps != null ? fps.toFixed(1) : '--';
+        document.getElementById('m-lat').textContent = latSecs != null ? latSecs.toFixed(3) : '--';
+        _rvcHandle = video.requestVideoFrameCallback(onFrame);
+      }
+      _rvcHandle = video.requestVideoFrameCallback(onFrame);
     }
 
     function stopMetrics() {
-      clearInterval(_metricsTimer);
-      _metricsTimer = null;
-      window._captureMs = null;
+      if (_rvcHandle != null) {
+        video.cancelVideoFrameCallback(_rvcHandle);
+        _rvcHandle = null;
+      }
+      _prevFrames = 0;
+      _prevFrameTime = 0;
       document.getElementById('m-fps').textContent = '--';
       document.getElementById('m-lat').textContent = '--';
     }

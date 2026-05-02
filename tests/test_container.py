@@ -336,22 +336,24 @@ class TestWebRTCStream:
         """
         Verify end-to-end capture→render latency is below MAX_LATENCY_MS.
 
-        The service embeds a capture timestamp in every video frame via a WebRTC
-        data channel.  The browser stores the most recent timestamp in
-        window._captureMs.  Latency = Date.now() - window._captureMs measures
-        the full wall-clock delta from screen capture to the JS measurement point.
+        The service writes a wall-clock NTP timestamp into every RTP packet via
+        the abs-capture-time header extension.  Chrome exposes it as
+        metadata.captureTime in requestVideoFrameCallback, allowing true
+        per-frame service→browser latency to be measured without a side channel.
 
         Both containers and Chrome run on the same host (host-network mode) so
         their clocks are identical — no NTP skew between machines.
         """
         http_port, ws_port = streaming_container
         _wait_for_playing(browser, http_port, ws_port, turn_params)
-        _wait_for_capture_ts(browser)
-        latency = browser.execute_script(
-            "return Date.now() - (window._captureMs || 0);"
+        _wait_for_latency_display(browser)
+        lat_text = browser.execute_script(
+            "return document.getElementById('m-lat').textContent;"
         )
-        assert latency < MAX_LATENCY_MS, (
-            f"End-to-end latency {latency} ms exceeds threshold {MAX_LATENCY_MS} ms"
+        lat_secs = float(lat_text)
+        latency_ms = round(lat_secs * 1000)
+        assert latency_ms < MAX_LATENCY_MS, (
+            f"End-to-end latency {latency_ms} ms exceeds threshold {MAX_LATENCY_MS} ms"
         )
 
 
@@ -420,15 +422,20 @@ def _capture_frame(browser):
     return last
 
 
-def _wait_for_capture_ts(driver, timeout=30):
-    """Poll until the data channel has delivered a capture timestamp."""
+def _wait_for_latency_display(driver, timeout=30):
+    """Poll until the latency header shows a numeric value (not '--')."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        ts = driver.execute_script("return window._captureMs || null;")
-        if ts is not None:
-            return int(ts)
+        text = driver.execute_script(
+            "return document.getElementById('m-lat').textContent;"
+        )
+        try:
+            float(text)
+            return
+        except (ValueError, TypeError):
+            pass
         time.sleep(0.5)
-    pytest.fail(f"Data-channel timestamp not received within {timeout}s")
+    pytest.fail(f"Latency header did not show a numeric value within {timeout}s")
 
 
 # ── Level 3: split-stream playback + dimensions ───────────────────────────────
