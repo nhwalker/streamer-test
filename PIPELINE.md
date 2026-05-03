@@ -331,13 +331,25 @@ to MP4 on rotation.
 #### Post-rotation: MKV → MP4 finalize
 
 When `splitmuxsink` rotates a fragment, `pipeline.py` enqueues the
-just-completed `.mkv` for remux on a single background daemon thread:
+just-completed `.mkv` for remux on a single background daemon thread.
+ffmpeg writes the new MP4 alongside the source in `ARCHIVE_LIVE_DIR`
+under a `.part` suffix, then the finished file is published into
+`ARCHIVE_DIR` via an atomic rename:
 
 ```
+# 1. ffmpeg writes the new MP4 next to the source, in ARCHIVE_LIVE_DIR
 ffmpeg -y -nostdin -hide_banner -loglevel error \
        -fflags +genpts -i ${LIVE}/${prefix}-NNNNN.mkv \
        -c copy -map 0:v:0 -movflags +faststart \
-       ${ARCHIVE}/${prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mp4
+       ${LIVE}/${prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mp4.part
+
+# 2. Move into ARCHIVE_DIR under .part; cross-fs copies land there, not
+#    under the final name.  Then atomic rename to the final name.
+shutil.move(    ${LIVE}/${name}.mp4.part,    ${ARCHIVE}/${name}.mp4.part )
+os.rename(      ${ARCHIVE}/${name}.mp4.part, ${ARCHIVE}/${name}.mp4     )
+
+# 3. Source MKV deleted only after publication succeeds.
+os.unlink(${LIVE}/${prefix}-NNNNN.mkv)
 ```
 
 Key properties:
@@ -346,20 +358,28 @@ Key properties:
   no quality loss, near-instant compared to a transcode.
 - **`-movflags +faststart`** — ffmpeg does a 2-pass write to place the
   `moov` atom at the front of the MP4, allowing web players to start
-  decoding from the first received bytes.
+  decoding from the first received bytes.  The 2-pass intermediate
+  states stay confined to `ARCHIVE_LIVE_DIR` because the work file is
+  written there.
+- **Atomic publication** — `ARCHIVE_DIR`'s `*.mp4` glob never matches a
+  partially-written file.  ffmpeg's output is hidden under `.part` in
+  `ARCHIVE_LIVE_DIR`; the cross-filesystem copy lands under `.part` in
+  `ARCHIVE_DIR`; only the final `os.rename` makes the new segment
+  visible to readers.
 - **Background worker** — the `format-location-full` callback returns
   immediately; the remux runs off the GStreamer streaming thread so it
   cannot back up the pipeline queues.
 - **Fallback** — if ffmpeg ever fails (corrupt fragment, missing tool),
-  the pipeline falls back to a plain `shutil.move` of the original `.mkv`
-  next to where the `.mp4` would have landed, so a recording is never
-  lost.
+  the pipeline cleans up the partial `.mp4.part` and moves the original
+  `.mkv` into `ARCHIVE_DIR` (also via a `.part`-then-rename publication)
+  so a recording is never lost.  The fallback `.mkv` is not picked up by
+  `/archive` (which globs `*.mp4`); it sits on disk until an admin
+  recovers it.
 
-The in-progress fragment is written into `ARCHIVE_LIVE_DIR` (default
-`/archive-live`); the finalized faststart MP4 lands in `ARCHIVE_DIR`
-(default `/archive`).  Keeping the live write path on its own filesystem
-(e.g. tmpfs or a fast local disk) and the completed archive on a slower
-bulk volume is supported transparently.
+Keeping the live write path on its own filesystem (e.g. tmpfs or a fast
+local disk) and the completed archive on a slower bulk volume is
+supported transparently — the cross-fs copy and the in-place rename are
+both handled correctly.
 
 ---
 

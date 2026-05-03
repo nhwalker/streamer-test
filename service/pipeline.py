@@ -259,10 +259,39 @@ def main():
     def _finalize_fragment(src, dst):
         """Remux src .mkv to dst .mp4 (faststart) and remove the source.
 
-        Falls back to moving the .mkv (under a .mkv name next to dst) when
-        ffmpeg fails so we never lose the recording.
+        ffmpeg writes the new MP4 alongside the source in ARCHIVE_LIVE_DIR
+        (under a `.part` suffix) so /archive never sees a partial file.
+        `+faststart` does a 2-pass write — the file passes through several
+        intermediate states before the moov atom lands at the front — and
+        keeping all of that confined to ARCHIVE_LIVE_DIR means /archive's
+        `*.mp4` glob only ever lists fully-finalized segments.
+
+        Once ffmpeg succeeds we publish to ARCHIVE_DIR via a `.part` →
+        final-name rename so the publication itself is atomic within
+        ARCHIVE_DIR even when ARCHIVE_LIVE_DIR and ARCHIVE_DIR are on
+        different filesystems (the cross-fs copy lands under .part; the
+        rename to the final name is on a single filesystem).
+
+        Falls back to moving the .mkv (under a .mkv name in ARCHIVE_DIR)
+        when ffmpeg fails so we never lose the recording.
         """
-        if _remux_to_mp4(src, dst):
+        tmp_dst        = os.path.join(ARCHIVE_LIVE_DIR,
+                                      os.path.basename(dst) + '.part')
+        publish_part   = dst + '.part'
+
+        if _remux_to_mp4(src, tmp_dst):
+            try:
+                shutil.move(tmp_dst, publish_part)
+                os.rename(publish_part, dst)
+            except OSError as exc:
+                print(f'[service] WARNING: could not publish {tmp_dst} as '
+                      f'{dst}: {exc}', file=sys.stderr, flush=True)
+                for path in (tmp_dst, publish_part):
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                return
             try:
                 os.unlink(src)
             except OSError as exc:
@@ -271,14 +300,27 @@ def main():
             print(f'[service] archive: {os.path.basename(src)}'
                   f' -> {os.path.basename(dst)}', flush=True)
             return
-        fallback = os.path.splitext(dst)[0] + '.mkv'
+
+        # ffmpeg failed — clean up its partial output and keep the .mkv.
         try:
-            shutil.move(src, fallback)
+            os.unlink(tmp_dst)
+        except FileNotFoundError:
+            pass
+
+        fallback      = os.path.splitext(dst)[0] + '.mkv'
+        fallback_part = fallback + '.part'
+        try:
+            shutil.move(src, fallback_part)
+            os.rename(fallback_part, fallback)
             print(f'[service] archive: fallback move {os.path.basename(src)}'
                   f' -> {os.path.basename(fallback)}', flush=True)
         except OSError as exc:
             print(f'[service] WARNING: could not move {src} to {fallback}: {exc}',
                   file=sys.stderr, flush=True)
+            try:
+                os.unlink(fallback_part)
+            except FileNotFoundError:
+                pass
 
     def _finalize_worker():
         while True:
