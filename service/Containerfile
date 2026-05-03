@@ -146,8 +146,13 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
              /usr/local/bin/archive_times.py /usr/local/bin/video_transcode.py \
              /usr/local/bin/desktop_config.py
 
-# ── Default archive volume ────────────────────────────────────────────────────
+# ── Default archive volumes ───────────────────────────────────────────────────
+# /archive holds completed (timestamp-named) segments.
+# /archive-live holds the in-progress segment until splitmuxsink rotates it,
+# then it's moved into /archive.  Keeping live segments separate lets
+# operators put them on a different (e.g. faster, ephemeral) filesystem.
 VOLUME /archive
+VOLUME /archive-live
 
 # ── Environment defaults (all overridable at runtime via -e) ────────────────
 # STREAM_WIDTH/STREAM_HEIGHT and DESKTOP_SPLITS are intentionally unset —
@@ -162,6 +167,7 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     DESKTOP_NAME=desktop \
     STREAM_FRAMERATE=30 \
     ARCHIVE_DIR=/archive \
+    ARCHIVE_LIVE_DIR=/archive-live \
     ARCHIVE_SEGMENT_SEC=600 \
     ARCHIVE_BITRATE=6000 \
     SIGNALLING_HOST=0.0.0.0 \

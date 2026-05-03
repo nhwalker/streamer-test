@@ -28,7 +28,10 @@ Environment variables:
   DISPLAY                X11 display for host mode                (:0)
   STREAM_FRAMERATE       frames per second for host mode          (30)
 
-  ARCHIVE_DIR            output dir for .mkv segments             (/archive)
+  ARCHIVE_DIR            output dir for completed .mkv segments   (/archive)
+  ARCHIVE_LIVE_DIR       output dir for the in-progress segment;
+                         each segment is moved to ARCHIVE_DIR when
+                         it rotates                              (/archive-live)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds              (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps            (6000)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
@@ -43,6 +46,7 @@ See desktop_config.py for DESKTOP_NAME, STREAM_WIDTH, STREAM_HEIGHT,
 DESKTOP_SPLITS, CROP_HEIGHT, and SIGNALLING_PORT.
 """
 import os
+import shutil
 import signal
 import sys
 import time
@@ -64,6 +68,7 @@ DISPLAY               = os.environ.get('DISPLAY', ':0')
 FRAMERATE             = os.environ.get('STREAM_FRAMERATE', '30')
 
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
+ARCHIVE_LIVE_DIR      = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
 ARCHIVE_MAX_BYTES     = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
@@ -114,9 +119,10 @@ def main():
 
     Gst.init(None)
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_LIVE_DIR, exist_ok=True)
 
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
-    archive_pattern = os.path.join(ARCHIVE_DIR, f'{archive_prefix}-%05d.mkv')
+    archive_pattern = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-%05d.mkv')
 
     print('[service] Starting stream service:', flush=True)
     print(f'  Desktop name      : {desktop_name}')
@@ -129,7 +135,8 @@ def main():
         print(f'  Mode              : caster')
         print(f'  Caster signalling : {caster_sig_uri}')
         print(f'  Resolution        : {width}x{height}')
-    print(f'  Archive           : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
+    print(f'  Live segments     : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
+    print(f'  Completed archive : {ARCHIVE_DIR}')
     print(f'  Archive bitrate   : {ARCHIVE_BITRATE} kbps')
     print(f'  Signalling /      : ws://127.0.0.1:{full_sig_port}')
     for s in screens:
@@ -219,14 +226,19 @@ def main():
         if frag_id not in _fragment_starts:
             return
         start_ns = _fragment_starts.pop(frag_id)
-        src = os.path.join(ARCHIVE_DIR, f'{archive_prefix}-{frag_id:05d}.mkv')
-        dst = renamed_segment_path(src, start_ns, end_ns, archive_prefix)
+        src = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-{frag_id:05d}.mkv')
+        dst = renamed_segment_path(src, start_ns, end_ns, archive_prefix,
+                                   dest_dir=ARCHIVE_DIR)
         try:
-            os.rename(src, dst)
+            # shutil.move is os.rename on the same filesystem; falls back to
+            # copy + delete when ARCHIVE_LIVE_DIR and ARCHIVE_DIR live on
+            # different filesystems (e.g. live on tmpfs, archive on a slower
+            # bulk volume).
+            shutil.move(src, dst)
             print(f'[service] archive: {os.path.basename(src)}'
                   f' -> {os.path.basename(dst)}', flush=True)
         except OSError as exc:
-            print(f'[service] WARNING: could not rename {src}: {exc}',
+            print(f'[service] WARNING: could not move {src} to {dst}: {exc}',
                   file=sys.stderr, flush=True)
 
     def _on_format_location_full(_splitmux, fragment_id, first_sample):

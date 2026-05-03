@@ -41,7 +41,10 @@ GET /video?last=<duration>
 Environment variables:
   WEB_PORT             HTTP listening port              (8080)
   WEB_DIR              Static file root                 (/var/www/html)
-  ARCHIVE_DIR          Directory of .mkv segments       (/archive)
+  ARCHIVE_DIR          Directory of completed .mkv      (/archive)
+                       segments (timestamp-named)
+  ARCHIVE_LIVE_DIR     Directory the in-progress        (/archive-live)
+                       segment is being written into
   ARCHIVE_SEGMENT_SEC  Nominal segment duration         (600)
   VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
   VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
@@ -64,6 +67,7 @@ from video_transcode import transcode_to_video
 
 WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
 ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')
+ARCHIVE_LIVE_DIR     = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
 ARCHIVE_SEGMENT_SEC  = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 VIDEO_FILL_COLOR     = int(os.environ.get('VIDEO_FILL_COLOR', '0xFF000000'), 16)
 VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
@@ -105,37 +109,36 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
-def stage_segments(archive_dir, start_ts, end_ts):
+def stage_segments(archive_dir, live_dir, start_ts, end_ts):
     """Copy overlapping segments into a TemporaryDirectory and return it.
 
-    Completed segments have their recording timestamps embedded in their
-    filenames (via the fragment-closed rename in pipeline.py); those
-    timestamps are used directly.
+    archive_dir   directory of completed segments — files with timestamps
+                  embedded in their filenames (renamed by pipeline.py when
+                  splitmuxsink rotates a fragment).
+    live_dir      directory the pipeline writes the in-progress segment
+                  into.  Pipeline moves each fragment from live_dir to
+                  archive_dir on rotation.
 
-    The current active segment (the highest-named unnamed file) is included
-    when its estimated time range overlaps the request window.  Its start
-    time is the end of the last completed segment; its end time is now().
-    If no completed segments exist before it, the active segment is excluded
-    (no reliable start time can be determined).
+    Completed segments have their recording timestamps embedded in their
+    filenames; those timestamps are used directly.
+
+    The current active segment (the highest-named unnamed file in live_dir)
+    is included when its estimated time range overlaps the request window.
+    Its start time is the end of the last completed segment; its end time
+    is now().  If no completed segments exist before it, the active
+    segment is excluded (no reliable start time can be determined).
 
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
     """
     tmp = tempfile.TemporaryDirectory(prefix='archive_stage_')
-    all_files = glob.glob(os.path.join(archive_dir, '*.mkv'))
-    if not all_files:
-        return tmp
 
     now = time.time()
     renamed = []
-    unnamed = []
-
-    for path in all_files:
+    for path in glob.glob(os.path.join(archive_dir, '*.mkv')):
         times = parse_segment_times(os.path.basename(path))
         if times:
             renamed.append((path, times[0], times[1]))
-        else:
-            unnamed.append(path)
 
     renamed.sort(key=lambda x: x[1])
 
@@ -146,30 +149,33 @@ def stage_segments(archive_dir, start_ts, end_ts):
             except FileNotFoundError:
                 pass  # purge deleted it between glob and copy; skip it
 
-    # The active (currently-writing) segment is the highest-named unnamed
-    # file.  Its start time equals the end of the last completed segment —
-    # the same boundary pipeline.py will use when it finalizes the file.
-    # Without a completed predecessor we have no reliable start time, so
-    # any other unnamed files (orphans from crashed runs) are dropped.
+    # The active (currently-writing) segment is the highest-named file in
+    # live_dir.  Its start time equals the end of the last completed
+    # segment — the same boundary pipeline.py will use when it finalizes
+    # the file.  Without a completed predecessor we have no reliable start
+    # time, so any other unnamed files (orphans from crashed runs) are
+    # dropped.
     #
-    # Race with segment rollover (pipeline.py calling os.rename):
-    #   - If we open() the file before rename fires, the fd holds a
+    # Race with segment rollover (pipeline.py calling shutil.move):
+    #   - If we open() the file before the move fires, the fd holds a
     #     reference to the inode; the copy completes even if the name
     #     changes underneath us.
-    #   - If rename fires before open(), we get FileNotFoundError.
-    #     The file now exists under its timestamp name, so we re-glob
-    #     to find and copy it as a completed segment.
-    if unnamed and renamed:
-        active    = max(unnamed)
+    #   - If the move fires before open(), we get FileNotFoundError.
+    #     The file now exists under its timestamp name in archive_dir,
+    #     so we re-glob there to find and copy it as a completed segment.
+    live_files = glob.glob(os.path.join(live_dir, '*.mkv'))
+    if live_files and renamed:
+        active    = max(live_files)
         seg_start = renamed[-1][2]
         seg_end   = now
         if seg_start < end_ts and seg_end > start_ts and seg_end - seg_start >= 1.0:
             prefix = os.path.basename(active).rsplit('-', 1)[0]
             dst = renamed_segment_path(
-                os.path.join(tmp.name, os.path.basename(active)),
+                active,
                 int(seg_start * 1e9),
                 int(seg_end   * 1e9),
                 prefix,
+                dest_dir=tmp.name,
             )
             try:
                 with open(active, 'rb') as src, open(dst, 'wb') as out:
@@ -244,7 +250,7 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'invalid parameter value')
             return
 
-        tmp = stage_segments(ARCHIVE_DIR, start_ts, end_ts)
+        tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
         try:
             zip_path = os.path.join(tmp.name, '_archive.zip')
             zip_segments(tmp.name, zip_path)
@@ -279,7 +285,7 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'requested range exceeds 12-hour maximum')
             return
 
-        stage_tmp  = stage_segments(ARCHIVE_DIR, start_ts, end_ts)
+        stage_tmp  = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
         output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
         try:
             output_path = os.path.join(output_tmp.name, 'video.mkv')
