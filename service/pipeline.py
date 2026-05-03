@@ -240,12 +240,20 @@ def main():
     _finalize_queue  = queue.Queue()
 
     def _remux_to_mp4(src, dst):
-        """Remux MKV → MP4 with faststart.  Returns True on success."""
+        """Remux MKV → MP4 with faststart.  Returns True on success.
+
+        `-f mp4` is passed explicitly because the on-disk filename has a
+        `.mp4.part` suffix during the write — ffmpeg's normal
+        extension-based muxer detection sees `.part` and fails with
+        "Unable to choose an output format".  The atomic rename to the
+        final `.mp4` happens after this call returns.
+        """
         result = subprocess.run(
             ['ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
              '-fflags', '+genpts', '-i', src,
              '-c', 'copy', '-map', '0:v:0',
-             '-movflags', '+faststart', dst],
+             '-movflags', '+faststart',
+             '-f', 'mp4', dst],
             capture_output=True,
         )
         if result.returncode != 0:
