@@ -334,9 +334,17 @@ def write_config(path=CONFIG_PATH_DEFAULT, env=None):
 
 
 def load_config(path=CONFIG_PATH_DEFAULT):
-    """Read a previously-written config file."""
-    with open(path) as fh:
-        return json.load(fh)
+    """Read a previously-written config file.
+
+    When the file does not exist (e.g. in unit tests that import the web
+    server module without running the entrypoint), fall back to computing
+    a fresh config from the current environment.
+    """
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return compute_config()
 
 
 if __name__ == '__main__':
