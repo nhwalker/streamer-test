@@ -157,36 +157,45 @@ abstract class AbstractLiveFeedColorTest {
         }
     }
 
-    // ── Test 0: latency display populates ────────────────────────────────────
+    // ── Test 0: stream metrics display populates ─────────────────────────────
 
     @Test
     @Order(0)
-    @DisplayName("Latency display shows a numeric value")
-    @Description("Verifies the page header eventually shows a numeric value for #m-lat "
-            + "(half the WebRTC RTT in milliseconds). No threshold is asserted because "
-            + "RTT/2 is a network-only metric, not glass-to-glass latency.")
-    void latencyDisplayShowsNumericValue() throws InterruptedException {
+    @DisplayName("Stream metrics display populates")
+    @Description("Verifies the page header populates every stream metric and the health dot. "
+            + "Asserts that within 30s of playback all of #m-lat (RTT/2 ms), #m-res (resolution), "
+            + "#m-qp (avg QP), #m-frz (freezes/min) show a value other than '--' and that "
+            + "#m-health gets a green/yellow/red class. No thresholds are asserted on the values "
+            + "themselves.")
+    void metricsDisplayPopulates() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 30_000;
-        String latText = null;
+        @SuppressWarnings("unchecked")
+        Map<String, Object> state = null;
         while (System.currentTimeMillis() < deadline) {
-            Object text = js().executeScript(
-                    "const el = document.getElementById('m-lat');"
-                    + "return el ? el.textContent.trim() : null;");
-            if (text instanceof String s && !s.equals("--")) {
-                latText = s;
-                break;
-            }
+            state = (Map<String, Object>) js().executeScript(
+                    "return {" +
+                    "  lat:    document.getElementById('m-lat').textContent.trim()," +
+                    "  res:    document.getElementById('m-res').textContent.trim()," +
+                    "  qp:     document.getElementById('m-qp').textContent.trim()," +
+                    "  frz:    document.getElementById('m-frz').textContent.trim()," +
+                    "  health: document.getElementById('m-health').className.trim()" +
+                    "};");
+            if (allMetricsPopulated(state)) return;
             Thread.sleep(200);
         }
-        if (latText == null) {
-            fail(collectDiagnostics("Latency element (#m-lat) did not update from '--' within 30 s"));
-            return;
+        fail(collectDiagnostics(
+                "Stream metrics did not fully populate within 30 s; last state: " + state));
+    }
+
+    private static boolean allMetricsPopulated(Map<String, Object> state) {
+        if (state == null) return false;
+        for (String key : new String[]{"lat", "res", "qp", "frz"}) {
+            Object v = state.get(key);
+            if (!(v instanceof String s) || s.isEmpty() || s.equals("--")) return false;
         }
-        try {
-            Double.parseDouble(latText);
-        } catch (NumberFormatException e) {
-            fail(collectDiagnostics("Could not parse latency value '" + latText + "' from #m-lat element"));
-        }
+        Object h = state.get("health");
+        return h instanceof String hs
+                && (hs.equals("green") || hs.equals("yellow") || hs.equals("red"));
     }
 
     private String collectDiagnostics(String reason) {
@@ -196,12 +205,20 @@ abstract class AbstractLiveFeedColorTest {
         try {
             Object pageState = js().executeScript(
                     "const v = document.querySelector('video');" +
+                    "const txt = id => {" +
+                    "  const el = document.getElementById(id);" +
+                    "  return el ? el.textContent : 'missing';" +
+                    "};" +
                     "return {" +
-                    "  mLat: document.getElementById('m-lat') ? document.getElementById('m-lat').textContent : 'missing'," +
-                    "  mFps: document.getElementById('m-fps') ? document.getElementById('m-fps').textContent : 'missing'," +
-                    "  videoWidth: v ? v.videoWidth : -1," +
+                    "  mFps:   txt('m-fps')," +
+                    "  mLat:   txt('m-lat')," +
+                    "  mRes:   txt('m-res')," +
+                    "  mQp:    txt('m-qp')," +
+                    "  mFrz:   txt('m-frz')," +
+                    "  mHealth: document.getElementById('m-health') ? document.getElementById('m-health').className : 'missing'," +
+                    "  videoWidth:  v ? v.videoWidth  : -1," +
                     "  currentTime: v ? v.currentTime : -1," +
-                    "  readyState: v ? v.readyState : -1" +
+                    "  readyState:  v ? v.readyState  : -1" +
                     "};");
             sb.append("  page state: ").append(pageState).append("\n");
         } catch (Exception e) {

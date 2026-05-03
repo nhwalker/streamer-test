@@ -328,22 +328,23 @@ class TestWebRTCStream:
                 f"from the red Xvfb root. Last sample: {last_stats}"
             )
 
-    def test_latency_displayed(self, streaming_container, _caster, _service, browser, turn_params):
+    def test_metrics_displayed(self, streaming_container, _caster, _service, browser, turn_params):
         """
-        Verify the page header eventually shows a numeric value for #m-lat.
+        Verify the page header populates every stream metric and the health dot.
 
-        The header displays half the WebRTC round-trip time in milliseconds
-        (network only — does not include encode/jitter/decode/render delay).
-        We don't assert a threshold because RTT/2 is not glass-to-glass latency
-        and tightening it would just be flaky on CI hardware.
+        Asserts that within 30s of playback all of #m-lat (RTT/2 ms),
+        #m-res (resolution), #m-qp (avg QP), #m-frz (freezes/min) show a value
+        other than '--' and that #m-health gets a green/yellow/red class.
+        No thresholds are asserted on the values themselves — RTT/2 and QP are
+        not absolute quality measures, and CI hardware varies too much for a
+        meaningful bound.
         """
         http_port, ws_port = streaming_container
         _wait_for_playing(browser, http_port, ws_port, turn_params)
         try:
-            _wait_for_latency_display(browser)
-        except Exception:
-            _dump_diagnostics(browser, _caster, _service,
-                              "latency display never updated from '--'")
+            _wait_for_metrics(browser)
+        except TimeoutError as exc:
+            _dump_diagnostics(browser, _caster, _service, str(exc))
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -423,12 +424,22 @@ def _dump_diagnostics(browser, caster, service, reason):
     try:
         page_state = browser.execute_script("""
             const v = document.querySelector('video');
+            const txt = id => {
+                const el = document.getElementById(id);
+                return el ? el.textContent : 'missing';
+            };
             return {
-                m_lat: document.getElementById('m-lat').textContent,
-                m_fps: document.getElementById('m-fps').textContent,
-                videoWidth: v ? v.videoWidth : -1,
+                m_fps:    txt('m-fps'),
+                m_lat:    txt('m-lat'),
+                m_res:    txt('m-res'),
+                m_qp:     txt('m-qp'),
+                m_frz:    txt('m-frz'),
+                m_health: document.getElementById('m-health')
+                    ? document.getElementById('m-health').className
+                    : 'missing',
+                videoWidth:  v ? v.videoWidth  : -1,
                 currentTime: v ? v.currentTime : -1,
-                readyState: v ? v.readyState : -1,
+                readyState:  v ? v.readyState  : -1,
             };
         """)
     except Exception as exc:
@@ -446,20 +457,31 @@ def _dump_diagnostics(browser, caster, service, reason):
     )
 
 
-def _wait_for_latency_display(driver, timeout=30):
-    """Poll until the latency header shows a numeric value (not '--')."""
+def _wait_for_metrics(driver, timeout=30):
+    """Poll until every metric span populates and #m-health gets a color class."""
     deadline = time.time() + timeout
+    last_state = {}
     while time.time() < deadline:
-        text = driver.execute_script(
-            "return document.getElementById('m-lat').textContent;"
+        last_state = driver.execute_script("""
+            return {
+                lat:    document.getElementById('m-lat').textContent.trim(),
+                res:    document.getElementById('m-res').textContent.trim(),
+                qp:     document.getElementById('m-qp').textContent.trim(),
+                frz:    document.getElementById('m-frz').textContent.trim(),
+                health: document.getElementById('m-health').className.trim(),
+            };
+        """)
+        text_ok = all(
+            last_state.get(k) not in (None, '', '--')
+            for k in ('lat', 'res', 'qp', 'frz')
         )
-        try:
-            float(text)
-            return
-        except (ValueError, TypeError):
-            pass
+        health_ok = last_state.get('health') in ('green', 'yellow', 'red')
+        if text_ok and health_ok:
+            return last_state
         time.sleep(0.5)
-    pytest.fail(f"Latency header did not show a numeric value within {timeout}s")
+    raise TimeoutError(
+        f"Stream metrics did not fully populate within {timeout}s; last state: {last_state}"
+    )
 
 
 # ── Level 3: split-stream playback + dimensions ───────────────────────────────

@@ -30,6 +30,20 @@
       font-variant-numeric: tabular-nums;
     }
 
+    #m-health {
+      display: inline-block;
+      width: 0.7em;
+      height: 0.7em;
+      border-radius: 50%;
+      margin-right: 0.4em;
+      background: #555;
+      vertical-align: middle;
+      transition: background-color 0.3s;
+    }
+    #m-health.green  { background: #4caf50; }
+    #m-health.yellow { background: #ffc107; }
+    #m-health.red    { background: #f44336; }
+
     #video-area {
       flex: 1 1 0;
       min-height: 0;
@@ -65,9 +79,13 @@
 </head>
 <body>
   <div id="header">
+    <span id="m-health" title="Stream health. Green: healthy. Yellow: high QP or 1–5% loss. Red: freezes, &gt;5% loss, or keyframe requests."></span>
     Desktop: <span id="m-name">--</span>
     &nbsp;&nbsp;FPS: <span id="m-fps">--</span>
-    &nbsp;&nbsp;Net RTT/2 (ms): <span id="m-lat" title="Half of the WebRTC round-trip time. Network only — does not include encode, jitter buffer, decode or render delay.">--</span>
+    &nbsp;&nbsp;RTT/2 (ms): <span id="m-lat" title="Half of the WebRTC round-trip time. Network only — does not include encode, jitter buffer, decode or render delay.">--</span>
+    &nbsp;&nbsp;Res: <span id="m-res">--</span>
+    &nbsp;&nbsp;QP: <span id="m-qp" title="Average quantization parameter over the rolling 10s window. Higher = more compression. Codec-dependent scale (H.264: 0–51, VP9/AV1: 0–255, VP8: 0–127).">--</span>
+    &nbsp;&nbsp;Freezes/min: <span id="m-frz" title="Stalls &gt;150 ms detected by the browser, scaled to per-minute rate over the rolling 10s window.">--</span>
   </div>
   <div id="video-area">
     <p id="status">Connecting to signalling server…</p>
@@ -152,7 +170,13 @@
     };
 
     let _metricsTimer = null;
-    let _prevFramesDecoded = 0, _prevFramesTime = 0;
+    const _snapshots = [];     // rolling window of inbound-rtp counters
+    const WINDOW_LEN = 10;     // 1Hz × 10 = ~10s rolling window
+
+    // Codec-dependent QP ranges; used to set the "yellow" threshold for the health dot.
+    // Source: codec specs. H.264: 0–51, VP8: 0–127, VP9/AV1: 0–255.
+    const QP_MAX = { 'video/H264': 51, 'video/VP8': 127, 'video/VP9': 255, 'video/AV1': 255 };
+    const QP_YELLOW_RATIO = 0.7;
 
     async function updateMetrics() {
       const pc = window._streamPc;
@@ -160,22 +184,25 @@
       let stats;
       try { stats = await pc.getStats(); } catch (_) { return; }
 
-      let fps    = null;
+      const codecsById = new Map();
+      stats.forEach(r => { if (r.type === 'codec') codecsById.set(r.id, r.mimeType); });
+
+      const snap = { t: performance.now() };
+      let curFps = null;
       let rttSec = null;
-      const now  = performance.now();
 
       stats.forEach(r => {
         if (r.type === 'inbound-rtp' && r.kind === 'video') {
-          if (typeof r.framesPerSecond === 'number') {
-            fps = r.framesPerSecond;
-          } else if (typeof r.framesDecoded === 'number' && _prevFramesTime > 0) {
-            const dt = (now - _prevFramesTime) / 1000;
-            if (dt > 0) fps = (r.framesDecoded - _prevFramesDecoded) / dt;
-          }
-          if (typeof r.framesDecoded === 'number') {
-            _prevFramesDecoded = r.framesDecoded;
-            _prevFramesTime    = now;
-          }
+          curFps              = (typeof r.framesPerSecond === 'number') ? r.framesPerSecond : null;
+          snap.framesDecoded  = r.framesDecoded     ?? 0;
+          snap.qpSum          = (typeof r.qpSum === 'number') ? r.qpSum : null;
+          snap.freezeCount    = r.freezeCount       ?? 0;
+          snap.packetsLost    = r.packetsLost       ?? 0;
+          snap.packetsReceived= r.packetsReceived   ?? 0;
+          snap.pliCount       = r.pliCount          ?? 0;
+          snap.frameWidth     = r.frameWidth        ?? 0;
+          snap.frameHeight    = r.frameHeight       ?? 0;
+          snap.mimeType       = codecsById.get(r.codecId) || null;
         }
         // Per-stream RTT (preferred): from RTCP RR/SR exchange for this video track.
         if (r.type === 'remote-inbound-rtp' && r.kind === 'video') {
@@ -193,9 +220,65 @@
         });
       }
 
+      _snapshots.push(snap);
+      while (_snapshots.length > WINDOW_LEN + 1) _snapshots.shift();
+
+      const old    = _snapshots[0];
+      const winSec = (snap.t - old.t) / 1000;
+
+      // FPS: prefer Chrome's instantaneous value; fallback to window-averaged delta.
+      let fps = curFps;
+      if (fps == null && winSec > 0 && snap.framesDecoded != null && old.framesDecoded != null) {
+        fps = (snap.framesDecoded - old.framesDecoded) / winSec;
+      }
+
+      // Average QP per frame over the window.
+      const dFrames = (snap.framesDecoded ?? 0) - (old.framesDecoded ?? 0);
+      const avgQp   = (snap.qpSum != null && old.qpSum != null && dFrames > 0)
+          ? (snap.qpSum - old.qpSum) / dFrames
+          : null;
+
+      // Loss percentage over the window.
+      const dLost   = snap.packetsLost      - old.packetsLost;
+      const dRecv   = snap.packetsReceived  - old.packetsReceived;
+      const lossPct = (dRecv + dLost) > 0 ? (dLost / (dRecv + dLost)) * 100 : null;
+
+      // Freezes per minute, rescaled from the window length.
+      const dFreezes      = snap.freezeCount - old.freezeCount;
+      const freezesPerMin = winSec > 0 ? (dFreezes / winSec) * 60 : null;
+
+      // Keyframe requests over the window — even one means severe loss.
+      const dPli = snap.pliCount - old.pliCount;
+
+      const res = (snap.frameWidth && snap.frameHeight)
+          ? `${snap.frameWidth}×${snap.frameHeight}`
+          : null;
+
+      // Health classifier — needs a few samples before it's meaningful.
+      let health = null;
+      if (_snapshots.length >= 3) {
+        const qpYellow = (QP_MAX[snap.mimeType] ?? 51) * QP_YELLOW_RATIO;
+        if ((freezesPerMin != null && freezesPerMin > 2)
+            || dPli > 0
+            || (lossPct != null && lossPct > 5)) {
+          health = 'red';
+        } else if ((avgQp != null && avgQp > qpYellow)
+            || (lossPct != null && lossPct > 1)) {
+          health = 'yellow';
+        } else if (fps != null && fps > 0) {
+          health = 'green';
+        }
+      }
+
       document.getElementById('m-fps').textContent = fps    != null ? fps.toFixed(1) : '--';
       // RTT/2 in ms = rttSec * 1000 / 2 = rttSec * 500
       document.getElementById('m-lat').textContent = rttSec != null ? Math.round(rttSec * 500).toString() : '--';
+      document.getElementById('m-res').textContent = res    ?? '--';
+      document.getElementById('m-qp' ).textContent = avgQp  != null ? Math.round(avgQp).toString() : '--';
+      document.getElementById('m-frz').textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
+      const dot = document.getElementById('m-health');
+      dot.classList.remove('green', 'yellow', 'red');
+      if (health) dot.classList.add(health);
     }
 
     function startMetrics() {
@@ -209,10 +292,11 @@
         clearInterval(_metricsTimer);
         _metricsTimer = null;
       }
-      _prevFramesDecoded = 0;
-      _prevFramesTime    = 0;
-      document.getElementById('m-fps').textContent = '--';
-      document.getElementById('m-lat').textContent = '--';
+      _snapshots.length = 0;
+      for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz']) {
+        document.getElementById(id).textContent = '--';
+      }
+      document.getElementById('m-health').classList.remove('green', 'yellow', 'red');
     }
 
     setStatus(`Connecting to ${sigUrl} …`);
