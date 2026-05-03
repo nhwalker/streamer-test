@@ -27,10 +27,13 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+import org.openqa.selenium.logging.LogType;
+import org.openqa.selenium.logging.LoggingPreferences;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -112,6 +115,9 @@ abstract class AbstractLiveFeedColorTest {
         // Paint the display red before opening the browser so the first frame is red.
         stack.setDesktopColor("#ff0000");
 
+        LoggingPreferences logPrefs = new LoggingPreferences();
+        logPrefs.enable(LogType.BROWSER, Level.ALL);
+
         ChromeOptions opts = new ChromeOptions();
         opts.addArguments(
                 "--headless=new",
@@ -122,6 +128,7 @@ abstract class AbstractLiveFeedColorTest {
                 "--disable-features=WebRtcHideLocalIpsWithMdns",
                 "--allow-loopback-for-peer-connection"
         );
+        opts.setCapability("goog:loggingPrefs", logPrefs);
         driver = new ChromeDriver(opts);
         driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
 
@@ -160,8 +167,8 @@ abstract class AbstractLiveFeedColorTest {
     @DisplayName("Live stream latency is below threshold")
     @Description("Reads the latency value rendered in the page header (#m-lat, in seconds) "
             + "and asserts it is below MAX_LATENCY_MS. The header shows "
-            + "'Latency (secs): <value>' where value is updated every second from the "
-            + "capture timestamp delivered by the service's WebRTC data channel.")
+            + "'Latency (secs): <value>' where value comes from the capture timestamp "
+            + "embedded via the abs-capture-time RTP header extension.")
     void latencyIsBelowThreshold() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 30_000;
         String latText = null;
@@ -175,20 +182,75 @@ abstract class AbstractLiveFeedColorTest {
             }
             Thread.sleep(200);
         }
-        assertNotNull(latText,
-                "Latency element (#m-lat) did not update from '--' within 30 s");
+        if (latText == null) {
+            fail(collectDiagnostics("Latency element (#m-lat) did not update from '--' within 30 s"));
+            return;
+        }
 
         double latencySecs;
         try {
             latencySecs = Double.parseDouble(latText);
         } catch (NumberFormatException e) {
-            fail("Could not parse latency value '" + latText + "' from #m-lat element");
+            fail(collectDiagnostics("Could not parse latency value '" + latText + "' from #m-lat element"));
             return;
         }
         long latencyMs = Math.round(latencySecs * 1000);
-        assertTrue(latencyMs < MAX_LATENCY_MS,
-                "End-to-end latency " + latencyMs + " ms (" + latText + " s) "
-                + "exceeds threshold " + MAX_LATENCY_MS + " ms");
+        if (latencyMs >= MAX_LATENCY_MS) {
+            fail(collectDiagnostics("End-to-end latency " + latencyMs + " ms (" + latText + " s) "
+                    + "exceeds threshold " + MAX_LATENCY_MS + " ms"));
+        }
+    }
+
+    private String collectDiagnostics(String reason) {
+        StringBuilder sb = new StringBuilder(reason).append("\n");
+
+        // Page state
+        try {
+            Object pageState = js().executeScript(
+                    "const v = document.querySelector('video');" +
+                    "return {" +
+                    "  mLat: document.getElementById('m-lat') ? document.getElementById('m-lat').textContent : 'missing'," +
+                    "  mFps: document.getElementById('m-fps') ? document.getElementById('m-fps').textContent : 'missing'," +
+                    "  videoWidth: v ? v.videoWidth : -1," +
+                    "  currentTime: v ? v.currentTime : -1," +
+                    "  readyState: v ? v.readyState : -1" +
+                    "};");
+            sb.append("  page state: ").append(pageState).append("\n");
+        } catch (Exception e) {
+            sb.append("  page state: (error: ").append(e.getMessage()).append(")\n");
+        }
+
+        // Browser console logs (includes [rvfc-diag] and WebRTC errors)
+        try {
+            var entries = driver.manage().logs().get(LogType.BROWSER).getAll();
+            sb.append("  browser console (").append(entries.size()).append(" entries):\n");
+            for (var entry : entries) {
+                sb.append("    [").append(entry.getLevel()).append("] ")
+                  .append(entry.getMessage()).append("\n");
+            }
+        } catch (Exception e) {
+            sb.append("  browser console: (error: ").append(e.getMessage()).append(")\n");
+        }
+
+        // Service container logs (includes [abs-cap-ext] diagnostic lines)
+        try {
+            sb.append("===== service container logs =====\n")
+              .append(stack.serviceLogs()).append("\n");
+        } catch (Exception e) {
+            sb.append("===== service container logs: error: ").append(e.getMessage()).append("\n");
+        }
+
+        // Caster container logs (caster mode only; empty string in host mode)
+        try {
+            String cl = stack.casterLogs();
+            if (!cl.isEmpty()) {
+                sb.append("===== caster container logs =====\n").append(cl).append("\n");
+            }
+        } catch (Exception e) {
+            sb.append("===== caster container logs: error: ").append(e.getMessage()).append("\n");
+        }
+
+        return sb.toString();
     }
 
     // ── Test 1: live flip verification ────────────────────────────────────────
