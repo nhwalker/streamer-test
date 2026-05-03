@@ -3,14 +3,15 @@ pytest fixtures for the streamer-test container integration suite.
 
 Fixture dependency graph:
 
-    xvfb_display (session)                          archive_dir (session)
+    xvfb_display (session)              archive_dir, archive_live_dir (session)
          │                                                 │
          ▼                                                 │
     _caster (session)  ── runs caster container            │
          │  webrtcsink published to caster's signalling    │
          ▼  server on CASTER_SIGNALLING_PORT               ▼
     _service (session)  ── runs service container; webrtcsrc dials caster,
-         │                  mounts archive_dir as /archive
+         │                  mounts archive_dir as /archive,
+         │                  mounts archive_live_dir as /archive-live
          ▼
     streaming_container (session)  ──► yields (http_port, ws_port)
          │
@@ -206,8 +207,22 @@ def xvfb_display():
 
 @pytest.fixture(scope="session")
 def archive_dir(tmp_path_factory):
-    """Host directory mounted into the service container as /archive."""
+    """Host directory mounted into the service container as /archive.
+
+    Holds completed (timestamp-named) segments only.
+    """
     path = tmp_path_factory.mktemp("archive")
+    os.chmod(path, 0o777)
+    return str(path)
+
+
+@pytest.fixture(scope="session")
+def archive_live_dir(tmp_path_factory):
+    """Host directory mounted into the service container as /archive-live.
+
+    Holds the in-progress segment that splitmuxsink is currently writing.
+    """
+    path = tmp_path_factory.mktemp("archive_live")
     os.chmod(path, 0o777)
     return str(path)
 
@@ -268,7 +283,7 @@ def caster_peer_id(_caster):
 
 # ── Service ──────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
-def _service(_caster, caster_peer_id, archive_dir):
+def _service(_caster, caster_peer_id, archive_dir, archive_live_dir):
     """
     The service container: webrtcsrc dials caster → tee → archive + webrtcsink.
 
@@ -288,6 +303,7 @@ def _service(_caster, caster_peer_id, archive_dir):
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping(archive_dir, "/archive", "rw")
+        .with_volume_mapping(archive_live_dir, "/archive-live", "rw")
         .with_kwargs(network_mode="host")
     )
     with container:
@@ -343,31 +359,43 @@ def turn_params():
     })
 
 
-def _wait_for_first_segment(archive_dir, timeout=30.0):
+def _wait_for_first_segment(live_dir, timeout=30.0):
+    """Wait for the first in-progress stream-NNNNN.mkv to appear in live_dir."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        first = min(
-            (f for f in os.listdir(archive_dir)
-             if f.startswith("stream-") and f.endswith(".mkv")),
-            default=None,
-        )
-        if first:
-            return os.path.join(archive_dir, first)
+        if os.path.isdir(live_dir):
+            first = min(
+                (f for f in os.listdir(live_dir)
+                 if f.startswith("stream-") and f.endswith(".mkv")),
+                default=None,
+            )
+            if first:
+                return os.path.join(live_dir, first)
         time.sleep(0.5)
     return None
 
 
 @pytest.fixture(scope="session")
-def first_segment(streaming_container, archive_dir, _caster, _service):
-    """Path to the first .mkv archive segment, waiting up to 30 s."""
-    path = _wait_for_first_segment(archive_dir, timeout=30.0)
+def first_segment(streaming_container, archive_live_dir, archive_dir,
+                  _caster, _service):
+    """Path to the first in-progress .mkv segment, waiting up to 30 s.
+
+    The active segment is written into archive_live_dir; only after a
+    fragment rotates does it move into archive_dir under its timestamp
+    name.
+    """
+    path = _wait_for_first_segment(archive_live_dir, timeout=30.0)
     if path is None:
         service_out, service_err = _service.get_logs()
         caster_out, caster_err   = _caster.get_logs()
-        listing = os.listdir(archive_dir) if os.path.isdir(archive_dir) else []
+        live_listing = os.listdir(archive_live_dir) \
+            if os.path.isdir(archive_live_dir) else []
+        archive_listing = os.listdir(archive_dir) \
+            if os.path.isdir(archive_dir) else []
         raise RuntimeError(
-            f"No stream-*.mkv appeared in {archive_dir} within 30 s.\n"
-            f"Directory listing: {listing}\n"
+            f"No stream-*.mkv appeared in {archive_live_dir} within 30 s.\n"
+            f"Live dir listing:    {live_listing}\n"
+            f"Archive dir listing: {archive_listing}\n"
             f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
             f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
             f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"

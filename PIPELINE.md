@@ -307,7 +307,7 @@ would be undecodable without seeking back to the previous segment.
 | Property | Value | Purpose |
 |---|---|---|
 | `muxer-factory` | `matroskamux` | Wrap H.264 in Matroska (.mkv) container |
-| `location` | `/archive/{prefix}-%05d.mkv` | Output path with zero-padded segment index |
+| `location` | `${ARCHIVE_LIVE_DIR}/{prefix}-%05d.mkv` | Output path for the in-progress segment |
 | `max-size-time` | `ARCHIVE_SEGMENT_SEC × Gst.SECOND` | Rotate to a new file every N seconds |
 
 Muxes the H.264 stream into rotating Matroska segments. `splitmuxsink` opens a
@@ -316,13 +316,21 @@ limit, ensuring no single file grows unboundedly. Matroska was chosen over MP4
 because it handles non-monotonic timestamps and open-ended streams gracefully,
 and does not require a final `moov` atom write to be playable.
 
+The in-progress segment is written into `ARCHIVE_LIVE_DIR` (default
+`/archive-live`).  When the segment rotates, it is moved into `ARCHIVE_DIR`
+(default `/archive`) under its final timestamp-based name.  Keeping the live
+write path on its own filesystem (e.g. tmpfs or a fast local disk) and the
+completed archive on a slower bulk volume is supported transparently —
+`shutil.move` handles cross-filesystem moves.
+
 ---
 
 ### Segment Naming and Timestamping
 
-Segments are written with sequential numeric names
+Segments are written into `ARCHIVE_LIVE_DIR` with sequential numeric names
 (`{prefix}-00000.mkv`, `{prefix}-00001.mkv`, …).  When a segment is completed,
-it is atomically renamed to embed its precise wall-clock recording interval:
+it is moved into `ARCHIVE_DIR` and renamed to embed its precise wall-clock
+recording interval:
 
 ```
 {prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mkv
@@ -342,7 +350,8 @@ now_ns = pipeline.get_base_time() + buf.pts
 
 This value simultaneously becomes the **end** timestamp of the just-completed
 fragment and the **start** timestamp of the new one.  The old fragment is
-renamed immediately using `archive_times.renamed_segment_path()`.
+moved from `ARCHIVE_LIVE_DIR` to `ARCHIVE_DIR` immediately, with the new name
+computed by `archive_times.renamed_segment_path()`.
 
 On pipeline shutdown (EOS), `format-location-full` does not fire for the final
 fragment.  The EOS handler (`on_message`) renames it using
@@ -367,8 +376,10 @@ When either `ARCHIVE_MAX_BYTES` or `ARCHIVE_MAX_AGE_DAYS` is non-zero,
 
 The purge logic (`archive_purge.py`):
 
-1. Sorts all `.mkv` files in `ARCHIVE_DIR` by mtime.
-2. Exempts the most recent file (it may still be open for writing).
+1. Sorts all `.mkv` files in `ARCHIVE_DIR` (completed segments only) by mtime.
+2. Exempts the most recent file as a safety margin so at least one segment
+   always survives.  The currently-writing segment lives in
+   `ARCHIVE_LIVE_DIR` and is therefore never visible to the purger.
 3. If `ARCHIVE_MAX_AGE_DAYS` is set, deletes every remaining file whose mtime
    is older than the cutoff.
 4. If `ARCHIVE_MAX_BYTES` is set, deletes the oldest remaining files one by
@@ -593,7 +604,8 @@ Requests longer than 12 hours are rejected with 400.
 | `STREAM_WIDTH` | `1920` (caster) / native (host) | Capture width.  In host mode, leaving it unset reads the X server's native width via `xrandr` |
 | `STREAM_HEIGHT` | `1080` (caster) / native (host) | Capture height.  In host mode, leaving it unset reads the X server's native height via `xrandr` |
 | `DESKTOP_SPLITS` | _(empty)_ | `WxH+X+Y;WxH+X+Y;…` regions.  In host mode unset triggers `xrandr --listmonitors` auto-detection.  In caster mode unset falls back to a `CROP_HEIGHT`-based top/bottom split |
-| `ARCHIVE_DIR` | `/archive` | Output directory for `.mkv` segments |
+| `ARCHIVE_DIR` | `/archive` | Directory for completed (timestamp-named) `.mkv` segments |
+| `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress segment is written into; each segment is moved into `ARCHIVE_DIR` when it rotates |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
 | `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps |
 | `ARCHIVE_MAX_BYTES` | `0` | Delete oldest segments when archive exceeds this size; `0` = unlimited |

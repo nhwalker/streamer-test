@@ -12,7 +12,7 @@
 #   CASTER_HOST empty -> host mode:   capture X11 directly via ximagesrc
 set -euo pipefail
 
-mkdir -p "${ARCHIVE_DIR}"
+mkdir -p "${ARCHIVE_DIR}" "${ARCHIVE_LIVE_DIR}"
 
 # ── GPU pre-flight ────────────────────────────────────────────────────────────
 if command -v nvidia-smi &>/dev/null; then
@@ -114,7 +114,7 @@ echo "│  Ingest    : X11 display ${DISPLAY} (host mode)       "
 else
 echo "│  Ingest    : ws://${CASTER_HOST}:${CASTER_SIGNALLING_PORT} (caster)  "
 fi
-echo "│  Archive   : ${ARCHIVE_DIR}                         "
+echo "│  Archive   : ${ARCHIVE_DIR} (live: ${ARCHIVE_LIVE_DIR})"
 echo "└─────────────────────────────────────────────────────┘"
 echo ""
 

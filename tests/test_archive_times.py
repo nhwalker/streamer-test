@@ -73,6 +73,21 @@ class TestRenamedSegmentPath:
         path = renamed_segment_path('/my/archive/dir/stream-00000.mkv', _REF_NS, _REF_NS + 1, 'stream')
         assert os.path.dirname(path) == '/my/archive/dir'
 
+    def test_dest_dir_overrides_source_directory(self):
+        path = renamed_segment_path(
+            '/archive-live/stream-00000.mkv', _REF_NS, _REF_NS + 1, 'stream',
+            dest_dir='/archive',
+        )
+        assert os.path.dirname(path) == '/archive'
+        assert os.path.basename(path).startswith('stream_')
+
+    def test_dest_dir_none_falls_back_to_source(self):
+        path = renamed_segment_path(
+            '/archive-live/stream-00000.mkv', _REF_NS, _REF_NS + 1, 'stream',
+            dest_dir=None,
+        )
+        assert os.path.dirname(path) == '/archive-live'
+
 
 class TestParseSegmentTimes:
 
