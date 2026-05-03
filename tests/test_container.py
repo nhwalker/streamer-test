@@ -333,11 +333,11 @@ class TestWebRTCStream:
         Verify the page header populates every stream metric and the health dot.
 
         Asserts that within 30s of playback all of #m-lat (RTT/2 ms),
-        #m-res (resolution), #m-qp (avg QP), #m-frz (freezes/min) show a value
-        other than '--' and that #m-health gets a green/yellow/red class.
-        No thresholds are asserted on the values themselves — RTT/2 and QP are
-        not absolute quality measures, and CI hardware varies too much for a
-        meaningful bound.
+        #m-res (resolution), #m-qp (avg QP), #m-frz (freezes/min),
+        #m-jbd (jitter buffer delay ms) show a value other than '--' and that
+        #m-health gets a green/yellow/red class.  No thresholds are asserted
+        on the values themselves — RTT/2 and QP are not absolute quality
+        measures, and CI hardware varies too much for a meaningful bound.
         """
         http_port, ws_port = streaming_container
         _wait_for_playing(browser, http_port, ws_port, turn_params)
@@ -434,6 +434,7 @@ def _dump_diagnostics(browser, caster, service, reason):
                 m_res:    txt('m-res'),
                 m_qp:     txt('m-qp'),
                 m_frz:    txt('m-frz'),
+                m_jbd:    txt('m-jbd'),
                 m_health: document.getElementById('m-health')
                     ? document.getElementById('m-health').className
                     : 'missing',
@@ -468,12 +469,13 @@ def _wait_for_metrics(driver, timeout=30):
                 res:    document.getElementById('m-res').textContent.trim(),
                 qp:     document.getElementById('m-qp').textContent.trim(),
                 frz:    document.getElementById('m-frz').textContent.trim(),
+                jbd:    document.getElementById('m-jbd').textContent.trim(),
                 health: document.getElementById('m-health').className.trim(),
             };
         """)
         text_ok = all(
             last_state.get(k) not in (None, '', '--')
-            for k in ('lat', 'res', 'qp', 'frz')
+            for k in ('lat', 'res', 'qp', 'frz', 'jbd')
         )
         health_ok = last_state.get('health') in ('green', 'yellow', 'red')
         if text_ok and health_ok:

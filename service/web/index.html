@@ -86,6 +86,7 @@
     &nbsp;&nbsp;Res: <span id="m-res">--</span>
     &nbsp;&nbsp;QP: <span id="m-qp" title="Average quantization parameter over the rolling 10s window. Higher = more compression. Codec-dependent scale (H.264: 0–51, VP9/AV1: 0–255, VP8: 0–127).">--</span>
     &nbsp;&nbsp;Freezes/min: <span id="m-frz" title="Stalls &gt;150 ms detected by the browser, scaled to per-minute rate over the rolling 10s window.">--</span>
+    &nbsp;&nbsp;JBD (ms): <span id="m-jbd" title="Average jitter buffer delay per frame over the rolling 10s window. The receiver holds each frame this long after arrival to absorb network timing variance. Rising values usually predict freezes a few seconds before they happen.">--</span>
   </div>
   <div id="video-area">
     <p id="status">Connecting to signalling server…</p>
@@ -200,6 +201,8 @@
           snap.packetsLost    = r.packetsLost       ?? 0;
           snap.packetsReceived= r.packetsReceived   ?? 0;
           snap.pliCount       = r.pliCount          ?? 0;
+          snap.jbDelay        = (typeof r.jitterBufferDelay         === 'number') ? r.jitterBufferDelay         : null;
+          snap.jbEmitted      = (typeof r.jitterBufferEmittedCount  === 'number') ? r.jitterBufferEmittedCount  : null;
           snap.frameWidth     = r.frameWidth        ?? 0;
           snap.frameHeight    = r.frameHeight       ?? 0;
           snap.mimeType       = codecsById.get(r.codecId) || null;
@@ -250,6 +253,14 @@
       // Keyframe requests over the window — even one means severe loss.
       const dPli = snap.pliCount - old.pliCount;
 
+      // Average jitter buffer delay per frame over the window, in ms.
+      // Rising = network getting bursty; usually predicts freezes.
+      const avgJbMs = (snap.jbDelay != null && old.jbDelay != null
+                       && snap.jbEmitted != null && old.jbEmitted != null
+                       && (snap.jbEmitted - old.jbEmitted) > 0)
+          ? ((snap.jbDelay - old.jbDelay) / (snap.jbEmitted - old.jbEmitted)) * 1000
+          : null;
+
       const res = (snap.frameWidth && snap.frameHeight)
           ? `${snap.frameWidth}×${snap.frameHeight}`
           : null;
@@ -263,7 +274,8 @@
             || (lossPct != null && lossPct > 5)) {
           health = 'red';
         } else if ((avgQp != null && avgQp > qpYellow)
-            || (lossPct != null && lossPct > 1)) {
+            || (lossPct != null && lossPct > 1)
+            || (avgJbMs != null && avgJbMs > 200)) {
           health = 'yellow';
         } else if (fps != null && fps > 0) {
           health = 'green';
@@ -276,6 +288,7 @@
       document.getElementById('m-res').textContent = res    ?? '--';
       document.getElementById('m-qp' ).textContent = avgQp  != null ? Math.round(avgQp).toString() : '--';
       document.getElementById('m-frz').textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
+      document.getElementById('m-jbd').textContent = avgJbMs != null ? Math.round(avgJbMs).toString() : '--';
       const dot = document.getElementById('m-health');
       dot.classList.remove('green', 'yellow', 'red');
       if (health) dot.classList.add(health);
@@ -293,7 +306,7 @@
         _metricsTimer = null;
       }
       _snapshots.length = 0;
-      for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz']) {
+      for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz', 'm-jbd']) {
         document.getElementById(id).textContent = '--';
       }
       document.getElementById('m-health').classList.remove('green', 'yellow', 'red');

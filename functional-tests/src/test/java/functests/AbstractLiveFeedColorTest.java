@@ -164,9 +164,9 @@ abstract class AbstractLiveFeedColorTest {
     @DisplayName("Stream metrics display populates")
     @Description("Verifies the page header populates every stream metric and the health dot. "
             + "Asserts that within 30s of playback all of #m-lat (RTT/2 ms), #m-res (resolution), "
-            + "#m-qp (avg QP), #m-frz (freezes/min) show a value other than '--' and that "
-            + "#m-health gets a green/yellow/red class. No thresholds are asserted on the values "
-            + "themselves.")
+            + "#m-qp (avg QP), #m-frz (freezes/min), #m-jbd (jitter buffer delay ms) show a value "
+            + "other than '--' and that #m-health gets a green/yellow/red class. No thresholds "
+            + "are asserted on the values themselves.")
     void metricsDisplayPopulates() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 30_000;
         @SuppressWarnings("unchecked")
@@ -178,6 +178,7 @@ abstract class AbstractLiveFeedColorTest {
                     "  res:    document.getElementById('m-res').textContent.trim()," +
                     "  qp:     document.getElementById('m-qp').textContent.trim()," +
                     "  frz:    document.getElementById('m-frz').textContent.trim()," +
+                    "  jbd:    document.getElementById('m-jbd').textContent.trim()," +
                     "  health: document.getElementById('m-health').className.trim()" +
                     "};");
             if (allMetricsPopulated(state)) return;
@@ -189,7 +190,7 @@ abstract class AbstractLiveFeedColorTest {
 
     private static boolean allMetricsPopulated(Map<String, Object> state) {
         if (state == null) return false;
-        for (String key : new String[]{"lat", "res", "qp", "frz"}) {
+        for (String key : new String[]{"lat", "res", "qp", "frz", "jbd"}) {
             Object v = state.get(key);
             if (!(v instanceof String s) || s.isEmpty() || s.equals("--")) return false;
         }
@@ -215,6 +216,7 @@ abstract class AbstractLiveFeedColorTest {
                     "  mRes:   txt('m-res')," +
                     "  mQp:    txt('m-qp')," +
                     "  mFrz:   txt('m-frz')," +
+                    "  mJbd:   txt('m-jbd')," +
                     "  mHealth: document.getElementById('m-health') ? document.getElementById('m-health').className : 'missing'," +
                     "  videoWidth:  v ? v.videoWidth  : -1," +
                     "  currentTime: v ? v.currentTime : -1," +
