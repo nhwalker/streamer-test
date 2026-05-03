@@ -176,8 +176,30 @@ def _name_regions(regions):
     return [(r, f'screen{i + 1}') for i, r in enumerate(ordered)]
 
 
-def _crop_height_split(env, frame_w, frame_h):
-    """Return the legacy CROP_HEIGHT split, or None if it isn't usable."""
+def _crops_from_region(region, frame_w, frame_h):
+    """Compute videocrop edge trims that select *region* out of frame_w x frame_h.
+
+    Used when the source's actual dimensions are known to match frame_w x frame_h
+    (host mode where videoscale enforces the configured size, or caster mode
+    where the user supplied DESKTOP_SPLITS together with explicit dimensions).
+    """
+    return {
+        'left':   max(0, region['x']),
+        'top':    max(0, region['y']),
+        'right':  max(0, frame_w - region['x'] - region['width']),
+        'bottom': max(0, frame_h - region['y'] - region['height']),
+    }
+
+
+def _legacy_crop_split(env, frame_w, frame_h):
+    """Source-size-agnostic CROP_HEIGHT vertical split (legacy behaviour).
+
+    Returns a list of {'region': ..., 'crop': ...} dicts, or None when
+    CROP_HEIGHT is unset or unusable.  The crop trims use CROP_HEIGHT
+    directly so they remain correct even when the actual source height
+    does not match the configured one (which happens in caster mode when
+    the user does not set STREAM_HEIGHT explicitly).
+    """
     crop_raw = env.get('CROP_HEIGHT')
     if not crop_raw:
         return None
@@ -188,39 +210,54 @@ def _crop_height_split(env, frame_w, frame_h):
     if crop <= 0 or crop >= frame_h:
         return None
     return [
-        {'x': 0, 'y': 0,    'width': frame_w, 'height': crop},
-        {'x': 0, 'y': crop, 'width': frame_w, 'height': frame_h - crop},
+        {
+            'region': {'x': 0, 'y': 0, 'width': frame_w, 'height': crop},
+            # 'bottom = crop' = trim that many pixels from the bottom of the
+            # source, keeping the top portion.  Source-size-agnostic.
+            'crop':   {'left': 0, 'top': 0, 'right': 0, 'bottom': crop},
+        },
+        {
+            'region': {'x': 0, 'y': crop,
+                       'width': frame_w, 'height': frame_h - crop},
+            'crop':   {'left': 0, 'top': crop, 'right': 0, 'bottom': 0},
+        },
     ]
 
 
 def _splits_from_env(env, host_mode, frame_w, frame_h, display):
-    """Return the unnamed list of regions implied by DESKTOP_SPLITS+context."""
+    """Return list of {'region': ..., 'crop': ...} dicts for the configured splits."""
     raw = (env.get('DESKTOP_SPLITS') or '').strip()
     if raw:
-        return [_parse_region(s) for s in raw.split(';') if s.strip()]
+        regions = [_parse_region(s) for s in raw.split(';') if s.strip()]
+        return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
+                for r in regions]
 
     if host_mode:
         regions = _query_x_monitors(display)
         if len(regions) >= 2:
-            return regions
+            return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
+                    for r in regions]
         # 0-1 monitors from RandR — fall back to legacy CROP_HEIGHT if set,
         # otherwise use the single monitor (or whole frame).
-        legacy = _crop_height_split(env, frame_w, frame_h)
+        legacy = _legacy_crop_split(env, frame_w, frame_h)
         if legacy is not None:
             return legacy
         if regions:
-            return regions
+            return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
+                    for r in regions]
         print('[desktop_config] WARNING: no monitor geometry available and '
               'CROP_HEIGHT is unset; falling back to a single full-frame '
               'screen.', file=sys.stderr)
-        return [{'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}]
+        full = {'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}
+        return [{'region': full, 'crop': {'left': 0, 'top': 0, 'right': 0, 'bottom': 0}}]
 
     # Caster mode: there is no X server to query.  Use CROP_HEIGHT if set,
     # otherwise serve a single full-frame screen.
-    legacy = _crop_height_split(env, frame_w, frame_h)
+    legacy = _legacy_crop_split(env, frame_w, frame_h)
     if legacy is not None:
         return legacy
-    return [{'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}]
+    full = {'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}
+    return [{'region': full, 'crop': {'left': 0, 'top': 0, 'right': 0, 'bottom': 0}}]
 
 
 def compute_config(env=None):
@@ -253,11 +290,16 @@ def compute_config(env=None):
 
     sig_port = int(env.get('SIGNALLING_PORT', '8443'))
 
-    raw_regions = _splits_from_env(env, host_mode, width, height, display)
-    named = _name_regions(raw_regions)
+    splits = _splits_from_env(env, host_mode, width, height, display)
+    named = _name_regions([s['region'] for s in splits])
+
+    # Pair each named region back with its crop info.  _name_regions may
+    # reorder the regions, so look them up by identity from the original list.
+    region_to_crop = {id(s['region']): s['crop'] for s in splits}
 
     screens = []
     for i, (region, name) in enumerate(named):
+        crop = region_to_crop[id(region)]
         screens.append({
             'name':            name,
             'path':            f'/{name}',
@@ -266,6 +308,10 @@ def compute_config(env=None):
             'y':               region['y'],
             'width':           region['width'],
             'height':          region['height'],
+            'cropLeft':        crop['left'],
+            'cropTop':         crop['top'],
+            'cropRight':       crop['right'],
+            'cropBottom':      crop['bottom'],
         })
 
     return {

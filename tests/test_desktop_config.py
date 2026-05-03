@@ -36,6 +36,8 @@ def test_caster_mode_defaults_to_one_full_screen():
     assert s['name'] == 'screen1'
     assert s['signallingPort'] == 8444
     assert (s['x'], s['y'], s['width'], s['height']) == (0, 0, 1920, 1080)
+    # No trimming for the single full-frame screen.
+    assert (s['cropLeft'], s['cropTop'], s['cropRight'], s['cropBottom']) == (0, 0, 0, 0)
 
 
 def test_caster_mode_crop_height_yields_top_bottom():
@@ -53,6 +55,22 @@ def test_caster_mode_crop_height_yields_top_bottom():
     assert bot['signallingPort'] == 8445
 
 
+def test_caster_mode_crop_uses_crop_height_directly():
+    """The legacy CROP_HEIGHT split must use source-size-agnostic trims so
+    that crop values stay correct in caster mode even when the configured
+    height does not match the actual incoming stream height."""
+    cfg = desktop_config.compute_config({
+        'CASTER_HOST': '127.0.0.1',
+        # default STREAM_WIDTH=1920, STREAM_HEIGHT=1080
+        'CROP_HEIGHT': '360',
+    })
+    top, bot = cfg['screens']
+    assert (top['cropLeft'], top['cropTop'], top['cropRight'], top['cropBottom']) \
+        == (0, 0, 0, 360)
+    assert (bot['cropLeft'], bot['cropTop'], bot['cropRight'], bot['cropBottom']) \
+        == (0, 360, 0, 0)
+
+
 def test_explicit_desktop_splits_horizontal_pair():
     cfg = desktop_config.compute_config({
         'CASTER_HOST': '127.0.0.1',
@@ -65,6 +83,11 @@ def test_explicit_desktop_splits_horizontal_pair():
     left, right = cfg['screens']
     assert left['x'] == 0
     assert right['x'] == 1920
+    # Explicit DESKTOP_SPLITS: trims computed from configured frame dims.
+    assert (left['cropLeft'], left['cropTop'], left['cropRight'], left['cropBottom']) \
+        == (0, 0, 1920, 0)
+    assert (right['cropLeft'], right['cropTop'], right['cropRight'], right['cropBottom']) \
+        == (1920, 0, 0, 0)
 
 
 def test_explicit_desktop_splits_three_screens_use_screen_n():

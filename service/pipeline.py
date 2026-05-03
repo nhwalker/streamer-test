@@ -239,16 +239,16 @@ def main():
     print('[service] archive: using format-location-full (PTS-based timestamps)',
           flush=True)
 
-    # ── Configure videocrop per screen: keep the named region by trimming
-    # the four edges around it.  videocrop properties trim from each edge
-    # in raw-frame coordinates.
+    # ── Configure videocrop per screen: each screen's crop trims are
+    # pre-computed by desktop_config so they remain correct in caster mode
+    # even when the source's actual dimensions differ from the configured
+    # ones (e.g. CROP_HEIGHT-based splits use trims expressed directly in
+    # source coordinates).
     for s, _q, vc, _wsk in screen_branches:
-        right_trim  = max(0, width  - s['x'] - s['width'])
-        bottom_trim = max(0, height - s['y'] - s['height'])
-        vc.set_property('left',   max(0, s['x']))
-        vc.set_property('top',    max(0, s['y']))
-        vc.set_property('right',  right_trim)
-        vc.set_property('bottom', bottom_trim)
+        vc.set_property('left',   s['cropLeft'])
+        vc.set_property('top',    s['cropTop'])
+        vc.set_property('right',  s['cropRight'])
+        vc.set_property('bottom', s['cropBottom'])
 
     # ── Configure browser webrtcsink instances
     sinks = [(ws_full, full_sig_port)]
