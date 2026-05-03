@@ -1,6 +1,9 @@
 package functests;
 
+import functests.support.BrowserRecorder;
+import functests.support.BrowserRecorderExtension;
 import functests.support.EvidenceAttachmentExtension;
+import functests.support.RecordedBrowserTest;
 import functests.support.ServiceStack;
 import io.qameta.allure.Allure;
 import io.qameta.allure.Description;
@@ -58,12 +61,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-@ExtendWith(EvidenceAttachmentExtension.class)
-abstract class AbstractLiveFeedColorTest {
+@ExtendWith({EvidenceAttachmentExtension.class, BrowserRecorderExtension.class})
+abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
 
     // ── Per-subclass instance state ───────────────────────────────────────────
-    ServiceStack stack;
-    WebDriver    driver;
+    ServiceStack     stack;
+    WebDriver        driver;
+    BrowserRecorder  recorder;
 
     // Set by @Order(1); read by @Order(2) and @Order(3).
     long flipStartEpoch;
@@ -131,6 +135,7 @@ abstract class AbstractLiveFeedColorTest {
         opts.setCapability("goog:loggingPrefs", logPrefs);
         driver = new ChromeDriver(opts);
         driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
+        recorder = BrowserRecorder.forDriver(driver);
 
         String url = stack.baseUrl() + "/?signalling=ws://localhost:" + stack.wsPort()
                 + buildTurnParams();
@@ -151,6 +156,9 @@ abstract class AbstractLiveFeedColorTest {
 
     @AfterAll
     void teardown() {
+        if (recorder != null) {
+            try { recorder.close(); } catch (Exception ignored) {}
+        }
         if (driver != null) {
             try { driver.quit(); } catch (Exception ignored) {}
         }
@@ -158,6 +166,11 @@ abstract class AbstractLiveFeedColorTest {
             stack.stopColorWindow();
             stack.stop();
         }
+    }
+
+    @Override
+    public BrowserRecorder browserRecorder() {
+        return recorder;
     }
 
     // ── Test 0: stream metrics display populates ─────────────────────────────
