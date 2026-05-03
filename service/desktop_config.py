@@ -15,8 +15,8 @@ Inputs (environment variables, evaluated once at container start):
   DESKTOP_NAME      Page-header label and archive filename prefix.
                     Default: 'desktop'.
 
-  CASTER_HOST       Empty selects host mode (xrandr-based auto-detection).
-                    Non-empty selects caster mode (no X server present).
+  CASTER_HOST       Empty selects host mode (X RandR auto-detection via
+                    python-xlib).  Non-empty selects caster mode.
 
   DISPLAY           X11 display, used in host mode only.
 
@@ -25,12 +25,12 @@ Inputs (environment variables, evaluated once at container start):
                     Caster mode: empty falls back to 1920x1080.
 
   DESKTOP_SPLITS    Semicolon-separated 'WxH+X+Y' regions.  Empty in host
-                    mode triggers xrandr --listmonitors auto-detection;
-                    empty in caster mode falls back to a CROP_HEIGHT-based
-                    top/bottom split for backward compatibility.
+                    mode triggers RandR auto-detection; empty in caster
+                    mode falls back to a CROP_HEIGHT-based top/bottom
+                    split for backward compatibility.
 
-  CROP_HEIGHT       Caster-mode legacy split point (default = STREAM_HEIGHT
-                    so the result is one full-frame split if unset).
+  CROP_HEIGHT       Caster-mode legacy split point.  Also used in host
+                    mode when RandR returns fewer than 2 monitors.
 
   SIGNALLING_PORT   Base port for browser-facing signalling servers.
                     Screen i uses SIGNALLING_PORT + 1 + i.
@@ -41,20 +41,11 @@ entrypoint and read by the other processes via load_config().
 import json
 import os
 import re
-import subprocess
 import sys
 
 CONFIG_PATH_DEFAULT = '/run/desktop-stream/config.json'
 
 _GEOM_RE = re.compile(r'^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$')
-
-# xrandr --listmonitors line:
-#   " 0: +*HDMI-1 1920/527x1080/297+0+0  HDMI-1"
-# We only care about the WxH+X+Y portion (the "/527" / "/297" are physical
-# size in mm, which we discard).
-_LISTMON_RE = re.compile(
-    r'^\s*\d+:\s+\+?\*?\S+\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)\b',
-)
 
 
 def _parse_region(s):
@@ -67,48 +58,94 @@ def _parse_region(s):
     return {'x': x, 'y': y, 'width': w, 'height': h}
 
 
-def _query_xrandr_screen(display):
-    """Return (width, height) of the X server's root window via xrandr."""
-    out = subprocess.run(
-        ['xrandr', '--display', display, '--current'],
-        check=True, timeout=5,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    ).stdout.decode(errors='replace')
-    # The "Screen 0: minimum 8 x 8, current 3840 x 1080, maximum ..." line.
-    m = re.search(r'current\s+(\d+)\s*x\s*(\d+)', out)
-    if not m:
-        raise RuntimeError(
-            f'xrandr did not report a current screen size:\n{out}'
-        )
-    return int(m.group(1)), int(m.group(2))
-
-
-def _query_xrandr_monitors(display):
-    """Return a list of monitor regions ({'x','y','width','height'}) via xrandr.
-
-    Returns an empty list (and logs a warning) if xrandr is missing or the
-    invocation fails — the caller falls back to other strategies.
-    """
+def _open_xdisplay(display_name):
+    """Return an open Xlib.display.Display, or None if Xlib/X server unavailable."""
     try:
-        out = subprocess.run(
-            ['xrandr', '--display', display, '--listmonitors'],
-            check=True, timeout=5,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        ).stdout.decode(errors='replace')
-    except (FileNotFoundError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired) as exc:
-        print(f'[desktop_config] WARNING: xrandr --listmonitors failed '
-              f'({exc}); cannot auto-detect monitor geometry.',
-              file=sys.stderr)
+        from Xlib import display as xdisplay  # noqa: WPS433 - lazy import is intentional
+    except ImportError as exc:
+        print(f'[desktop_config] WARNING: python-xlib unavailable ({exc}); '
+              'cannot auto-detect screen geometry.', file=sys.stderr)
+        return None
+    try:
+        return xdisplay.Display(display_name)
+    except Exception as exc:  # DisplayConnectionError, DisplayNameError, ...
+        print(f'[desktop_config] WARNING: cannot open X display {display_name!r} '
+              f'({exc}); cannot auto-detect screen geometry.', file=sys.stderr)
+        return None
+
+
+def _query_x_screen(display_name):
+    """Return (width, height) of the X server's root window, or None on failure."""
+    d = _open_xdisplay(display_name)
+    if d is None:
+        return None
+    try:
+        s = d.screen()
+        return s.width_in_pixels, s.height_in_pixels
+    except Exception as exc:
+        print(f'[desktop_config] WARNING: X screen query failed ({exc}); '
+              'cannot auto-detect screen size.', file=sys.stderr)
+        return None
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+def _query_x_monitors(display_name):
+    """Return a list of monitor regions ({'x','y','width','height'}) via RandR.
+
+    Tries XRRGetMonitors (RandR 1.5) first; falls back to enumerating active
+    CRTCs.  Returns [] when no usable data is available — the caller chooses
+    its own fallback strategy.
+    """
+    d = _open_xdisplay(display_name)
+    if d is None:
         return []
-    regions = []
-    for line in out.splitlines():
-        m = _LISTMON_RE.match(line)
-        if not m:
-            continue
-        w, h, x, y = (int(g) for g in m.groups())
-        regions.append({'x': x, 'y': y, 'width': w, 'height': h})
-    return regions
+    try:
+        root = d.screen().root
+        # RandR 1.5: one entry per logical monitor (handles cloned outputs).
+        try:
+            res = root.xrandr_get_monitors()
+            regions = [
+                {'x': m.x, 'y': m.y,
+                 'width': m.width_in_pixels, 'height': m.height_in_pixels}
+                for m in res.monitors
+                if m.width_in_pixels > 0 and m.height_in_pixels > 0
+            ]
+            if regions:
+                return regions
+        except Exception as exc:
+            print(f'[desktop_config] xrandr_get_monitors failed ({exc}); '
+                  'trying CRTC enumeration.', file=sys.stderr)
+
+        # Fallback: enumerate active CRTCs from the screen resources.
+        try:
+            res = root.xrandr_get_screen_resources_current()
+        except Exception as exc:
+            print(f'[desktop_config] xrandr_get_screen_resources_current '
+                  f'failed ({exc}); cannot enumerate monitors.',
+                  file=sys.stderr)
+            return []
+
+        regions = []
+        for crtc_id in res.crtcs:
+            try:
+                info = d.xrandr_get_crtc_info(crtc_id, res.config_timestamp)
+            except Exception:
+                continue
+            if info.width > 0 and info.height > 0:
+                regions.append({
+                    'x': info.x, 'y': info.y,
+                    'width': info.width, 'height': info.height,
+                })
+        return regions
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
 
 
 def _name_regions(regions):
@@ -163,20 +200,19 @@ def _splits_from_env(env, host_mode, frame_w, frame_h, display):
         return [_parse_region(s) for s in raw.split(';') if s.strip()]
 
     if host_mode:
-        regions = _query_xrandr_monitors(display)
+        regions = _query_x_monitors(display)
         if len(regions) >= 2:
             return regions
-        # xrandr returned 0 or 1 monitors — fall back to the legacy CROP_HEIGHT
-        # split if set, otherwise use the single monitor xrandr reported (or a
-        # whole-frame screen if it reported none).
+        # 0-1 monitors from RandR — fall back to legacy CROP_HEIGHT if set,
+        # otherwise use the single monitor (or whole frame).
         legacy = _crop_height_split(env, frame_w, frame_h)
         if legacy is not None:
             return legacy
         if regions:
             return regions
-        print('[desktop_config] WARNING: xrandr --listmonitors returned no '
-              'monitors and CROP_HEIGHT is unset; falling back to a single '
-              'full-frame screen.', file=sys.stderr)
+        print('[desktop_config] WARNING: no monitor geometry available and '
+              'CROP_HEIGHT is unset; falling back to a single full-frame '
+              'screen.', file=sys.stderr)
         return [{'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}]
 
     # Caster mode: there is no X server to query.  Use CROP_HEIGHT if set,
@@ -188,9 +224,9 @@ def _splits_from_env(env, host_mode, frame_w, frame_h, display):
 
 
 def compute_config(env=None):
-    """Compute the runtime config from environment + xrandr probes.
+    """Compute the runtime config from environment + RandR probes.
 
-    Pure with respect to env + xrandr; no side effects on the filesystem.
+    Pure with respect to env + Xlib; no side effects on the filesystem.
     """
     env = env if env is not None else os.environ
 
@@ -203,14 +239,12 @@ def compute_config(env=None):
     if width_raw and height_raw:
         width, height = int(width_raw), int(height_raw)
     elif host_mode:
-        try:
-            native_w, native_h = _query_xrandr_screen(display)
-        except (FileNotFoundError, subprocess.CalledProcessError,
-                subprocess.TimeoutExpired, RuntimeError) as exc:
-            print(f'[desktop_config] WARNING: xrandr screen query failed '
-                  f'({exc}); falling back to 1920x1080.',
-                  file=sys.stderr)
-            native_w, native_h = 1920, 1080
+        native = _query_x_screen(display)
+        if native is None:
+            print('[desktop_config] WARNING: X screen size unavailable; '
+                  'falling back to 1920x1080.', file=sys.stderr)
+            native = (1920, 1080)
+        native_w, native_h = native
         width  = int(width_raw)  if width_raw  else native_w
         height = int(height_raw) if height_raw else native_h
     else:

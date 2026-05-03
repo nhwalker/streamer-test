@@ -98,7 +98,7 @@ RUN dnf install -y \
         python3 \
         nmap-ncat \
         python3-gobject \
-        xrandr \
+        python3-xlib \
         ffmpeg \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* \

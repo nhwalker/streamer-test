@@ -14,12 +14,11 @@ import desktop_config  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _stub_xrandr(monkeypatch):
-    """By default no xrandr probes succeed; tests opt-in case-by-case."""
-    monkeypatch.setattr(desktop_config, '_query_xrandr_screen',
-                        lambda _display: (_ for _ in ()).throw(
-                            FileNotFoundError('xrandr not available')))
-    monkeypatch.setattr(desktop_config, '_query_xrandr_monitors',
+def _stub_x_probes(monkeypatch):
+    """By default no X probes succeed; tests opt-in case-by-case."""
+    monkeypatch.setattr(desktop_config, '_query_x_screen',
+                        lambda _display: None)
+    monkeypatch.setattr(desktop_config, '_query_x_monitors',
                         lambda _display: [])
 
 
@@ -85,10 +84,10 @@ def test_explicit_desktop_splits_three_screens_use_screen_n():
     ]
 
 
-def test_host_mode_native_resolution_from_xrandr(monkeypatch):
-    monkeypatch.setattr(desktop_config, '_query_xrandr_screen',
+def test_host_mode_native_resolution_from_x_server(monkeypatch):
+    monkeypatch.setattr(desktop_config, '_query_x_screen',
                         lambda _d: (3840, 1080))
-    monkeypatch.setattr(desktop_config, '_query_xrandr_monitors',
+    monkeypatch.setattr(desktop_config, '_query_x_monitors',
                         lambda _d: [
                             {'x': 0,    'y': 0, 'width': 1920, 'height': 1080},
                             {'x': 1920, 'y': 0, 'width': 1920, 'height': 1080},
@@ -101,11 +100,11 @@ def test_host_mode_native_resolution_from_xrandr(monkeypatch):
 
 
 def test_host_mode_explicit_dimensions_skip_screen_query(monkeypatch):
-    # _query_xrandr_screen must not be called when both dims are given.
+    # _query_x_screen must not be called when both dims are given.
     def _fail(_d):
-        raise AssertionError('_query_xrandr_screen should not be called')
-    monkeypatch.setattr(desktop_config, '_query_xrandr_screen', _fail)
-    monkeypatch.setattr(desktop_config, '_query_xrandr_monitors',
+        raise AssertionError('_query_x_screen should not be called')
+    monkeypatch.setattr(desktop_config, '_query_x_screen', _fail)
+    monkeypatch.setattr(desktop_config, '_query_x_monitors',
                         lambda _d: [{'x': 0, 'y': 0, 'width': 1280, 'height': 720}])
     cfg = desktop_config.compute_config({
         'STREAM_WIDTH': '1280',
@@ -114,7 +113,7 @@ def test_host_mode_explicit_dimensions_skip_screen_query(monkeypatch):
     assert (cfg['width'], cfg['height']) == (1280, 720)
 
 
-def test_host_mode_falls_back_to_crop_height_when_xrandr_quiet():
+def test_host_mode_falls_back_to_crop_height_when_x_quiet():
     cfg = desktop_config.compute_config({
         'STREAM_WIDTH': '1280',
         'STREAM_HEIGHT': '720',
