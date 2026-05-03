@@ -42,7 +42,6 @@ Environment variables:
   GST_WEBRTC_STUN_SERVER optional STUN URI                        ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
 """
-import json as _json
 import os
 import signal
 import struct
@@ -105,27 +104,72 @@ class AbsCaptureTimeExt(GstRtp.RTPHeaderExtension):
     timestamp (UQ32.32).  Chrome's requestVideoFrameCallback exposes this as
     metadata.captureTime so the browser can compute true per-frame latency
     without any data-channel side channel.
+
+    DIAGNOSTIC: This class is heavily instrumented to determine where the
+    chain breaks.  Each virtual method logs its first invocation so we can
+    see in the service logs whether GType registration, vtable dispatch, and
+    parameter marshalling are all working.
     """
 
     __gtype_name__ = 'AbsCaptureTimeExt'
     _URI = 'urn:ietf:params:rtp-hdrext:abs-capture-time'
 
+    _logged_init  = False
+    _logged_flags = False
+    _logged_max   = False
+    _logged_write = False
+    _logged_err   = False
+
+    def __init__(self):
+        super().__init__()
+        if not AbsCaptureTimeExt._logged_init:
+            AbsCaptureTimeExt._logged_init = True
+            print('[abs-cap-ext] __init__ called (GType instantiation OK)',
+                  flush=True)
+
     def do_get_supported_flags(self):
+        if not AbsCaptureTimeExt._logged_flags:
+            AbsCaptureTimeExt._logged_flags = True
+            print('[abs-cap-ext] do_get_supported_flags called '
+                  '(virtual dispatch OK)', flush=True)
         return (GstRtp.RTPHeaderExtensionFlags.ONE_BYTE |
                 GstRtp.RTPHeaderExtensionFlags.TWO_BYTE)
 
     def do_get_max_size(self, input_meta):
+        if not AbsCaptureTimeExt._logged_max:
+            AbsCaptureTimeExt._logged_max = True
+            print('[abs-cap-ext] do_get_max_size called -> 8 '
+                  '(SDP path reached)', flush=True)
         return 8  # 64-bit NTP timestamp, short form
 
     def do_write(self, input_meta, write_flags, output, data):
+        if not AbsCaptureTimeExt._logged_write:
+            AbsCaptureTimeExt._logged_write = True
+            try:
+                dlen = len(data)
+            except Exception:
+                dlen = '?'
+            print(f'[abs-cap-ext] do_write called: '
+                  f'data type={type(data).__name__} len={dlen} '
+                  f'is_bytearray={isinstance(data, bytearray)} '
+                  f'is_memoryview={isinstance(data, memoryview)} '
+                  f'is_bytes={isinstance(data, bytes)} '
+                  f'(write path reached)', flush=True)
         ns = _capture_state['ns']
         if ns == 0:
             return 0
-        s = ns * 1e-9 + _NTP_UNIX_OFFSET_S
-        sec  = int(s)
-        frac = int((s - sec) * (1 << 32))
-        struct.pack_into('>II', data, 0, sec, frac)
-        return 8
+        try:
+            s = ns * 1e-9 + _NTP_UNIX_OFFSET_S
+            sec  = int(s)
+            frac = int((s - sec) * (1 << 32))
+            struct.pack_into('>II', data, 0, sec, frac)
+            return 8
+        except Exception as exc:
+            if not AbsCaptureTimeExt._logged_err:
+                AbsCaptureTimeExt._logged_err = True
+                print(f'[abs-cap-ext] do_write FAILED: '
+                      f'{type(exc).__name__}: {exc}', flush=True)
+            return 0
 
     def do_read(self, read_flags, data, buffer):
         return True  # sender-only; receiver side unused
@@ -307,24 +351,6 @@ def main():
         if STUN:
             sink.set_property('stun-server', STUN)
 
-    # ── Data-channel relay: service → browser ────────────────────────────────
-    # Sends the capture timestamp (ms since Unix epoch) every 200 ms over a
-    # WebRTC data channel named 'ts'.  This is the fallback latency signal used
-    # by the browser when abs-capture-time is not available via requestVideoFrameCallback.
-    _browser_channels = {}
-
-    def _on_browser_consumer_added(_sink, peer_id, webrtcbin):
-        ch = webrtcbin.emit('create-data-channel', 'ts',
-                            Gst.Structure.new_empty('config'))
-        _browser_channels[peer_id] = ch
-
-    def _on_browser_consumer_removed(_sink, peer_id, _webrtcbin):
-        _browser_channels.pop(peer_id, None)
-
-    for _s in (ws_full, ws_top, ws_bot):
-        _s.connect('consumer-added',   _on_browser_consumer_added)
-        _s.connect('consumer-removed', _on_browser_consumer_removed)
-
     # ── Static links: vconvert -> tee -> archive + webrtc branches
     vconvert.link(tee)  # host mode: xsrc→vrate→vscale→vconvert already linked above
 
@@ -395,16 +421,46 @@ def main():
                       file=sys.stderr, flush=True)
 
         if name in _RTP_PAYLOADER_NAMES:
-            ext = AbsCaptureTimeExt()
+            print(f'[service] payloader created: {name} '
+                  f'(deep-element-added fired)', flush=True)
+            try:
+                ext = AbsCaptureTimeExt()
+            except Exception as exc:
+                print(f'[service] AbsCaptureTimeExt() FAILED: '
+                      f'{type(exc).__name__}: {exc}', file=sys.stderr,
+                      flush=True)
+                return
             ext.set_uri(AbsCaptureTimeExt._URI)
             ext.set_id(3)
+            print(f'[service] ext post-construct: uri={ext.get_uri()} '
+                  f'id={ext.get_id()} '
+                  f'gtype={type(ext).__gtype__.name}', flush=True)
             try:
-                element.emit('add-extension', ext)
-                print(f'[service] abs-capture-time extension attached to {name}',
+                ret = element.emit('add-extension', ext)
+                print(f'[service] add-extension on {name}: emit returned {ret!r}',
                       flush=True)
             except Exception as exc:
-                print(f'[service] WARNING: add-extension failed on {name}: {exc}',
+                print(f'[service] WARNING: add-extension failed on {name}: '
+                      f'{type(exc).__name__}: {exc}',
                       file=sys.stderr, flush=True)
+            # Probe the payloader's src pad to inspect the caps it advertises
+            # so we can verify whether the extmap-N=URI made it into caps.
+            src_pad = element.get_static_pad('src')
+            if src_pad:
+                def _on_src_caps(_pad, info):
+                    ev = info.get_event()
+                    if ev and ev.type == Gst.EventType.CAPS:
+                        ok, caps = ev.parse_caps()
+                        cs = caps.to_string() if caps else '(null)'
+                        if 'extmap' in cs or 'abs-capture-time' in cs:
+                            print(f'[service] {name} src caps include extension: '
+                                  f'{cs}', flush=True)
+                        else:
+                            print(f'[service] {name} src caps (no extmap): {cs}',
+                                  flush=True)
+                    return Gst.PadProbeReturn.OK
+                src_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM,
+                                  _on_src_caps)
 
     pipeline.connect('deep-element-added', on_deep_element_added)
 
@@ -447,19 +503,6 @@ def main():
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT,  on_signal)
-
-    def _relay_ts():
-        ns = _capture_state['ns']
-        if _browser_channels and ns:
-            msg = _json.dumps({'t': ns // 1_000_000})
-            for ch in list(_browser_channels.values()):
-                try:
-                    ch.emit('send-string', msg)
-                except Exception:
-                    pass
-        return True  # reschedule
-
-    GLib.timeout_add(200, _relay_ts)
 
     if ARCHIVE_MAX_BYTES or ARCHIVE_MAX_AGE_DAYS:
         purge_archive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES, ARCHIVE_MAX_AGE_DAYS)

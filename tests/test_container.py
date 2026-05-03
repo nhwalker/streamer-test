@@ -346,15 +346,23 @@ class TestWebRTCStream:
         """
         http_port, ws_port = streaming_container
         _wait_for_playing(browser, http_port, ws_port, turn_params)
-        _wait_for_latency_display(browser)
+        try:
+            _wait_for_latency_display(browser)
+        except Exception:
+            _dump_diagnostics(browser, _caster, _service,
+                              "latency display never updated from '--'")
         lat_text = browser.execute_script(
             "return document.getElementById('m-lat').textContent;"
         )
-        lat_secs = float(lat_text)
+        try:
+            lat_secs = float(lat_text)
+        except (ValueError, TypeError):
+            _dump_diagnostics(browser, _caster, _service,
+                              f"latency display not numeric: {lat_text!r}")
         latency_ms = round(lat_secs * 1000)
-        assert latency_ms < MAX_LATENCY_MS, (
-            f"End-to-end latency {latency_ms} ms exceeds threshold {MAX_LATENCY_MS} ms"
-        )
+        if latency_ms >= MAX_LATENCY_MS:
+            _dump_diagnostics(browser, _caster, _service,
+                              f"latency {latency_ms} ms exceeds {MAX_LATENCY_MS} ms")
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -420,6 +428,47 @@ def _capture_frame(browser):
 
     WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(frame_ready)
     return last
+
+
+def _dump_diagnostics(browser, caster, service, reason):
+    """Dump browser console + service/caster container logs and pytest.fail.
+
+    The abs-capture-time RTP extension chain has many silent failure modes
+    (GType registration, virtual method dispatch, SDP wiring, Chrome
+    interpretation).  When the latency test fails we want every log line we
+    can get our hands on so we can localise where the chain breaks.
+    """
+    try:
+        console_logs = browser.get_log("browser")
+    except Exception:
+        console_logs = []
+    console_text = "\n".join(
+        f"    [{e['level']}] {e['message']}" for e in console_logs
+    ) or "    (no browser console output)"
+    try:
+        page_state = browser.execute_script("""
+            const v = document.querySelector('video');
+            return {
+                m_lat: document.getElementById('m-lat').textContent,
+                m_fps: document.getElementById('m-fps').textContent,
+                videoWidth: v ? v.videoWidth : -1,
+                currentTime: v ? v.currentTime : -1,
+                readyState: v ? v.readyState : -1,
+            };
+        """)
+    except Exception as exc:
+        page_state = {'error': str(exc)}
+    service_out, service_err = service.get_logs()
+    caster_out,  caster_err  = caster.get_logs()
+    pytest.fail(
+        f"Latency test failed: {reason}\n"
+        f"  page state     : {page_state}\n"
+        f"  browser console:\n{console_text}\n"
+        f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
+        f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
+        f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
+        f"===== service stderr =====\n{service_err.decode(errors='replace')}"
+    )
 
 
 def _wait_for_latency_display(driver, timeout=30):

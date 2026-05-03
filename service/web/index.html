@@ -122,12 +122,6 @@
             });
           }
         });
-        pc.addEventListener('datachannel', function (e) {
-          if (e.channel.label !== 'ts') return;
-          e.channel.addEventListener('message', function (m) {
-            try { window._captureMs = JSON.parse(m.data).t; } catch (_) {}
-          });
-        });
         return pc;
       }
       PatchedRPC.prototype = _OrigRPC.prototype;
@@ -159,10 +153,26 @@
 
     let _rvcHandle = null;
     let _prevFrames = 0, _prevFrameTime = 0;
+    let _loggedMeta = false;
 
     function startMetrics() {
       stopMetrics();
+      _loggedMeta = false;
       function onFrame(now, metadata) {
+        // DIAGNOSTIC: log the rVFC metadata once we've seen a few frames so
+        // we can tell whether captureTime is ever populated by Chrome.
+        if (!_loggedMeta && (metadata.presentedFrames || 0) > 5) {
+          _loggedMeta = true;
+          const keys = Object.keys(metadata);
+          console.log('[rvfc-diag] metadata keys: ' + keys.join(','));
+          console.log('[rvfc-diag] captureTime=' + metadata.captureTime +
+                      ' receiveTime=' + metadata.receiveTime +
+                      ' rtpTimestamp=' + metadata.rtpTimestamp +
+                      ' processingDuration=' + metadata.processingDuration +
+                      ' expectedDisplayTime=' + metadata.expectedDisplayTime +
+                      ' presentationTime=' + metadata.presentationTime +
+                      ' now=' + now);
+        }
         let fps = null;
         if (_prevFrameTime > 0 && metadata.presentedFrames != null) {
           const dt = (now - _prevFrameTime) / 1000;
@@ -174,11 +184,7 @@
         }
         let latSecs = null;
         if (metadata.captureTime != null) {
-          // abs-capture-time RTP extension: true per-frame latency
           latSecs = (now - metadata.captureTime) / 1000;
-        } else if (window._captureMs != null) {
-          // data-channel fallback: ~200 ms granularity, still accurate enough
-          latSecs = (Date.now() - window._captureMs) / 1000;
         }
         document.getElementById('m-fps').textContent = fps != null ? fps.toFixed(1) : '--';
         document.getElementById('m-lat').textContent = latSecs != null ? latSecs.toFixed(3) : '--';
@@ -194,7 +200,6 @@
       }
       _prevFrames = 0;
       _prevFrameTime = 0;
-      window._captureMs = null;
       document.getElementById('m-fps').textContent = '--';
       document.getElementById('m-lat').textContent = '--';
     }
