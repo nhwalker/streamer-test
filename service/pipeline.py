@@ -14,33 +14,33 @@ Either way, the tee fans out identically:
   tee. -> encoder -> h264parse -> splitmuxsink matroskamux    (archive)
   tee. -> tee_webrtc
             tee_webrtc. -> webrtcsink (full)                  (browser, per-peer encode)
-            tee_webrtc. -> videocrop (bottom) -> webrtcsink   (top half)
-            tee_webrtc. -> videocrop (top)    -> webrtcsink   (bottom half)
+            tee_webrtc. -> videocrop (region 0) -> webrtcsink (screen 0)
+            tee_webrtc. -> videocrop (region 1) -> webrtcsink (screen 1)
+            ...
+
+The resolution and the list of per-screen regions come from
+desktop_config.load_config(); see desktop_config.py for the env-var contract.
 
 Environment variables:
   CASTER_HOST            caster hostname / IP; empty = host mode  ("")
   CASTER_SIGNALLING_PORT caster's signalling server port          (8443)
 
   DISPLAY                X11 display for host mode                (:0)
-  STREAM_WIDTH           capture width for host mode              (1920)
-  STREAM_HEIGHT          capture height for host mode             (1080)
   STREAM_FRAMERATE       frames per second for host mode          (30)
 
   ARCHIVE_DIR            output dir for .mkv segments             (/archive)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds              (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps            (6000)
-  ARCHIVE_PREFIX         filename prefix for segments             (stream)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
                          exceeds this many bytes; 0 = unlimited          (0)
   ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
                          0 = unlimited                                    (0)
 
-  SIGNALLING_PORT        service's browser-facing signalling port (8443)
-                         top-half  stream uses SIGNALLING_PORT+1  (8444)
-                         bottom-half stream uses SIGNALLING_PORT+2 (8445)
-  CROP_HEIGHT            pixel row where frame is split            (1080)
   GST_WEBRTC_STUN_SERVER optional STUN URI                        ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
+
+See desktop_config.py for DESKTOP_NAME, STREAM_WIDTH, STREAM_HEIGHT,
+DESKTOP_SPLITS, CROP_HEIGHT, and SIGNALLING_PORT.
 """
 import os
 import signal
@@ -50,6 +50,7 @@ import time
 import gi
 from archive_purge import purge_archive
 from archive_times import renamed_segment_path
+from desktop_config import load_config
 gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
@@ -60,21 +61,14 @@ CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
 
 HOST_MODE             = not bool(CASTER_HOST)
 DISPLAY               = os.environ.get('DISPLAY', ':0')
-WIDTH                 = os.environ.get('STREAM_WIDTH', '1920')
-HEIGHT                = os.environ.get('STREAM_HEIGHT', '1080')
 FRAMERATE             = os.environ.get('STREAM_FRAMERATE', '30')
 
 ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
-ARCHIVE_PREFIX        = os.environ.get('ARCHIVE_PREFIX', 'stream')
 ARCHIVE_MAX_BYTES     = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
 ARCHIVE_MAX_AGE_DAYS  = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 
-SIG_PORT              = os.environ.get('SIGNALLING_PORT', '8443')
-SIG_PORT_TOP          = str(int(SIG_PORT) + 1)
-SIG_PORT_BOTTOM       = str(int(SIG_PORT) + 2)
-CROP_HEIGHT           = int(os.environ.get('CROP_HEIGHT', '1080'))
 STUN                  = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 
@@ -110,27 +104,37 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    config         = load_config()
+    desktop_name   = config['desktopName']
+    width          = config['width']
+    height         = config['height']
+    full_sig_port  = config['fullSignallingPort']
+    screens        = config['screens']
+    archive_prefix = desktop_name
+
     Gst.init(None)
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
-    archive_pattern = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-%05d.mkv')
+    archive_pattern = os.path.join(ARCHIVE_DIR, f'{archive_prefix}-%05d.mkv')
 
     print('[service] Starting stream service:', flush=True)
+    print(f'  Desktop name      : {desktop_name}')
     if HOST_MODE:
         print(f'  Mode              : host (X11 direct capture)')
         print(f'  Display           : {DISPLAY}')
-        print(f'  Resolution        : {WIDTH}x{HEIGHT} @ {FRAMERATE} fps')
+        print(f'  Resolution        : {width}x{height} @ {FRAMERATE} fps')
     else:
         caster_sig_uri = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
         print(f'  Mode              : caster')
         print(f'  Caster signalling : {caster_sig_uri}')
+        print(f'  Resolution        : {width}x{height}')
     print(f'  Archive           : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Archive bitrate   : {ARCHIVE_BITRATE} kbps')
-    print(f'  Signalling /      : ws://127.0.0.1:{SIG_PORT}')
-    print(f'  Signalling /top   : ws://127.0.0.1:{SIG_PORT_TOP}')
-    print(f'  Signalling /bottom: ws://127.0.0.1:{SIG_PORT_BOTTOM}')
-    print(f'  Crop height       : {CROP_HEIGHT}px')
+    print(f'  Signalling /      : ws://127.0.0.1:{full_sig_port}')
+    for s in screens:
+        print(f'  Signalling {s["path"]:<7s}: ws://127.0.0.1:{s["signallingPort"]}'
+              f'  region {s["width"]}x{s["height"]}+{s["x"]}+{s["y"]}')
     print(f'  WebRTC codecs     : {WEBRTC_VIDEO_CAPS}')
     if STUN:
         print(f'  STUN              : {STUN}')
@@ -159,20 +163,20 @@ def main():
     arch_h264 = make('h264parse',    'arch_h264')
     archive   = make('splitmuxsink', 'archive')
 
-    # ── Browser WebRTC branch: fan out to full / top / bottom streams
+    # ── Browser WebRTC branch: fan out to full / per-screen streams
     q_webrtc   = make('queue',       'q_webrtc')
     tee_webrtc = make('tee',         't_webrtc')
 
     q_full     = make('queue',       'q_full')
     ws_full    = make('webrtcsink',  'ws_full')
 
-    q_top      = make('queue',       'q_top')
-    crop_top   = make('videocrop',   'crop_top')
-    ws_top     = make('webrtcsink',  'ws_top')
-
-    q_bot      = make('queue',       'q_bot')
-    crop_bot   = make('videocrop',   'crop_bot')
-    ws_bot     = make('webrtcsink',  'ws_bot')
+    # One queue + videocrop + webrtcsink per configured screen.
+    screen_branches = []
+    for i, s in enumerate(screens):
+        q   = make('queue',      f'q_{s["name"]}')
+        vc  = make('videocrop',  f'crop_{s["name"]}')
+        wsk = make('webrtcsink', f'ws_{s["name"]}')
+        screen_branches.append((s, q, vc, wsk))
 
     # ── Configure ingress source
     if HOST_MODE:
@@ -188,7 +192,7 @@ def main():
         vrate.link(vscale)
         vscale.link_filtered(
             vconvert,
-            Gst.Caps.from_string(f'video/x-raw,width={WIDTH},height={HEIGHT}'),
+            Gst.Caps.from_string(f'video/x-raw,width={width},height={height}'),
         )
     else:
         wsrc = make('webrtcsrc', 'wsrc')
@@ -215,8 +219,8 @@ def main():
         if frag_id not in _fragment_starts:
             return
         start_ns = _fragment_starts.pop(frag_id)
-        src = os.path.join(ARCHIVE_DIR, f'{ARCHIVE_PREFIX}-{frag_id:05d}.mkv')
-        dst = renamed_segment_path(src, start_ns, end_ns, ARCHIVE_PREFIX)
+        src = os.path.join(ARCHIVE_DIR, f'{archive_prefix}-{frag_id:05d}.mkv')
+        dst = renamed_segment_path(src, start_ns, end_ns, archive_prefix)
         try:
             os.rename(src, dst)
             print(f'[service] archive: {os.path.basename(src)}'
@@ -235,12 +239,21 @@ def main():
     print('[service] archive: using format-location-full (PTS-based timestamps)',
           flush=True)
 
-    # ── Configure videocrop: remove CROP_HEIGHT pixels from the named edge
-    crop_top.set_property('bottom', CROP_HEIGHT)   # keep top half
-    crop_bot.set_property('top',    CROP_HEIGHT)   # keep bottom half
+    # ── Configure videocrop per screen: keep the named region by trimming
+    # the four edges around it.  videocrop properties trim from each edge
+    # in raw-frame coordinates.
+    for s, _q, vc, _wsk in screen_branches:
+        right_trim  = max(0, width  - s['x'] - s['width'])
+        bottom_trim = max(0, height - s['y'] - s['height'])
+        vc.set_property('left',   max(0, s['x']))
+        vc.set_property('top',    max(0, s['y']))
+        vc.set_property('right',  right_trim)
+        vc.set_property('bottom', bottom_trim)
 
     # ── Configure browser webrtcsink instances
-    for sink, port in ((ws_full, SIG_PORT), (ws_top, SIG_PORT_TOP), (ws_bot, SIG_PORT_BOTTOM)):
+    sinks = [(ws_full, full_sig_port)]
+    sinks.extend((wsk, s['signallingPort']) for s, _q, _vc, wsk in screen_branches)
+    for sink, port in sinks:
         sink.get_property('signaller').set_property('uri', f'ws://127.0.0.1:{port}')
         sink.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
         if STUN:
@@ -268,13 +281,10 @@ def main():
     tee_webrtc.link(q_full)
     q_full.link(ws_full)
 
-    tee_webrtc.link(q_top)
-    q_top.link(crop_top)
-    crop_top.link(ws_top)
-
-    tee_webrtc.link(q_bot)
-    q_bot.link(crop_bot)
-    crop_bot.link(ws_bot)
+    for _s, q, vc, wsk in screen_branches:
+        tee_webrtc.link(q)
+        q.link(vc)
+        vc.link(wsk)
 
     # ── Dynamic src pad from webrtcsrc → videoconvert (caster mode only)
     if not HOST_MODE:

@@ -98,6 +98,7 @@ RUN dnf install -y \
         python3 \
         nmap-ncat \
         python3-gobject \
+        xorg-x11-server-utils \
         ffmpeg \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* \
@@ -137,27 +138,32 @@ COPY web_server.py       /usr/local/bin/web_server.py
 COPY archive_purge.py    /usr/local/bin/archive_purge.py
 COPY archive_times.py    /usr/local/bin/archive_times.py
 COPY video_transcode.py  /usr/local/bin/video_transcode.py
+COPY desktop_config.py   /usr/local/bin/desktop_config.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
              /usr/local/bin/web_server.py /usr/local/bin/archive_purge.py \
-             /usr/local/bin/archive_times.py /usr/local/bin/video_transcode.py
+             /usr/local/bin/archive_times.py /usr/local/bin/video_transcode.py \
+             /usr/local/bin/desktop_config.py
 
 # ── Default archive volume ────────────────────────────────────────────────────
 VOLUME /archive
 
 # ── Environment defaults (all overridable at runtime via -e) ────────────────
+# STREAM_WIDTH/STREAM_HEIGHT and DESKTOP_SPLITS are intentionally unset —
+# in host mode the runtime auto-detects native screen size + monitor
+# geometry from xrandr; in caster mode unset width/height fall back to
+# 1920x1080 and unset DESKTOP_SPLITS falls back to a CROP_HEIGHT-based
+# top/bottom split (matching the legacy default).
 ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     CASTER_HOST="" \
     CASTER_SIGNALLING_PORT=8443 \
     DISPLAY=:0 \
-    STREAM_WIDTH=1920 \
-    STREAM_HEIGHT=1080 \
+    DESKTOP_NAME=desktop \
     STREAM_FRAMERATE=30 \
     ARCHIVE_DIR=/archive \
     ARCHIVE_SEGMENT_SEC=600 \
     ARCHIVE_BITRATE=6000 \
     SIGNALLING_HOST=0.0.0.0 \
     SIGNALLING_PORT=8443 \
-    CROP_HEIGHT=1080 \
     WEB_PORT=8080 \
     GST_WEBRTC_STUN_SERVER="" \
     GST_WEBRTC_TURN_SERVER="" \

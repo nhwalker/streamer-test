@@ -414,12 +414,14 @@ All settings are environment variables passed to `docker run -e`:
 | Variable | Default | Description |
 |---|---|---|
 | `DISPLAY` | `:0` | X11 display to capture |
+| `DESKTOP_NAME` | `desktop` | Label shown in the page header; also used as the archive filename prefix |
 | `STREAM_CODEC` | `vp9` | Video codec: `vp9`, `vp8`, `h264`, or `h265`\* |
-| `STREAM_WIDTH` | `1920` | Capture width in pixels |
-| `STREAM_HEIGHT` | `1080` | Capture height in pixels |
+| `STREAM_WIDTH` | _(host: native; caster: 1920)_ | Capture width.  In host mode, leaving this unset reads the X server's native width via `xrandr` |
+| `STREAM_HEIGHT` | _(host: native; caster: 1080)_ | Capture height.  In host mode, leaving this unset reads the X server's native height via `xrandr` |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
+| `DESKTOP_SPLITS` | _(empty)_ | Per-screen regions in `WxH+X+Y;WxH+X+Y` form.  In host mode, unset triggers `xrandr --listmonitors` auto-detection |
 | `SIGNALLING_HOST` | `0.0.0.0` | Network interface for the signalling server |
-| `SIGNALLING_PORT` | `8443` | Port for the WebSocket signalling server |
+| `SIGNALLING_PORT` | `8443` | Port for the full-frame WebSocket signalling server; screen `i` uses `SIGNALLING_PORT + 1 + i` |
 | `WEB_PORT` | `8080` | Port for the HTTP page server |
 | `GST_WEBRTC_STUN_SERVER` | _(empty)_ | STUN server URI, e.g. `stun://stun.l.google.com:19302` |
 | `GST_WEBRTC_TURN_SERVER` | _(empty)_ | TURN relay URI, e.g. `turn://user:pass@host:3478` — applied per-consumer via the `add-turn-server` signal |

@@ -2,10 +2,15 @@
 """
 web_server.py -- HTTP router for the desktop-stream-service web UI.
 
-Routes /top and /bottom (with or without trailing slash) to index.html so the
-browser's path-aware signalling-port logic in index.html can select the correct
-WebRTC signalling server for that stream.  All other paths are served as static
-files from WEB_DIR.
+Routes each configured screen path (e.g. /top, /bottom, /left, /right, or
+/screen1...) to index.html so the browser's signalling-port logic can pick
+the correct WebRTC server based on the runtime config.  All other paths are
+served as static files from WEB_DIR.
+
+GET /config.json
+  Returns the runtime config (desktop name, capture resolution, list of
+  named screen regions with their signalling ports).  Read by index.html on
+  page load.
 
 GET /archive?start=<timestamp>&end=<timestamp>
 GET /archive?last=<duration>
@@ -44,6 +49,7 @@ Environment variables:
 """
 import datetime
 import glob
+import json
 import os
 import shutil
 import tempfile
@@ -53,6 +59,7 @@ import zipfile
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 from archive_times import parse_segment_times, renamed_segment_path
+from desktop_config import load_config
 from video_transcode import transcode_to_video
 
 WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
@@ -63,7 +70,9 @@ VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
 VIDEO_DEFAULT_HEIGHT = int(os.environ.get('VIDEO_DEFAULT_HEIGHT', '1080'))
 VIDEO_MAX_SEC        = 12 * 3600
 
-ROUTED_PATHS = {'/top', '/bottom'}
+CONFIG = load_config()
+CONFIG_JSON = json.dumps(CONFIG).encode('utf-8')
+ROUTED_PATHS = {s['path'] for s in CONFIG['screens']}
 
 
 _DURATION_UNITS = {'s': 1, 'm': 60, 'h': 3600}
@@ -199,8 +208,18 @@ class Router(SimpleHTTPRequestHandler):
             self._handle_archive()
         elif path == '/video':
             self._handle_video()
+        elif path == '/config.json':
+            self._handle_config()
         else:
             super().do_GET()
+
+    def _handle_config(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(CONFIG_JSON)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(CONFIG_JSON)
 
     def translate_path(self, path):
         # Strip query string before checking path

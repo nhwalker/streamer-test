@@ -80,7 +80,7 @@
 <body>
   <div id="header">
     <span id="m-health" title="Stream health. Green: healthy. Yellow: high QP or 1–5% loss. Red: freezes, &gt;5% loss, or keyframe requests."></span>
-    Desktop: <span id="m-name">--</span>
+    <span id="m-name">--</span><span id="m-screen"></span>
     &nbsp;&nbsp;FPS: <span id="m-fps">--</span>
     &nbsp;&nbsp;RTT/2 (ms): <span id="m-lat" title="Half of the WebRTC round-trip time. Network only — does not include encode, jitter buffer, decode or render delay.">--</span>
     &nbsp;&nbsp;Res: <span id="m-res">--</span>
@@ -98,11 +98,9 @@
     so it must be loaded as a classic script before the inline script runs.
 
     Query parameters:
-      ?signalling=ws://host:8443   Override the signalling server URL.
-                                   Defaults based on URL path:
-                                     /        -> ws://<hostname>:8443  (full stream)
-                                     /top     -> ws://<hostname>:8444  (top half)
-                                     /bottom  -> ws://<hostname>:8445  (bottom half)
+      ?signalling=ws://host:8443     Override the signalling server URL.
+                                     The default is read from /config.json
+                                     based on the current URL path.
       ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
                                      browser and container are on different hosts.
   -->
@@ -150,10 +148,7 @@
   <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
   <script>
     const params   = new URLSearchParams(window.location.search);
-    const path     = window.location.pathname.replace(/\/$/, '');
-    const sigPort  = path === '/top' ? 8444 : path === '/bottom' ? 8445 : 8443;
-    const sigUrl   = params.get('signalling') ??
-                     `ws://${window.location.hostname}:${sigPort}`;
+    const path     = window.location.pathname.replace(/\/$/, '') || '/';
     const stunUrl  = params.get('stun');
     const turnUri  = params.get('turn_uri');
     const turnUser = params.get('turn_user');
@@ -162,13 +157,45 @@
     const video  = document.getElementById('stream');
     const status = document.getElementById('status');
 
-    document.getElementById('m-name').textContent =
-      sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
-
     const setStatus = (msg, isError = false) => {
       status.textContent = msg;
       status.className   = isError ? 'error' : '';
     };
+
+    // Resolve the desktop name + signalling port from the runtime config.
+    // Falls back to legacy /top|/bottom defaults if /config.json is missing
+    // (e.g. older container image cached during a rolling upgrade).
+    async function resolveStreamConfig() {
+      let cfg = null;
+      try {
+        const r = await fetch('/config.json', { cache: 'no-store' });
+        if (r.ok) cfg = await r.json();
+      } catch (_) {}
+
+      let desktopName = cfg ? cfg.desktopName : null;
+      let screenLabel = '';
+      let sigPort     = cfg ? cfg.fullSignallingPort : 8443;
+
+      if (cfg) {
+        const screen = (cfg.screens || []).find(s => s.path === path);
+        if (screen) {
+          sigPort = screen.signallingPort;
+          screenLabel = ` / ${screen.name}`;
+        }
+      } else {
+        // Legacy fallback path-to-port map.
+        if (path === '/top')    sigPort = 8444;
+        if (path === '/bottom') sigPort = 8445;
+      }
+
+      const sigUrl = params.get('signalling') ??
+                     `ws://${window.location.hostname}:${sigPort}`;
+
+      if (!desktopName) {
+        desktopName = sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
+      }
+      return { sigUrl, desktopName, screenLabel };
+    }
 
     let _metricsTimer = null;
     const _snapshots = [];     // rolling window of inbound-rtp counters
@@ -312,59 +339,67 @@
       document.getElementById('m-health').classList.remove('green', 'yellow', 'red');
     }
 
-    setStatus(`Connecting to ${sigUrl} …`);
+    (async () => {
+      const { sigUrl, desktopName, screenLabel } = await resolveStreamConfig();
+      document.getElementById('m-name').textContent   = desktopName;
+      document.getElementById('m-screen').textContent = screenLabel;
+      document.title = screenLabel
+        ? `${desktopName}${screenLabel} — Desktop Stream`
+        : `${desktopName} — Desktop Stream`;
+      setStatus(`Connecting to ${sigUrl} …`);
 
-    const iceServers = [];
-    if (stunUrl) iceServers.push({ urls: `stun:${stunUrl}` });
-    if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
+      const iceServers = [];
+      if (stunUrl) iceServers.push({ urls: `stun:${stunUrl}` });
+      if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
 
-    const api = new GstWebRTCAPI({
-      signalingServerUrl: sigUrl,
-      // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
-      webrtcConfig: { iceServers },
-    });
+      const api = new GstWebRTCAPI({
+        signalingServerUrl: sigUrl,
+        // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
+        webrtcConfig: { iceServers },
+      });
 
-    api.registerProducersListener({
-      producerAdded(producer) {
-        setStatus(`Producer found (${producer.id}) — starting stream…`);
+      api.registerProducersListener({
+        producerAdded(producer) {
+          setStatus(`Producer found (${producer.id}) — starting stream…`);
 
-        const session = api.createConsumerSession(producer.id);
-        if (!session) {
-          setStatus('Failed to create consumer session.', true);
-          return;
-        }
+          const session = api.createConsumerSession(producer.id);
+          if (!session) {
+            setStatus('Failed to create consumer session.', true);
+            return;
+          }
 
-        session.element = video;
+          session.element = video;
 
-        session.addEventListener('error', (e) => {
-          setStatus(`Stream error: ${e.message ?? e}`, true);
-        });
+          session.addEventListener('error', (e) => {
+            setStatus(`Stream error: ${e.message ?? e}`, true);
+          });
 
-        session.addEventListener('closed', () => {
-          setStatus('Stream ended.');
+          session.addEventListener('closed', () => {
+            setStatus('Stream ended.');
+            video.srcObject = null;
+            stopMetrics();
+          });
+
+          const hideBanner = () => { status.className = 'hidden'; };
+          if (!video.paused && video.videoWidth > 0) {
+            hideBanner();
+            startMetrics();
+          } else {
+            video.addEventListener('playing', hideBanner, { once: true });
+            video.addEventListener('loadeddata', hideBanner, { once: true });
+            video.addEventListener('playing', startMetrics, { once: true });
+          }
+
+          session.connect();
+        },
+
+        producerRemoved(_producer) {
+          setStatus('Producer disconnected. Waiting for stream…');
           video.srcObject = null;
           stopMetrics();
-        });
-
-        const hideBanner = () => { status.className = 'hidden'; };
-        if (!video.paused && video.videoWidth > 0) {
-          hideBanner();
-          startMetrics();
-        } else {
-          video.addEventListener('playing', hideBanner, { once: true });
-          video.addEventListener('loadeddata', hideBanner, { once: true });
-          video.addEventListener('playing', startMetrics, { once: true });
-        }
-
-        session.connect();
-      },
-
-      producerRemoved(_producer) {
-        setStatus('Producer disconnected. Waiting for stream…');
-        video.srcObject = null;
-        stopMetrics();
-      },
-    });
+        },
+      });
+    })();
   </script>
 </body>
 </html>

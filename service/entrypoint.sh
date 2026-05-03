@@ -2,9 +2,10 @@
 # entrypoint.sh -- desktop-stream-service bootstrap.
 #
 # Starts services in order and waits on all of them:
-#   1. gst-webrtc-signalling-server x3  (background, :SIGNALLING_PORT, +1, +2)
-#   2. web_server.py                    (background, :WEB_PORT, serves /var/www/html)
-#   3. pipeline.py                      (background, host or caster mode, serves browsers)
+#   1. desktop_config.py                (writes /run/desktop-stream/config.json)
+#   2. gst-webrtc-signalling-server xN  (one per configured screen + full-frame)
+#   3. web_server.py                    (background, :WEB_PORT, serves /var/www/html)
+#   4. pipeline.py                      (background, host or caster mode, serves browsers)
 #
 # Mode is selected by CASTER_HOST:
 #   CASTER_HOST set   -> caster mode: ingest stream from a remote caster via webrtcsrc
@@ -12,9 +13,6 @@
 set -euo pipefail
 
 mkdir -p "${ARCHIVE_DIR}"
-
-SIG_PORT_TOP=$((SIGNALLING_PORT + 1))
-SIG_PORT_BOTTOM=$((SIGNALLING_PORT + 2))
 
 # ── GPU pre-flight ────────────────────────────────────────────────────────────
 if command -v nvidia-smi &>/dev/null; then
@@ -40,9 +38,26 @@ else
     echo "[service] Mode: caster (ingest from ${CASTER_HOST}:${CASTER_SIGNALLING_PORT})"
 fi
 
-# ── Signalling servers (full / top / bottom) ─────────────────────────────────
+# ── Compute and persist the runtime config (desktop name, resolution, splits) ─
+# pipeline.py and web_server.py both read /run/desktop-stream/config.json so
+# they agree on screen names, ports, and crop regions.
+mkdir -p /run/desktop-stream
+python3 /usr/local/bin/desktop_config.py >/dev/null
+
+# Read back the screen list so the rest of the script can spin up one
+# signalling server per screen + the full-frame server.
+mapfile -t SIG_PORTS < <(python3 -c '
+import json
+with open("/run/desktop-stream/config.json") as fh:
+    cfg = json.load(fh)
+print(cfg["fullSignallingPort"])
+for s in cfg["screens"]:
+    print(s["signallingPort"])
+')
+
+# ── Signalling servers (one per configured stream) ───────────────────────────
 SIG_PIDS=()
-for PORT in "${SIGNALLING_PORT}" "${SIG_PORT_TOP}" "${SIG_PORT_BOTTOM}"; do
+for PORT in "${SIG_PORTS[@]}"; do
     echo "[service] Starting signalling server on ${SIGNALLING_HOST}:${PORT} ..."
     gst-webrtc-signalling-server \
         --host "${SIGNALLING_HOST}" \
@@ -56,7 +71,7 @@ trap 'echo "[service] Shutting down..."; kill "${SIG_PIDS[@]}" 2>/dev/null; [ -n
      EXIT INT TERM
 
 # Readiness probe -- wait up to 2 s per signalling server.
-for PORT in "${SIGNALLING_PORT}" "${SIG_PORT_TOP}" "${SIG_PORT_BOTTOM}"; do
+for PORT in "${SIG_PORTS[@]}"; do
     READY=0
     for i in $(seq 1 20); do
         if nc -z 127.0.0.1 "${PORT}" 2>/dev/null; then
@@ -81,14 +96,19 @@ HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
 echo ""
 echo "┌─────────────────────────────────────────────────────┐"
 echo "│  Desktop Stream Service ready                       │"
-echo "│                                                     │"
-echo "│  Full stream  : http://${HOST_IP}:${WEB_PORT}/      "
-echo "│  Top half     : http://${HOST_IP}:${WEB_PORT}/top   "
-echo "│  Bottom half  : http://${HOST_IP}:${WEB_PORT}/bottom"
-echo "│                                                     │"
-echo "│  Signalling / : ws://${HOST_IP}:${SIGNALLING_PORT}  "
-echo "│  Signalling /top    : ws://${HOST_IP}:${SIG_PORT_TOP}    "
-echo "│  Signalling /bottom : ws://${HOST_IP}:${SIG_PORT_BOTTOM} "
+python3 - "${HOST_IP}" "${WEB_PORT}" <<'PYEOF'
+import json, sys
+host_ip, web_port = sys.argv[1], sys.argv[2]
+with open("/run/desktop-stream/config.json") as fh:
+    cfg = json.load(fh)
+print(f"│  Desktop name : {cfg['desktopName']}")
+print(f"│  Resolution   : {cfg['width']}x{cfg['height']}")
+print(f"│  Full stream  : http://{host_ip}:{web_port}/")
+for s in cfg["screens"]:
+    print(f"│    {s['name']:<10s}: http://{host_ip}:{web_port}{s['path']}"
+          f"  (ws :{s['signallingPort']})")
+print(f"│  Signalling / : ws://{host_ip}:{cfg['fullSignallingPort']}")
+PYEOF
 if [ -z "${CASTER_HOST:-}" ]; then
 echo "│  Ingest    : X11 display ${DISPLAY} (host mode)       "
 else
