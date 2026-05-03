@@ -70,7 +70,6 @@ def main():
 
     ws = pipeline.get_by_name('ws')
     ws.get_property('signaller').set_property('uri', sig_uri)
-
     if STUN:
         ws.set_property('stun-server', STUN)
 

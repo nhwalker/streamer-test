@@ -71,9 +71,6 @@ abstract class AbstractLiveFeedColorTest {
     protected abstract long flipHoldMs();
     protected abstract int  archiveSegmentSec();
 
-    /** Maximum acceptable end-to-end capture→render latency in milliseconds. */
-    static final int MAX_LATENCY_MS = 1000;
-
     // ── Canvas frame-capture script ───────────────────────────────────────────
     private static final String CAPTURE_SCRIPT =
         "const v = document.querySelector('video');" +
@@ -160,16 +157,15 @@ abstract class AbstractLiveFeedColorTest {
         }
     }
 
-    // ── Test 0: end-to-end latency check ─────────────────────────────────────
+    // ── Test 0: latency display populates ────────────────────────────────────
 
     @Test
     @Order(0)
-    @DisplayName("Live stream latency is below threshold")
-    @Description("Reads the latency value rendered in the page header (#m-lat, in seconds) "
-            + "and asserts it is below MAX_LATENCY_MS. The header shows "
-            + "'Latency (secs): <value>' where value comes from the capture timestamp "
-            + "embedded via the abs-capture-time RTP header extension.")
-    void latencyIsBelowThreshold() throws InterruptedException {
+    @DisplayName("Latency display shows a numeric value")
+    @Description("Verifies the page header eventually shows a numeric value for #m-lat "
+            + "(half the WebRTC RTT in milliseconds). No threshold is asserted because "
+            + "RTT/2 is a network-only metric, not glass-to-glass latency.")
+    void latencyDisplayShowsNumericValue() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 30_000;
         String latText = null;
         while (System.currentTimeMillis() < deadline) {
@@ -186,18 +182,10 @@ abstract class AbstractLiveFeedColorTest {
             fail(collectDiagnostics("Latency element (#m-lat) did not update from '--' within 30 s"));
             return;
         }
-
-        double latencySecs;
         try {
-            latencySecs = Double.parseDouble(latText);
+            Double.parseDouble(latText);
         } catch (NumberFormatException e) {
             fail(collectDiagnostics("Could not parse latency value '" + latText + "' from #m-lat element"));
-            return;
-        }
-        long latencyMs = Math.round(latencySecs * 1000);
-        if (latencyMs >= MAX_LATENCY_MS) {
-            fail(collectDiagnostics("End-to-end latency " + latencyMs + " ms (" + latText + " s) "
-                    + "exceeds threshold " + MAX_LATENCY_MS + " ms"));
         }
     }
 
@@ -232,7 +220,7 @@ abstract class AbstractLiveFeedColorTest {
             sb.append("  browser console: (error: ").append(e.getMessage()).append(")\n");
         }
 
-        // Service container logs (includes [abs-cap-ext] diagnostic lines)
+        // Service container logs
         try {
             sb.append("===== service container logs =====\n")
               .append(stack.serviceLogs()).append("\n");

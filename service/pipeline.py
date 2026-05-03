@@ -44,7 +44,6 @@ Environment variables:
 """
 import os
 import signal
-import struct
 import sys
 import time
 
@@ -53,8 +52,7 @@ from archive_purge import purge_archive
 from archive_times import renamed_segment_path
 gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
-gi.require_version('GstRtp', '1.0')
-from gi.repository import Gst, GLib, GstRtp  # noqa: E402 - must follow gi.require_version
+from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
 
 CASTER_HOST           = os.environ.get('CASTER_HOST', '')
 CASTER_SIG_PORT       = os.environ.get('CASTER_SIGNALLING_PORT', '8443')
@@ -81,53 +79,6 @@ STUN                  = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 
 WEBRTC_VIDEO_CAPS     = 'video/x-vp9;video/x-h264'
-
-# ── Absolute Capture Time RTP header extension ────────────────────────────────
-_capture_state = {'ns': 0}
-
-# RTP payloader element factory names that carry video to the browser.
-_RTP_PAYLOADER_NAMES  = frozenset({'rtph264pay', 'rtpvp9pay', 'rtpvp8pay', 'rtpav1pay'})
-
-# NTP epoch is 70 years before Unix epoch.
-_NTP_UNIX_OFFSET_S = 2_208_988_800
-
-
-class AbsCaptureTimeExt(GstRtp.RTPHeaderExtension):
-    """
-    Writes the abs-capture-time RTP header extension (short form, 8 bytes).
-
-    URI: urn:ietf:params:rtp-hdrext:abs-capture-time
-
-    The extension carries the wall-clock capture time as a 64-bit NTP
-    timestamp (UQ32.32).  Chrome's requestVideoFrameCallback exposes this as
-    metadata.captureTime so the browser can compute true per-frame latency.
-    """
-
-    __gtype_name__ = 'AbsCaptureTimeExt'
-    _URI = 'urn:ietf:params:rtp-hdrext:abs-capture-time'
-
-    def do_get_supported_flags(self):
-        return (GstRtp.RTPHeaderExtensionFlags.ONE_BYTE |
-                GstRtp.RTPHeaderExtensionFlags.TWO_BYTE)
-
-    def do_get_max_size(self, input_meta):
-        return 8  # 64-bit NTP timestamp, short form
-
-    def do_write(self, input_meta, write_flags, output, data):
-        ns = _capture_state['ns']
-        if ns == 0:
-            return 0
-        try:
-            s = ns * 1e-9 + _NTP_UNIX_OFFSET_S
-            sec  = int(s)
-            frac = int((s - sec) * (1 << 32))
-            struct.pack_into('>II', data, 0, sec, frac)
-            return 8
-        except Exception:
-            return 0
-
-    def do_read(self, read_flags, data, buffer):
-        return True
 
 
 def build_archive_encoder():
@@ -244,17 +195,6 @@ def main():
         wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
         wsrc.get_property('signaller').set_property('producer-peer-id', CASTER_PEER_ID)
 
-    # ── Capture timestamp probe: records wall-clock ns when each frame enters
-    # vconvert.  The AbsCaptureTimeExt reads this value and writes it as an NTP
-    # timestamp into every outgoing RTP packet so the browser can compute true
-    # per-frame service→browser latency via requestVideoFrameCallback.
-    def _on_capture_buffer(_pad, _info):
-        _capture_state['ns'] = time.time_ns()
-        return Gst.PadProbeReturn.OK
-
-    vconvert.get_static_pad('sink').add_probe(
-        Gst.PadProbeType.BUFFER, _on_capture_buffer)
-
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
     # independently decodable without seeking to the start.
@@ -357,16 +297,12 @@ def main():
 
         wsrc.connect('pad-added', on_pad_added)
 
-    # ── deep-element-added: add TURN server to each browser-facing webrtcbin ──
-    # gst-plugins-rs webrtcsink fires deep-element-added on the outer pipeline
-    # for webrtcbin (each consumer creates one).  Payloaders live in webrtcsink's
-    # internal send-pipeline and do NOT propagate here — they are reached via
-    # the encoder-setup signal below.
-    def on_deep_element_added(_bin, _sub_bin, element):
-        if not TURN:
-            return
-        factory = element.get_factory()
-        if factory and factory.get_name() == 'webrtcbin':
+    # ── TURN: injected per-webrtcbin instance when it is created
+    if TURN:
+        def on_deep_element_added(_bin, _sub_bin, element):
+            factory = element.get_factory()
+            if not factory or factory.get_name() != 'webrtcbin':
+                return
             try:
                 ok = element.emit('add-turn-server', TURN)
                 print(f'[service] add-turn-server: '
@@ -375,93 +311,7 @@ def main():
                 print(f'[service] WARNING: add-turn-server failed: {exc}',
                       file=sys.stderr, flush=True)
 
-    pipeline.connect('deep-element-added', on_deep_element_added)
-
-    # ── encoder-setup: attach abs-capture-time to each payloader ──────────────
-    # gst-plugins-rs webrtcsink fires encoder-setup(sink, peer_id, pad_name,
-    # encoder) when each per-consumer encoder is configured.  At that point the
-    # send pipeline is assembled: encoder → (capsfilter) → payloader → webrtcbin.
-    # We traverse the src-pad chain to find the payloader and add the extension.
-    def _add_ext_to_payloader(payloader):
-        pf   = payloader.get_factory()
-        name = pf.get_name() if pf else '?'
-        try:
-            ext = AbsCaptureTimeExt()
-        except Exception as exc:
-            print(f'[service] AbsCaptureTimeExt() FAILED: '
-                  f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
-            return
-        ext.set_uri(AbsCaptureTimeExt._URI)
-        ext.set_id(3)
-        try:
-            payloader.emit('add-extension', ext)
-            print(f'[service] add-extension OK on {name}', flush=True)
-        except Exception as exc:
-            print(f'[service] WARNING: add-extension on {name}: '
-                  f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
-
-    def _find_and_attach_payloader(element, depth=0):
-        """Walk src-pad chain from element to find the RTP payloader."""
-        if depth > 6:
-            return False
-        # Prefer the static 'src' pad; fall back to any SRC-direction pad.
-        src_pad = element.get_static_pad('src')
-        if src_pad is None:
-            for p in element.pads:
-                if p.get_direction() == Gst.PadDirection.SRC:
-                    src_pad = p
-                    break
-        if src_pad is None:
-            return False
-        peer = src_pad.get_peer()
-        if peer is None:
-            return False
-        nxt = peer.get_parent_element()
-        if nxt is None:
-            return False
-        nf   = nxt.get_factory()
-        name = nf.get_name() if nf else ''
-        if name in _RTP_PAYLOADER_NAMES:
-            _add_ext_to_payloader(nxt)
-            return True
-        return _find_and_attach_payloader(nxt, depth + 1)
-
-    def _on_encoder_setup(_sink, *args):
-        # Signal args vary by webrtcsink version; encoder is always last.
-        encoder = args[-1]
-        if not isinstance(encoder, Gst.Element):
-            return
-        ef   = encoder.get_factory()
-        ename = ef.get_name() if ef else '?'
-        print(f'[service] encoder-setup: {ename}', flush=True)
-        if _find_and_attach_payloader(encoder):
-            return  # done
-        # Payloader not linked yet — attach once the encoder's src pad links.
-        src_pad = encoder.get_static_pad('src')
-        if src_pad is None:
-            for p in encoder.pads:
-                if p.get_direction() == Gst.PadDirection.SRC:
-                    src_pad = p
-                    break
-        if src_pad:
-            def _on_linked(_pad, peer):
-                nxt = peer.get_parent_element() if peer else None
-                if nxt:
-                    _find_and_attach_payloader(nxt)
-            src_pad.connect('linked', _on_linked)
-        else:
-            print(f'[service] WARNING: {ename} has no src pad in encoder-setup',
-                  flush=True)
-
-    for _sink in (ws_full, ws_top, ws_bot):
-        try:
-            _sink.connect('encoder-setup', _on_encoder_setup)
-            print(f'[service] encoder-setup connected on {_sink.get_name()}',
-                  flush=True)
-        except Exception as exc:
-            print(f'[service] WARNING: encoder-setup not available on '
-                  f'{_sink.get_name()}: {type(exc).__name__}: {exc}',
-                  file=sys.stderr, flush=True)
+        pipeline.connect('deep-element-added', on_deep_element_added)
 
     loop = GLib.MainLoop()
     bus  = pipeline.get_bus()
