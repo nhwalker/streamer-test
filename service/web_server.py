@@ -14,17 +14,18 @@ GET /config.json
 
 GET /archive?start=<timestamp>&end=<timestamp>
 GET /archive?last=<duration>
-  Returns a zip of the .mkv segments whose recorded time overlaps the requested
+  Returns a zip of the .mp4 segments whose recorded time overlaps the requested
   window.  The active (currently-writing) segment is included when the window
-  extends past the last completed segment; its bytes are read as-is (Matroska
-  streaming format is valid at any truncation point).
+  extends past the last completed segment; it is still being written as
+  Matroska, so it is remuxed on the fly into a faststart .mp4 with `ffmpeg
+  -c copy` (no re-encoding) before being added to the zip.
 
 GET /video?start=<timestamp>&end=<timestamp>
 GET /video?last=<duration>
-  Returns a single .mkv covering exactly the requested window.  Segments are
-  clipped to the window boundaries; any missing coverage (gaps at the edges or
-  in the middle) is filled with solid VIDEO_FILL_COLOR frames.  Requests longer
-  than 12 hours are rejected with 400.
+  Returns a single faststart .mp4 covering exactly the requested window.
+  Segments are clipped to the window boundaries; any missing coverage (gaps
+  at the edges or in the middle) is filled with solid VIDEO_FILL_COLOR frames.
+  Requests longer than 12 hours are rejected with 400.
 
   <timestamp> accepts:
     - Unix epoch seconds as a number (integer or float)
@@ -41,9 +42,9 @@ GET /video?last=<duration>
 Environment variables:
   WEB_PORT             HTTP listening port              (8080)
   WEB_DIR              Static file root                 (/var/www/html)
-  ARCHIVE_DIR          Directory of completed .mkv      (/archive)
-                       segments (timestamp-named)
-  ARCHIVE_LIVE_DIR     Directory the in-progress        (/archive-live)
+  ARCHIVE_DIR          Directory of completed .mp4      (/archive)
+                       segments (timestamp-named, faststart)
+  ARCHIVE_LIVE_DIR     Directory the in-progress .mkv   (/archive-live)
                        segment is being written into
   ARCHIVE_SEGMENT_SEC  Nominal segment duration         (600)
   VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
@@ -55,6 +56,7 @@ import glob
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -109,15 +111,40 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
-def stage_segments(archive_dir, live_dir, start_ts, end_ts):
+def _remux_active_to_mp4(src_fd, dst):
+    """Remux a live Matroska fragment (read from an open fd) to faststart MP4.
+
+    Reading via /proc/self/fd/<n> rather than the path means our open file
+    descriptor pins the inode: even if pipeline.py moves the .mkv away from
+    live_dir mid-read, ffmpeg keeps reading the same bytes we opened.  The
+    `+faststart` flag rewrites the moov atom to the front of the output so
+    web players can begin decoding from the first received bytes.
+    `-c copy` means no re-encoding — the H.264 packets are remuxed verbatim.
+    `-err_detect ignore_err` tolerates a fragment whose tail is a partially
+    written cluster (the live file may still be being flushed at open time).
+    """
+    cmd = [
+        'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+        '-fflags', '+genpts', '-err_detect', 'ignore_err',
+        '-i', f'/proc/self/fd/{src_fd}',
+        '-c', 'copy', '-map', '0:v:0',
+        '-movflags', '+faststart',
+        dst,
+    ]
+    return subprocess.run(cmd, capture_output=True, pass_fds=(src_fd,))
+
+
+def stage_segments(archive_dir, live_dir, start_ts, end_ts,
+                   _remux=_remux_active_to_mp4):
     """Copy overlapping segments into a TemporaryDirectory and return it.
 
-    archive_dir   directory of completed segments — files with timestamps
-                  embedded in their filenames (renamed by pipeline.py when
-                  splitmuxsink rotates a fragment).
-    live_dir      directory the pipeline writes the in-progress segment
-                  into.  Pipeline moves each fragment from live_dir to
-                  archive_dir on rotation.
+    archive_dir   directory of completed .mp4 segments — files with
+                  timestamps embedded in their filenames (finalized by
+                  pipeline.py when splitmuxsink rotates a fragment, after
+                  remux from .mkv to faststart .mp4).
+    live_dir      directory the pipeline writes the in-progress .mkv
+                  segment into.  Pipeline remuxes each fragment from
+                  live_dir into archive_dir on rotation.
 
     Completed segments have their recording timestamps embedded in their
     filenames; those timestamps are used directly.
@@ -127,6 +154,11 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts):
     Its start time is the end of the last completed segment; its end time
     is now().  If no completed segments exist before it, the active
     segment is excluded (no reliable start time can be determined).
+    Because the live segment is still Matroska, it is remuxed on the fly
+    into a faststart .mp4 (no re-encoding) before being staged.
+
+    `_remux` is a seam for unit tests — pass a stub to avoid invoking
+    ffmpeg.  Production callers omit it.
 
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
@@ -135,7 +167,7 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts):
 
     now = time.time()
     renamed = []
-    for path in glob.glob(os.path.join(archive_dir, '*.mkv')):
+    for path in glob.glob(os.path.join(archive_dir, '*.mp4')):
         times = parse_segment_times(os.path.basename(path))
         if times:
             renamed.append((path, times[0], times[1]))
@@ -149,20 +181,20 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts):
             except FileNotFoundError:
                 pass  # purge deleted it between glob and copy; skip it
 
-    # The active (currently-writing) segment is the highest-named file in
+    # The active (currently-writing) segment is the highest-named .mkv in
     # live_dir.  Its start time equals the end of the last completed
     # segment — the same boundary pipeline.py will use when it finalizes
     # the file.  Without a completed predecessor we have no reliable start
     # time, so any other unnamed files (orphans from crashed runs) are
     # dropped.
     #
-    # Race with segment rollover (pipeline.py calling shutil.move):
-    #   - If we open() the file before the move fires, the fd holds a
-    #     reference to the inode; the copy completes even if the name
-    #     changes underneath us.
-    #   - If the move fires before open(), we get FileNotFoundError.
-    #     The file now exists under its timestamp name in archive_dir,
-    #     so we re-glob there to find and copy it as a completed segment.
+    # Race with segment rollover (pipeline.py finalizing into archive_dir):
+    #   - If we os.open() the file before the rotation fires, the fd holds
+    #     a reference to the inode; ffmpeg reads it via /proc/self/fd/N
+    #     and the remux completes even if the name changes underneath us.
+    #   - If the rotation fires before os.open(), we get FileNotFoundError.
+    #     The file now exists as a faststart .mp4 in archive_dir, so we
+    #     re-glob there to find and copy it as a completed segment.
     live_files = glob.glob(os.path.join(live_dir, '*.mkv'))
     if live_files and renamed:
         active    = max(live_files)
@@ -176,14 +208,31 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts):
                 int(seg_end   * 1e9),
                 prefix,
                 dest_dir=tmp.name,
+                ext='.mp4',
             )
+            fd = None
             try:
-                with open(active, 'rb') as src, open(dst, 'wb') as out:
-                    shutil.copyfileobj(src, out)
+                fd = os.open(active, os.O_RDONLY)
             except FileNotFoundError:
-                # Rollover fired in the window before open().
-                # Find the now-completed file by its start timestamp.
-                for path in glob.glob(os.path.join(archive_dir, '*.mkv')):
+                fd = None
+
+            if fd is not None:
+                try:
+                    result = _remux(fd, dst)
+                    if result.returncode != 0:
+                        stderr = result.stderr.decode('utf-8', errors='replace')[-500:]
+                        print(f'[web] WARNING: active-segment remux failed '
+                              f'(exit {result.returncode}): {stderr}', flush=True)
+                        try:
+                            os.unlink(dst)
+                        except FileNotFoundError:
+                            pass
+                finally:
+                    os.close(fd)
+            else:
+                # Rollover fired in the window before os.open().
+                # Find the now-completed .mp4 by its start timestamp.
+                for path in glob.glob(os.path.join(archive_dir, '*.mp4')):
                     times = parse_segment_times(os.path.basename(path))
                     if times and abs(times[0] - seg_start) < 1.0:
                         if times[0] < end_ts and times[1] > start_ts:
@@ -198,9 +247,9 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts):
 
 
 def zip_segments(stage_dir, zip_path):
-    """Write all .mkv files in stage_dir into a zip archive at zip_path."""
+    """Write all .mp4 files in stage_dir into a zip archive at zip_path."""
     with zipfile.ZipFile(zip_path, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(glob.glob(os.path.join(stage_dir, '*.mkv'))):
+        for path in sorted(glob.glob(os.path.join(stage_dir, '*.mp4'))):
             zf.write(path, os.path.basename(path))
 
 
@@ -288,7 +337,7 @@ class Router(SimpleHTTPRequestHandler):
         stage_tmp  = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
         output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
         try:
-            output_path = os.path.join(output_tmp.name, 'video.mkv')
+            output_path = os.path.join(output_tmp.name, 'video.mp4')
             transcode_to_video(
                 stage_tmp.name, start_ts, end_ts,
                 VIDEO_FILL_COLOR, output_path,
@@ -297,8 +346,8 @@ class Router(SimpleHTTPRequestHandler):
             )
             video_size = os.path.getsize(output_path)
             self.send_response(200)
-            self.send_header('Content-Type', 'video/x-matroska')
-            self.send_header('Content-Disposition', 'attachment; filename="video.mkv"')
+            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Content-Disposition', 'attachment; filename="video.mp4"')
             self.send_header('Content-Length', str(video_size))
             self.end_headers()
             with open(output_path, 'rb') as fh:

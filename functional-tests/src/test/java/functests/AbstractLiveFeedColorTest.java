@@ -344,14 +344,16 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
 
         byte[] videoBytes = resp.body();
         EvidenceAttachmentExtension.add(
-                "video-endpoint-last120s.mkv", "video/x-matroska", ".mkv", videoBytes);
-        assertTrue(videoBytes.length > 4, "Video response body is too short");
-        assertEquals(0x1A, videoBytes[0] & 0xFF, "Expected EBML magic byte 0");
-        assertEquals(0x45, videoBytes[1] & 0xFF, "Expected EBML magic byte 1");
-        assertEquals(0xDF, videoBytes[2] & 0xFF, "Expected EBML magic byte 2");
-        assertEquals(0xA3, videoBytes[3] & 0xFF, "Expected EBML magic byte 3");
+                "video-endpoint-last120s.mp4", "video/mp4", ".mp4", videoBytes);
+        assertTrue(videoBytes.length >= 8, "Video response body is too short");
+        // Every MP4 starts with a 4-byte box size followed by the ASCII tag
+        // 'ftyp' at offset 4.
+        assertEquals('f', videoBytes[4], "Expected MP4 'ftyp' tag byte 0");
+        assertEquals('t', videoBytes[5], "Expected MP4 'ftyp' tag byte 1");
+        assertEquals('y', videoBytes[6], "Expected MP4 'ftyp' tag byte 2");
+        assertEquals('p', videoBytes[7], "Expected MP4 'ftyp' tag byte 3");
 
-        Path videoFile = Files.createTempFile("flip-video-", ".mkv");
+        Path videoFile = Files.createTempFile("flip-video-", ".mp4");
         Path frameDir  = Files.createTempDirectory("flip-frames-");
         try {
             Files.write(videoFile, videoBytes);
@@ -420,7 +422,7 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
     @Test
     @Order(3)
     @DisplayName("Archive ZIP has valid segment names and flips in the correct order")
-    @Description("Downloads the archive for the exact flip window, verifies every MKV entry "
+    @Description("Downloads the archive for the exact flip window, verifies every MP4 entry "
             + "name matches the expected timestamp format and segments are in chronological "
             + "order, then extracts frames from each segment in turn and asserts the color "
             + "run sequence matches the expected pattern for numFlips() flips.")
@@ -445,7 +447,7 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
 
         // ── Extract and validate segment names ────────────────────────────────
         Pattern segPattern = Pattern.compile(
-                "^\\w+_(\\d{8}-\\d{6}\\.\\d{3})_to_(\\d{8}-\\d{6}\\.\\d{3})\\.mkv$");
+                "^\\w+_(\\d{8}-\\d{6}\\.\\d{3})_to_(\\d{8}-\\d{6}\\.\\d{3})\\.mp4$");
         DateTimeFormatter segFmt = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss.SSS")
                 .withZone(ZoneOffset.UTC);
 
@@ -454,7 +456,7 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 String name = entry.getName();
-                if (name.endsWith(".mkv")) {
+                if (name.endsWith(".mp4")) {
                     Matcher m = segPattern.matcher(name);
                     assertTrue(m.matches(),
                             "Segment name does not match expected format: " + name);
@@ -462,12 +464,12 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
                 }
             }
         }
-        assertFalse(segments.isEmpty(), "Archive ZIP contained no .mkv segments");
+        assertFalse(segments.isEmpty(), "Archive ZIP contained no .mp4 segments");
         segments.sort(Map.Entry.comparingByKey());
 
         for (Map.Entry<String, byte[]> seg : segments) {
             EvidenceAttachmentExtension.add(
-                    "archive/" + seg.getKey(), "video/x-matroska", ".mkv", seg.getValue());
+                    "archive/" + seg.getKey(), "video/mp4", ".mp4", seg.getValue());
         }
 
         // A segment that overlaps the request window [flipStartEpoch-5, flipEndEpoch+5]
@@ -501,7 +503,7 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
         List<double[]> allFrames = new ArrayList<>();
 
         for (Map.Entry<String, byte[]> seg : segments) {
-            Path segFile     = Files.createTempFile("arcseg-", ".mkv");
+            Path segFile     = Files.createTempFile("arcseg-", ".mp4");
             Path segFrameDir = Files.createTempDirectory("arcseg-frames-");
             try {
                 Files.write(segFile, seg.getValue());

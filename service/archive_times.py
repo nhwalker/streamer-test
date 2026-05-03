@@ -20,7 +20,8 @@ def format_timestamp(epoch_ns):
     return f'{dt.strftime(_STAMP_FMT)}.{dt.microsecond // 1000:03d}'
 
 
-def renamed_segment_path(location, start_ns, end_ns, prefix, dest_dir=None):
+def renamed_segment_path(location, start_ns, end_ns, prefix,
+                         dest_dir=None, ext=None):
     """Return the new file path for a completed segment.
 
     location  current file path (e.g. /archive-live/stream-00001.mkv)
@@ -29,8 +30,11 @@ def renamed_segment_path(location, start_ns, end_ns, prefix, dest_dir=None):
     prefix    configurable filename prefix (e.g. 'stream')
     dest_dir  directory the renamed file should land in; when None, the
               renamed file stays alongside the source (legacy behaviour).
+    ext       output extension including the leading dot (e.g. '.mp4').
+              When None, the source's extension is preserved.
     """
-    ext = os.path.splitext(location)[1]
+    if ext is None:
+        ext = os.path.splitext(location)[1]
     name = f'{prefix}_{format_timestamp(start_ns)}_to_{format_timestamp(end_ns)}{ext}'
     if dest_dir is None:
         dest_dir = os.path.dirname(location)

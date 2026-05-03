@@ -388,21 +388,23 @@ public final class ServiceStack {
     }
 
     /**
-     * Blocks until a {@code stream-*.mkv} file appears in the archive directory.
+     * Blocks until a completed {@code *_to_*.mp4} segment appears in the archive
+     * directory.  Completed segments are produced by the pipeline's
+     * matroska→MP4 remux step on the first fragment rotation.
      * Polls every 1 s; throws {@link AssertionError} after 90 s.
      */
     public void awaitFirstSegment() throws InterruptedException, IOException {
         long deadline = System.currentTimeMillis() + 90_000;
         while (System.currentTimeMillis() < deadline) {
             try (DirectoryStream<Path> ds =
-                         Files.newDirectoryStream(archiveDir, "*_to_*.mkv")) {
+                         Files.newDirectoryStream(archiveDir, "*_to_*.mp4")) {
                 if (ds.iterator().hasNext()) return;
             }
             Thread.sleep(1_000);
         }
         String casterInfo = caster != null ? "Caster logs:\n" + caster.getLogs() + "\n" : "";
         throw new AssertionError(
-                "No completed segment (*_to_*.mkv) appeared in " + archiveDir + " within 90 s.\n" +
+                "No completed segment (*_to_*.mp4) appeared in " + archiveDir + " within 90 s.\n" +
                 casterInfo +
                 "Service logs:\n" + service.getLogs());
     }

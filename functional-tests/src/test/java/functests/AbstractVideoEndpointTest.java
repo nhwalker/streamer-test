@@ -25,9 +25,6 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 abstract class AbstractVideoEndpointTest {
 
-    // EBML magic bytes identifying a Matroska/WebM container.
-    private static final byte[] EBML_MAGIC = {0x1A, 0x45, (byte) 0xDF, (byte) 0xA3};
-
     // VIDEO_MAX_SEC from the service source — requests strictly longer than this get 400.
     private static final int VIDEO_MAX_SEC = 12 * 3600; // 43200
 
@@ -113,28 +110,28 @@ abstract class AbstractVideoEndpointTest {
     }
 
     @Test
-    @DisplayName("last=60s → Content-Type: video/x-matroska")
-    @Description("Verifies that the video response sets Content-Type to video/x-matroska.")
-    void lastParamContentTypeIsMkv() throws Exception {
+    @DisplayName("last=60s → Content-Type: video/mp4")
+    @Description("Verifies that the video response sets Content-Type to video/mp4.")
+    void lastParamContentTypeIsMp4() throws Exception {
         String ct = get("?last=60s").headers().firstValue("content-type").orElse("");
-        assertTrue(ct.contains("video/x-matroska"), "Expected video/x-matroska, got: " + ct);
+        assertTrue(ct.contains("video/mp4"), "Expected video/mp4, got: " + ct);
     }
 
     @Test
-    @DisplayName("last=60s → Content-Disposition contains video.mkv")
-    @Description("Verifies that the Content-Disposition header references video.mkv as the download filename.")
+    @DisplayName("last=60s → Content-Disposition contains video.mp4")
+    @Description("Verifies that the Content-Disposition header references video.mp4 as the download filename.")
     void lastParamContentDispositionPresent() throws Exception {
         String cd = get("?last=60s").headers().firstValue("content-disposition").orElse("");
-        assertTrue(cd.contains("video.mkv"), "Expected video.mkv in Content-Disposition, got: " + cd);
+        assertTrue(cd.contains("video.mp4"), "Expected video.mp4 in Content-Disposition, got: " + cd);
     }
 
     @Test
-    @DisplayName("last=60s → response starts with EBML magic bytes")
-    @Description("Verifies that the video response body is a valid Matroska file by checking its EBML magic header.")
-    void lastParamResponseStartsWithEbmlMagic() throws Exception {
+    @DisplayName("last=60s → response is a faststart MP4")
+    @Description("Verifies that the video response body is a valid MP4 (ftyp at offset 4).")
+    void lastParamResponseIsMp4() throws Exception {
         byte[] body = getBytes("?last=60s");
-        assertTrue(startsWithEbmlMagic(body),
-                "Response body did not start with EBML magic bytes (1A 45 DF A3)");
+        assertTrue(isMp4(body),
+                "Response body was not a valid MP4 (no 'ftyp' at offset 4)");
     }
 
     @Test
@@ -156,24 +153,24 @@ abstract class AbstractVideoEndpointTest {
     }
 
     @Test
-    @DisplayName("start + end overlapping segments → EBML magic")
-    @Description("Verifies that a start/end window covering recorded segments returns a valid Matroska file.")
-    void startEndResponseStartsWithEbmlMagic() throws Exception {
+    @DisplayName("start + end overlapping segments → MP4")
+    @Description("Verifies that a start/end window covering recorded segments returns a valid MP4 file.")
+    void startEndResponseIsMp4() throws Exception {
         long now  = setupEpoch;
         byte[] body = getBytes("?start=" + (now - 60) + "&end=" + now);
-        assertTrue(startsWithEbmlMagic(body),
-                "start/end response body did not start with EBML magic bytes");
+        assertTrue(isMp4(body),
+                "start/end response body was not a valid MP4 (no 'ftyp' at offset 4)");
     }
 
     @Test
-    @DisplayName("Empty window → 200 with EBML magic (pure-color fill)")
-    @Description("Verifies that a time window with no segments still returns HTTP 200 with a valid MKV (filled with solid color by ffmpeg).")
-    void emptyWindowReturns200WithEbmlMagic() throws Exception {
-        // Epoch 0–1 predates any recording; ffmpeg generates a pure-color fill MKV.
+    @DisplayName("Empty window → 200 with MP4 (pure-color fill)")
+    @Description("Verifies that a time window with no segments still returns HTTP 200 with a valid MP4 (filled with solid color by ffmpeg).")
+    void emptyWindowReturns200WithMp4() throws Exception {
+        // Epoch 0–1 predates any recording; ffmpeg generates a pure-color fill MP4.
         HttpResponse<byte[]> r = getResponse("?start=0&end=1");
         assertEquals(200, r.statusCode());
-        assertTrue(startsWithEbmlMagic(r.body()),
-                "Pure-color fill MKV did not start with EBML magic bytes");
+        assertTrue(isMp4(r.body()),
+                "Pure-color fill response was not a valid MP4 (no 'ftyp' at offset 4)");
     }
 
     @Test
@@ -211,12 +208,16 @@ abstract class AbstractVideoEndpointTest {
         return getResponse(query).body();
     }
 
-    private static boolean startsWithEbmlMagic(byte[] body) {
-        if (body.length < 4) return false;
-        return (body[0] & 0xFF) == 0x1A
-            && (body[1] & 0xFF) == 0x45
-            && (body[2] & 0xFF) == 0xDF
-            && (body[3] & 0xFF) == 0xA3;
+    /**
+     * Returns true when {@code body} is a valid MP4/ISO BMFF container.
+     * Every MP4 starts with a {@code ftyp} box: a 4-byte big-endian box
+     * size followed by the ASCII tag {@code 'f','t','y','p'} at offset 4.
+     * The faststart flag does not change this layout — only the order of
+     * subsequent boxes — so the same check covers both modes.
+     */
+    private static boolean isMp4(byte[] body) {
+        if (body.length < 8) return false;
+        return body[4] == 'f' && body[5] == 't' && body[6] == 'y' && body[7] == 'p';
     }
 
     private static String encode(String s) {

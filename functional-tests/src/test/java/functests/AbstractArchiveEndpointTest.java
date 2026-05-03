@@ -119,14 +119,14 @@ abstract class AbstractArchiveEndpointTest {
     }
 
     @Test
-    @DisplayName("last=120s → ZIP contains .mkv files")
-    @Description("Verifies that the archive ZIP contains at least one .mkv segment file.")
-    void lastParamZipContainsMkvFiles() throws Exception {
+    @DisplayName("last=120s → ZIP contains .mp4 files")
+    @Description("Verifies that the archive ZIP contains at least one .mp4 segment file.")
+    void lastParamZipContainsMp4Files() throws Exception {
         byte[] body = getBytes("?last=120s");
         assertTrue(isValidZip(body), "Response body is not a valid ZIP");
         List<String> entries = zipEntryNames(body);
-        assertTrue(entries.stream().anyMatch(n -> n.endsWith(".mkv")),
-                "Expected at least one .mkv entry in ZIP; entries: " + entries);
+        assertTrue(entries.stream().anyMatch(n -> n.endsWith(".mp4")),
+                "Expected at least one .mp4 entry in ZIP; entries: " + entries);
     }
 
     @Test
@@ -148,15 +148,15 @@ abstract class AbstractArchiveEndpointTest {
     }
 
     @Test
-    @DisplayName("start + end overlapping segments → ZIP contains .mkv")
-    @Description("Verifies that a start/end window covering recorded segments produces a ZIP with .mkv files.")
-    void startEndResponseContainsMkvFiles() throws Exception {
+    @DisplayName("start + end overlapping segments → ZIP contains .mp4")
+    @Description("Verifies that a start/end window covering recorded segments produces a ZIP with .mp4 files.")
+    void startEndResponseContainsMp4Files() throws Exception {
         long now = Instant.now().getEpochSecond();
         byte[] body = getBytes("?start=" + (now - 120) + "&end=" + now);
         assertTrue(isValidZip(body), "Response body is not a valid ZIP");
         List<String> entries = zipEntryNames(body);
-        assertTrue(entries.stream().anyMatch(n -> n.endsWith(".mkv")),
-                "Expected .mkv entries for window covering last 120 s; entries: " + entries);
+        assertTrue(entries.stream().anyMatch(n -> n.endsWith(".mp4")),
+                "Expected .mp4 entries for window covering last 120 s; entries: " + entries);
     }
 
     @Test

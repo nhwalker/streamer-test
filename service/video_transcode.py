@@ -1,13 +1,14 @@
 """
 video_transcode.py -- ffmpeg-based video assembly for the /video endpoint.
 
-Takes a directory of staged .mkv segments and produces a single output .mkv
+Takes a directory of staged .mp4 segments and produces a single output .mp4
 that exactly covers the requested time window:
   - a full-duration solid-color base video covers the entire window
   - each segment is overlaid at its correct temporal position
   - segments starting before the window are trimmed; segments extending past
     the end are cut off implicitly when the base video ends
-  - the output is always a complete, decodable Matroska file
+  - the output is always a complete, faststart MP4 (moov atom at the front)
+    so web players can begin decoding from the first received bytes
 
 All files in the stage directory must have timestamps in their filenames
 (as produced by stage_segments in web_server.py).  Files without recognized
@@ -95,7 +96,7 @@ def _build_timeline(stage_dir, start_ts, end_ts):
     """
     timeline = []
     for fname in os.listdir(stage_dir):
-        if not fname.endswith('.mkv'):
+        if not fname.endswith('.mp4'):
             continue
         times = parse_segment_times(fname)
         if times is None:
@@ -120,11 +121,13 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
                        fill_color_argb, output_path,
                        default_width=1920, default_height=1080,
                        _query_info=None):
-    """Assemble a single MKV covering [start_ts, end_ts] from staged segments.
+    """Assemble a single MP4 covering [start_ts, end_ts] from staged segments.
 
     A solid fill_color_argb (0xAARRGGBB) base video covers the full duration.
     Each segment is overlaid at its correct temporal position.  Gaps between
-    segments and at the edges are filled by the base.
+    segments and at the edges are filled by the base.  The output is written
+    with `-movflags +faststart` so web players can start playback before the
+    full file has been received.
     output_path will be overwritten.  Raises RuntimeError on ffmpeg failure.
     """
     if _query_info is None:
@@ -185,7 +188,8 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
         )
 
     cmd += ['-filter_complex', ';'.join(filters)]
-    cmd += ['-map', '[out]'] + _ENCODER_ARGS + [output_path]
+    cmd += ['-map', '[out]'] + _ENCODER_ARGS
+    cmd += ['-movflags', '+faststart', output_path]
 
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:

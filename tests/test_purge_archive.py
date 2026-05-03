@@ -15,8 +15,8 @@ from archive_purge import purge_archive  # noqa: E402
 
 
 def _make_segment(directory, index, size=1024, age_seconds=0):
-    """Create a fake stream-NNNNN.mkv file with a specific mtime."""
-    path = os.path.join(directory, f'stream-{index:05d}.mkv')
+    """Create a fake stream-NNNNN.mp4 file with a specific mtime."""
+    path = os.path.join(directory, f'stream-{index:05d}.mp4')
     with open(path, 'wb') as fh:
         fh.write(b'\x00' * size)
     if age_seconds:

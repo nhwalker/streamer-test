@@ -88,6 +88,23 @@ class TestRenamedSegmentPath:
         )
         assert os.path.dirname(path) == '/archive-live'
 
+    def test_ext_override(self):
+        """ext='.mp4' overrides the source extension (used when remuxing
+        the live .mkv into the completed .mp4)."""
+        path = renamed_segment_path(
+            '/archive-live/stream-00000.mkv', _REF_NS, _REF_NS + 1, 'stream',
+            dest_dir='/archive', ext='.mp4',
+        )
+        assert path.endswith('.mp4')
+        assert '/archive/stream_' in path
+
+    def test_ext_none_preserves_source(self):
+        path = renamed_segment_path(
+            '/archive-live/stream-00000.mkv', _REF_NS, _REF_NS + 1, 'stream',
+            ext=None,
+        )
+        assert path.endswith('.mkv')
+
 
 class TestParseSegmentTimes:
 
