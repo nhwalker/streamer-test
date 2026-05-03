@@ -487,12 +487,19 @@ it is a dynamic, per-peer resource.
 
 `web_server.py` serves on `WEB_PORT` (default 8080) and handles four routes.
 
-### `GET /top`, `GET /bottom`
+### `GET /<screen-name>`
 
-Serve `index.html` directly (no redirect) so the browser's path-aware
-JavaScript can detect which sub-stream it is viewing and connect to the correct
-WebRTC signalling port (`SIGNALLING_PORT`, `+1`, or `+2`).  All other paths are
-served as static files from `WEB_DIR`.
+Each configured screen path (e.g. `/top`, `/bottom`, `/left`, `/right`, or
+`/screen1`…) serves `index.html` directly.  The page reads `/config.json`
+to pick the correct WebRTC signalling port for its path.  All other paths
+are served as static files from `WEB_DIR`.
+
+### `GET /config.json`
+
+Returns the runtime config — `desktopName`, `mode`, `width`, `height`,
+`fullSignallingPort`, and a `screens` list (each entry has `name`, `path`,
+`signallingPort`, `x`, `y`, `width`, `height`).  Read by `index.html` on
+load.
 
 ### `GET /archive`
 
@@ -582,14 +589,17 @@ Requests longer than 12 hours are rejected with 400.
 | `CASTER_HOST` | *(required)* | Hostname or IP of the caster container |
 | `CASTER_SIGNALLING_PORT` | `8443` | Caster's signalling server port |
 | `CASTER_PEER_ID` | `desktop-caster` | Producer peer-id to request from caster |
+| `DESKTOP_NAME` | `desktop` | Label shown in the page header and used as the archive filename prefix |
+| `STREAM_WIDTH` | `1920` (caster) / native (host) | Capture width.  In host mode, leaving it unset reads the X server's native width via `xrandr` |
+| `STREAM_HEIGHT` | `1080` (caster) / native (host) | Capture height.  In host mode, leaving it unset reads the X server's native height via `xrandr` |
+| `DESKTOP_SPLITS` | _(empty)_ | `WxH+X+Y;WxH+X+Y;…` regions.  In host mode unset triggers `xrandr --listmonitors` auto-detection.  In caster mode unset falls back to a `CROP_HEIGHT`-based top/bottom split |
 | `ARCHIVE_DIR` | `/archive` | Output directory for `.mkv` segments |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
 | `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps |
-| `ARCHIVE_PREFIX` | `stream` | Filename prefix for segment files |
 | `ARCHIVE_MAX_BYTES` | `0` | Delete oldest segments when archive exceeds this size; `0` = unlimited |
 | `ARCHIVE_MAX_AGE_DAYS` | `0` | Delete segments older than this many days; `0` = unlimited |
-| `SIGNALLING_PORT` | `8443` | Base port for browser-facing signalling servers |
-| `CROP_HEIGHT` | `1080` | Pixel row where the frame is split for top/bottom streams |
+| `SIGNALLING_PORT` | `8443` | Base port for browser-facing signalling servers; screen `i` uses `SIGNALLING_PORT + 1 + i` |
+| `CROP_HEIGHT` | _(unset)_ | Legacy split point; only consulted when `DESKTOP_SPLITS` is unset and (host mode) xrandr returns fewer than 2 monitors |
 | `WEB_PORT` | `8080` | HTTP server listening port |
 | `WEB_DIR` | `/var/www/html` | Static file root for the HTTP web server |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | ARGB fill colour for gaps in `/video` output (default: opaque black) |
@@ -598,5 +608,15 @@ Requests longer than 12 hours are rejected with 400.
 | `GST_WEBRTC_STUN_SERVER` | `` | STUN URI |
 | `GST_WEBRTC_TURN_SERVER` | `` | TURN URI |
 
-The top-half signalling server always runs on `SIGNALLING_PORT + 1` and the
-bottom-half on `SIGNALLING_PORT + 2`.
+Each configured screen runs its own signalling server on
+`SIGNALLING_PORT + 1 + i` (zero-indexed).  Screen names are auto-assigned
+from geometry:
+
+* exactly 2 regions side-by-side  → `left` / `right`
+* exactly 2 regions stacked       → `top`  / `bottom`
+* anything else                   → `screen1`, `screen2`, … in reading order
+  (top to bottom, then left to right within each row).
+
+The runtime config (desktop name, capture resolution, screen list) is
+written once at container start to `/run/desktop-stream/config.json` and is
+also served by the web server at `GET /config.json`.

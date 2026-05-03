@@ -87,6 +87,22 @@ class TestServiceAvailability:
 
         asyncio.run(_connect())
 
+    def test_config_endpoint_returns_runtime_config(self, streaming_container):
+        """The /config.json endpoint exposes the desktop name and screen layout."""
+        http_port, _ = streaming_container
+        r = requests.get(f"http://localhost:{http_port}/config.json", timeout=10)
+        assert r.status_code == 200
+        cfg = r.json()
+        assert cfg["desktopName"] == "stream"
+        assert cfg["mode"] == "caster"
+        assert cfg["fullSignallingPort"] == 8443
+        names = [s["name"] for s in cfg["screens"]]
+        assert names == ["top", "bottom"], (
+            f"expected top/bottom split from CROP_HEIGHT={CROP_HEIGHT}; got {names}"
+        )
+        ports = [s["signallingPort"] for s in cfg["screens"]]
+        assert ports == [WS_PORT_TOP, WS_PORT_BOTTOM]
+
     def test_top_endpoint_returns_200(self, streaming_container):
         http_port, _ = streaming_container
         r = requests.get(f"http://localhost:{http_port}/top", timeout=10)
