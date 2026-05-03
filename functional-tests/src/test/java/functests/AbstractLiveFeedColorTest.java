@@ -27,10 +27,13 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+import org.openqa.selenium.logging.LogType;
+import org.openqa.selenium.logging.LoggingPreferences;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -109,6 +112,9 @@ abstract class AbstractLiveFeedColorTest {
         // Paint the display red before opening the browser so the first frame is red.
         stack.setDesktopColor("#ff0000");
 
+        LoggingPreferences logPrefs = new LoggingPreferences();
+        logPrefs.enable(LogType.BROWSER, Level.ALL);
+
         ChromeOptions opts = new ChromeOptions();
         opts.addArguments(
                 "--headless=new",
@@ -119,6 +125,7 @@ abstract class AbstractLiveFeedColorTest {
                 "--disable-features=WebRtcHideLocalIpsWithMdns",
                 "--allow-loopback-for-peer-connection"
         );
+        opts.setCapability("goog:loggingPrefs", logPrefs);
         driver = new ChromeDriver(opts);
         driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
 
@@ -148,6 +155,109 @@ abstract class AbstractLiveFeedColorTest {
             stack.stopColorWindow();
             stack.stop();
         }
+    }
+
+    // ── Test 0: stream metrics display populates ─────────────────────────────
+
+    @Test
+    @Order(0)
+    @DisplayName("Stream metrics display populates")
+    @Description("Verifies the page header populates every stream metric and the health dot. "
+            + "Asserts that within 30s of playback all of #m-lat (RTT/2 ms), #m-res (resolution), "
+            + "#m-qp (avg QP), #m-frz (freezes/min), #m-jbd (jitter buffer delay ms) show a value "
+            + "other than '--' and that #m-health gets a green/yellow/red class. No thresholds "
+            + "are asserted on the values themselves.")
+    void metricsDisplayPopulates() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 30_000;
+        @SuppressWarnings("unchecked")
+        Map<String, Object> state = null;
+        while (System.currentTimeMillis() < deadline) {
+            state = (Map<String, Object>) js().executeScript(
+                    "return {" +
+                    "  lat:    document.getElementById('m-lat').textContent.trim()," +
+                    "  res:    document.getElementById('m-res').textContent.trim()," +
+                    "  qp:     document.getElementById('m-qp').textContent.trim()," +
+                    "  frz:    document.getElementById('m-frz').textContent.trim()," +
+                    "  jbd:    document.getElementById('m-jbd').textContent.trim()," +
+                    "  health: document.getElementById('m-health').className.trim()" +
+                    "};");
+            if (allMetricsPopulated(state)) return;
+            Thread.sleep(200);
+        }
+        fail(collectDiagnostics(
+                "Stream metrics did not fully populate within 30 s; last state: " + state));
+    }
+
+    private static boolean allMetricsPopulated(Map<String, Object> state) {
+        if (state == null) return false;
+        for (String key : new String[]{"lat", "res", "qp", "frz", "jbd"}) {
+            Object v = state.get(key);
+            if (!(v instanceof String s) || s.isEmpty() || s.equals("--")) return false;
+        }
+        Object h = state.get("health");
+        return h instanceof String hs
+                && (hs.equals("green") || hs.equals("yellow") || hs.equals("red"));
+    }
+
+    private String collectDiagnostics(String reason) {
+        StringBuilder sb = new StringBuilder(reason).append("\n");
+
+        // Page state
+        try {
+            Object pageState = js().executeScript(
+                    "const v = document.querySelector('video');" +
+                    "const txt = id => {" +
+                    "  const el = document.getElementById(id);" +
+                    "  return el ? el.textContent : 'missing';" +
+                    "};" +
+                    "return {" +
+                    "  mFps:   txt('m-fps')," +
+                    "  mLat:   txt('m-lat')," +
+                    "  mRes:   txt('m-res')," +
+                    "  mQp:    txt('m-qp')," +
+                    "  mFrz:   txt('m-frz')," +
+                    "  mJbd:   txt('m-jbd')," +
+                    "  mHealth: document.getElementById('m-health') ? document.getElementById('m-health').className : 'missing'," +
+                    "  videoWidth:  v ? v.videoWidth  : -1," +
+                    "  currentTime: v ? v.currentTime : -1," +
+                    "  readyState:  v ? v.readyState  : -1" +
+                    "};");
+            sb.append("  page state: ").append(pageState).append("\n");
+        } catch (Exception e) {
+            sb.append("  page state: (error: ").append(e.getMessage()).append(")\n");
+        }
+
+        // Browser console logs (includes [rvfc-diag] and WebRTC errors)
+        try {
+            var entries = driver.manage().logs().get(LogType.BROWSER).getAll();
+            sb.append("  browser console (").append(entries.size()).append(" entries):\n");
+            for (var entry : entries) {
+                sb.append("    [").append(entry.getLevel()).append("] ")
+                  .append(entry.getMessage()).append("\n");
+            }
+        } catch (Exception e) {
+            sb.append("  browser console: (error: ").append(e.getMessage()).append(")\n");
+        }
+
+        // Service container logs
+        try {
+            sb.append("===== service container logs =====\n")
+              .append(stack.serviceLogs()).append("\n");
+        } catch (Exception e) {
+            sb.append("===== service container logs: error: ").append(e.getMessage()).append("\n");
+        }
+
+        // Caster container logs (caster mode only; empty string in host mode)
+        try {
+            String cl = stack.casterLogs();
+            if (!cl.isEmpty()) {
+                sb.append("===== caster container logs =====\n").append(cl).append("\n");
+            }
+        } catch (Exception e) {
+            sb.append("===== caster container logs: error: ").append(e.getMessage()).append("\n");
+        }
+
+        return sb.toString();
     }
 
     // ── Test 1: live flip verification ────────────────────────────────────────

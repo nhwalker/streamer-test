@@ -13,6 +13,7 @@ Level 2 (TestWebRTCStream): drives a headless Chrome browser to load the
 """
 import asyncio
 import re
+import time
 
 import pytest
 import requests
@@ -327,6 +328,24 @@ class TestWebRTCStream:
                 f"from the red Xvfb root. Last sample: {last_stats}"
             )
 
+    def test_metrics_displayed(self, streaming_container, _caster, _service, browser, turn_params):
+        """
+        Verify the page header populates every stream metric and the health dot.
+
+        Asserts that within 30s of playback all of #m-lat (RTT/2 ms),
+        #m-res (resolution), #m-qp (avg QP), #m-frz (freezes/min),
+        #m-jbd (jitter buffer delay ms) show a value other than '--' and that
+        #m-health gets a green/yellow/red class.  No thresholds are asserted
+        on the values themselves — RTT/2 and QP are not absolute quality
+        measures, and CI hardware varies too much for a meaningful bound.
+        """
+        http_port, ws_port = streaming_container
+        _wait_for_playing(browser, http_port, ws_port, turn_params)
+        try:
+            _wait_for_metrics(browser)
+        except TimeoutError as exc:
+            _dump_diagnostics(browser, _caster, _service, str(exc))
+
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -391,6 +410,80 @@ def _capture_frame(browser):
 
     WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(frame_ready)
     return last
+
+
+def _dump_diagnostics(browser, caster, service, reason):
+    """Dump browser console + service/caster container logs and pytest.fail."""
+    try:
+        console_logs = browser.get_log("browser")
+    except Exception:
+        console_logs = []
+    console_text = "\n".join(
+        f"    [{e['level']}] {e['message']}" for e in console_logs
+    ) or "    (no browser console output)"
+    try:
+        page_state = browser.execute_script("""
+            const v = document.querySelector('video');
+            const txt = id => {
+                const el = document.getElementById(id);
+                return el ? el.textContent : 'missing';
+            };
+            return {
+                m_fps:    txt('m-fps'),
+                m_lat:    txt('m-lat'),
+                m_res:    txt('m-res'),
+                m_qp:     txt('m-qp'),
+                m_frz:    txt('m-frz'),
+                m_jbd:    txt('m-jbd'),
+                m_health: document.getElementById('m-health')
+                    ? document.getElementById('m-health').className
+                    : 'missing',
+                videoWidth:  v ? v.videoWidth  : -1,
+                currentTime: v ? v.currentTime : -1,
+                readyState:  v ? v.readyState  : -1,
+            };
+        """)
+    except Exception as exc:
+        page_state = {'error': str(exc)}
+    service_out, service_err = service.get_logs()
+    caster_out,  caster_err  = caster.get_logs()
+    pytest.fail(
+        f"Latency test failed: {reason}\n"
+        f"  page state     : {page_state}\n"
+        f"  browser console:\n{console_text}\n"
+        f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
+        f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
+        f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
+        f"===== service stderr =====\n{service_err.decode(errors='replace')}"
+    )
+
+
+def _wait_for_metrics(driver, timeout=30):
+    """Poll until every metric span populates and #m-health gets a color class."""
+    deadline = time.time() + timeout
+    last_state = {}
+    while time.time() < deadline:
+        last_state = driver.execute_script("""
+            return {
+                lat:    document.getElementById('m-lat').textContent.trim(),
+                res:    document.getElementById('m-res').textContent.trim(),
+                qp:     document.getElementById('m-qp').textContent.trim(),
+                frz:    document.getElementById('m-frz').textContent.trim(),
+                jbd:    document.getElementById('m-jbd').textContent.trim(),
+                health: document.getElementById('m-health').className.trim(),
+            };
+        """)
+        text_ok = all(
+            last_state.get(k) not in (None, '', '--')
+            for k in ('lat', 'res', 'qp', 'frz', 'jbd')
+        )
+        health_ok = last_state.get('health') in ('green', 'yellow', 'red')
+        if text_ok and health_ok:
+            return last_state
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"Stream metrics did not fully populate within {timeout}s; last state: {last_state}"
+    )
 
 
 # ── Level 3: split-stream playback + dimensions ───────────────────────────────
