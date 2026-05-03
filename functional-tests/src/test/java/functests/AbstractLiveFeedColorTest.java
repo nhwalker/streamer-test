@@ -1,9 +1,11 @@
 package functests;
 
+import functests.support.EvidenceAttachmentExtension;
 import functests.support.ServiceStack;
 import io.qameta.allure.Allure;
 import io.qameta.allure.Description;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.chrome.ChromeDriver;
@@ -56,6 +58,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@ExtendWith(EvidenceAttachmentExtension.class)
 abstract class AbstractLiveFeedColorTest {
 
     // ── Per-subclass instance state ───────────────────────────────────────────
@@ -327,6 +330,8 @@ abstract class AbstractLiveFeedColorTest {
                 "Expected 200 from /video, got " + resp.statusCode());
 
         byte[] videoBytes = resp.body();
+        EvidenceAttachmentExtension.add(
+                "video-endpoint-last120s.mkv", "video/x-matroska", ".mkv", videoBytes);
         assertTrue(videoBytes.length > 4, "Video response body is too short");
         assertEquals(0x1A, videoBytes[0] & 0xFF, "Expected EBML magic byte 0");
         assertEquals(0x45, videoBytes[1] & 0xFF, "Expected EBML magic byte 1");
@@ -446,6 +451,11 @@ abstract class AbstractLiveFeedColorTest {
         }
         assertFalse(segments.isEmpty(), "Archive ZIP contained no .mkv segments");
         segments.sort(Map.Entry.comparingByKey());
+
+        for (Map.Entry<String, byte[]> seg : segments) {
+            EvidenceAttachmentExtension.add(
+                    "archive/" + seg.getKey(), "video/x-matroska", ".mkv", seg.getValue());
+        }
 
         // A segment that overlaps the request window [flipStartEpoch-5, flipEndEpoch+5]
         // may have started up to one full segment duration before the window start.
