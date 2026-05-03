@@ -83,8 +83,6 @@ TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 WEBRTC_VIDEO_CAPS     = 'video/x-vp9;video/x-h264'
 
 # ── Absolute Capture Time RTP header extension ────────────────────────────────
-# Mutable dict so the pad-probe closure and the extension class share state
-# without needing globals or nonlocal.
 _capture_state = {'ns': 0}
 
 # RTP payloader element factory names that carry video to the browser.
@@ -102,59 +100,20 @@ class AbsCaptureTimeExt(GstRtp.RTPHeaderExtension):
 
     The extension carries the wall-clock capture time as a 64-bit NTP
     timestamp (UQ32.32).  Chrome's requestVideoFrameCallback exposes this as
-    metadata.captureTime so the browser can compute true per-frame latency
-    without any data-channel side channel.
-
-    DIAGNOSTIC: This class is heavily instrumented to determine where the
-    chain breaks.  Each virtual method logs its first invocation so we can
-    see in the service logs whether GType registration, vtable dispatch, and
-    parameter marshalling are all working.
+    metadata.captureTime so the browser can compute true per-frame latency.
     """
 
     __gtype_name__ = 'AbsCaptureTimeExt'
     _URI = 'urn:ietf:params:rtp-hdrext:abs-capture-time'
 
-    _logged_init  = False
-    _logged_flags = False
-    _logged_max   = False
-    _logged_write = False
-    _logged_err   = False
-
-    def __init__(self):
-        super().__init__()
-        if not AbsCaptureTimeExt._logged_init:
-            AbsCaptureTimeExt._logged_init = True
-            print('[abs-cap-ext] __init__ called (GType instantiation OK)',
-                  flush=True)
-
     def do_get_supported_flags(self):
-        if not AbsCaptureTimeExt._logged_flags:
-            AbsCaptureTimeExt._logged_flags = True
-            print('[abs-cap-ext] do_get_supported_flags called '
-                  '(virtual dispatch OK)', flush=True)
         return (GstRtp.RTPHeaderExtensionFlags.ONE_BYTE |
                 GstRtp.RTPHeaderExtensionFlags.TWO_BYTE)
 
     def do_get_max_size(self, input_meta):
-        if not AbsCaptureTimeExt._logged_max:
-            AbsCaptureTimeExt._logged_max = True
-            print('[abs-cap-ext] do_get_max_size called -> 8 '
-                  '(SDP path reached)', flush=True)
         return 8  # 64-bit NTP timestamp, short form
 
     def do_write(self, input_meta, write_flags, output, data):
-        if not AbsCaptureTimeExt._logged_write:
-            AbsCaptureTimeExt._logged_write = True
-            try:
-                dlen = len(data)
-            except Exception:
-                dlen = '?'
-            print(f'[abs-cap-ext] do_write called: '
-                  f'data type={type(data).__name__} len={dlen} '
-                  f'is_bytearray={isinstance(data, bytearray)} '
-                  f'is_memoryview={isinstance(data, memoryview)} '
-                  f'is_bytes={isinstance(data, bytes)} '
-                  f'(write path reached)', flush=True)
         ns = _capture_state['ns']
         if ns == 0:
             return 0
@@ -164,15 +123,11 @@ class AbsCaptureTimeExt(GstRtp.RTPHeaderExtension):
             frac = int((s - sec) * (1 << 32))
             struct.pack_into('>II', data, 0, sec, frac)
             return 8
-        except Exception as exc:
-            if not AbsCaptureTimeExt._logged_err:
-                AbsCaptureTimeExt._logged_err = True
-                print(f'[abs-cap-ext] do_write FAILED: '
-                      f'{type(exc).__name__}: {exc}', flush=True)
+        except Exception:
             return 0
 
     def do_read(self, read_flags, data, buffer):
-        return True  # sender-only; receiver side unused
+        return True
 
 
 def build_archive_encoder():
@@ -402,16 +357,16 @@ def main():
 
         wsrc.connect('pad-added', on_pad_added)
 
-    # ── deep-element-added: TURN + abs-capture-time extension on payloaders ──
-    # Always connected (not only when TURN is set) so payloaders are reached
-    # regardless of TURN configuration.
+    # ── deep-element-added: add TURN server to each browser-facing webrtcbin ──
+    # gst-plugins-rs webrtcsink fires deep-element-added on the outer pipeline
+    # for webrtcbin (each consumer creates one).  Payloaders live in webrtcsink's
+    # internal send-pipeline and do NOT propagate here — they are reached via
+    # the encoder-setup signal below.
     def on_deep_element_added(_bin, _sub_bin, element):
-        factory = element.get_factory()
-        if not factory:
+        if not TURN:
             return
-        name = factory.get_name()
-
-        if TURN and name == 'webrtcbin':
+        factory = element.get_factory()
+        if factory and factory.get_name() == 'webrtcbin':
             try:
                 ok = element.emit('add-turn-server', TURN)
                 print(f'[service] add-turn-server: '
@@ -420,49 +375,93 @@ def main():
                 print(f'[service] WARNING: add-turn-server failed: {exc}',
                       file=sys.stderr, flush=True)
 
-        if name in _RTP_PAYLOADER_NAMES:
-            print(f'[service] payloader created: {name} '
-                  f'(deep-element-added fired)', flush=True)
-            try:
-                ext = AbsCaptureTimeExt()
-            except Exception as exc:
-                print(f'[service] AbsCaptureTimeExt() FAILED: '
-                      f'{type(exc).__name__}: {exc}', file=sys.stderr,
-                      flush=True)
-                return
-            ext.set_uri(AbsCaptureTimeExt._URI)
-            ext.set_id(3)
-            print(f'[service] ext post-construct: uri={ext.get_uri()} '
-                  f'id={ext.get_id()} '
-                  f'gtype={type(ext).__gtype__.name}', flush=True)
-            try:
-                ret = element.emit('add-extension', ext)
-                print(f'[service] add-extension on {name}: emit returned {ret!r}',
-                      flush=True)
-            except Exception as exc:
-                print(f'[service] WARNING: add-extension failed on {name}: '
-                      f'{type(exc).__name__}: {exc}',
-                      file=sys.stderr, flush=True)
-            # Probe the payloader's src pad to inspect the caps it advertises
-            # so we can verify whether the extmap-N=URI made it into caps.
-            src_pad = element.get_static_pad('src')
-            if src_pad:
-                def _on_src_caps(_pad, info):
-                    ev = info.get_event()
-                    if ev and ev.type == Gst.EventType.CAPS:
-                        ok, caps = ev.parse_caps()
-                        cs = caps.to_string() if caps else '(null)'
-                        if 'extmap' in cs or 'abs-capture-time' in cs:
-                            print(f'[service] {name} src caps include extension: '
-                                  f'{cs}', flush=True)
-                        else:
-                            print(f'[service] {name} src caps (no extmap): {cs}',
-                                  flush=True)
-                    return Gst.PadProbeReturn.OK
-                src_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM,
-                                  _on_src_caps)
-
     pipeline.connect('deep-element-added', on_deep_element_added)
+
+    # ── encoder-setup: attach abs-capture-time to each payloader ──────────────
+    # gst-plugins-rs webrtcsink fires encoder-setup(sink, peer_id, pad_name,
+    # encoder) when each per-consumer encoder is configured.  At that point the
+    # send pipeline is assembled: encoder → (capsfilter) → payloader → webrtcbin.
+    # We traverse the src-pad chain to find the payloader and add the extension.
+    def _add_ext_to_payloader(payloader):
+        pf   = payloader.get_factory()
+        name = pf.get_name() if pf else '?'
+        try:
+            ext = AbsCaptureTimeExt()
+        except Exception as exc:
+            print(f'[service] AbsCaptureTimeExt() FAILED: '
+                  f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+            return
+        ext.set_uri(AbsCaptureTimeExt._URI)
+        ext.set_id(3)
+        try:
+            payloader.emit('add-extension', ext)
+            print(f'[service] add-extension OK on {name}', flush=True)
+        except Exception as exc:
+            print(f'[service] WARNING: add-extension on {name}: '
+                  f'{type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+
+    def _find_and_attach_payloader(element, depth=0):
+        """Walk src-pad chain from element to find the RTP payloader."""
+        if depth > 6:
+            return False
+        # Prefer the static 'src' pad; fall back to any SRC-direction pad.
+        src_pad = element.get_static_pad('src')
+        if src_pad is None:
+            for p in element.pads:
+                if p.get_direction() == Gst.PadDirection.SRC:
+                    src_pad = p
+                    break
+        if src_pad is None:
+            return False
+        peer = src_pad.get_peer()
+        if peer is None:
+            return False
+        nxt = peer.get_parent_element()
+        if nxt is None:
+            return False
+        nf   = nxt.get_factory()
+        name = nf.get_name() if nf else ''
+        if name in _RTP_PAYLOADER_NAMES:
+            _add_ext_to_payloader(nxt)
+            return True
+        return _find_and_attach_payloader(nxt, depth + 1)
+
+    def _on_encoder_setup(_sink, *args):
+        # Signal args vary by webrtcsink version; encoder is always last.
+        encoder = args[-1]
+        if not isinstance(encoder, Gst.Element):
+            return
+        ef   = encoder.get_factory()
+        ename = ef.get_name() if ef else '?'
+        print(f'[service] encoder-setup: {ename}', flush=True)
+        if _find_and_attach_payloader(encoder):
+            return  # done
+        # Payloader not linked yet — attach once the encoder's src pad links.
+        src_pad = encoder.get_static_pad('src')
+        if src_pad is None:
+            for p in encoder.pads:
+                if p.get_direction() == Gst.PadDirection.SRC:
+                    src_pad = p
+                    break
+        if src_pad:
+            def _on_linked(_pad, peer):
+                nxt = peer.get_parent_element() if peer else None
+                if nxt:
+                    _find_and_attach_payloader(nxt)
+            src_pad.connect('linked', _on_linked)
+        else:
+            print(f'[service] WARNING: {ename} has no src pad in encoder-setup',
+                  flush=True)
+
+    for _sink in (ws_full, ws_top, ws_bot):
+        try:
+            _sink.connect('encoder-setup', _on_encoder_setup)
+            print(f'[service] encoder-setup connected on {_sink.get_name()}',
+                  flush=True)
+        except Exception as exc:
+            print(f'[service] WARNING: encoder-setup not available on '
+                  f'{_sink.get_name()}: {type(exc).__name__}: {exc}',
+                  file=sys.stderr, flush=True)
 
     loop = GLib.MainLoop()
     bus  = pipeline.get_bus()

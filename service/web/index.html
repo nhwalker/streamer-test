@@ -153,26 +153,10 @@
 
     let _rvcHandle = null;
     let _prevFrames = 0, _prevFrameTime = 0;
-    let _loggedMeta = false;
 
     function startMetrics() {
       stopMetrics();
-      _loggedMeta = false;
       function onFrame(now, metadata) {
-        // DIAGNOSTIC: log the rVFC metadata once we've seen a few frames so
-        // we can tell whether captureTime is ever populated by Chrome.
-        if (!_loggedMeta && (metadata.presentedFrames || 0) > 5) {
-          _loggedMeta = true;
-          const keys = Object.keys(metadata);
-          console.log('[rvfc-diag] metadata keys: ' + keys.join(','));
-          console.log('[rvfc-diag] captureTime=' + metadata.captureTime +
-                      ' receiveTime=' + metadata.receiveTime +
-                      ' rtpTimestamp=' + metadata.rtpTimestamp +
-                      ' processingDuration=' + metadata.processingDuration +
-                      ' expectedDisplayTime=' + metadata.expectedDisplayTime +
-                      ' presentationTime=' + metadata.presentationTime +
-                      ' now=' + now);
-        }
         let fps = null;
         if (_prevFrameTime > 0 && metadata.presentedFrames != null) {
           const dt = (now - _prevFrameTime) / 1000;
