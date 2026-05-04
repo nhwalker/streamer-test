@@ -7,6 +7,20 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    /*
+      Quality palette — shared between the gumball and per-metric value
+      colours.  When a metric's value falls into a tier its text adopts the
+      corresponding colour; this lets the user trace which component is
+      keeping the overall gumball below bright-green.
+    */
+    :root {
+      --c-lossless:   #7CFC00;  /* lawn green — best */
+      --c-vlossless:  #4caf50;  /* mid green */
+      --c-good:       #43a047;  /* darker green, still legible on #1a1a1a */
+      --c-yellow:     #ffc107;
+      --c-red:        #f44336;
+    }
+
     html, body { height: 100%; }
 
     body {
@@ -48,11 +62,18 @@
         yellow             → degraded
         red                → broken
     */
-    #m-health.lossless          { background: #7CFC00; }  /* lawn green */
-    #m-health.visually-lossless { background: #4caf50; }  /* mid green */
-    #m-health.good              { background: #2e7d32; }  /* dark green */
-    #m-health.yellow            { background: #ffc107; }
-    #m-health.red               { background: #f44336; }
+    #m-health.lossless          { background: var(--c-lossless); }
+    #m-health.visually-lossless { background: var(--c-vlossless); }
+    #m-health.good              { background: var(--c-good); }
+    #m-health.yellow            { background: var(--c-yellow); }
+    #m-health.red               { background: var(--c-red); }
+
+    /* Per-metric value colour, applied via JS to the <span id="m-..."> nodes. */
+    .q-lossless          { color: var(--c-lossless); }
+    .q-visually-lossless { color: var(--c-vlossless); }
+    .q-good              { color: var(--c-good); }
+    .q-yellow            { color: var(--c-yellow); }
+    .q-red               { color: var(--c-red); }
 
     #video-area {
       flex: 1 1 0;
@@ -89,14 +110,15 @@
 </head>
 <body>
   <div id="header">
-    <span id="m-health" title="Stream quality. Bright green: lossless (QP≈0). Green: visually lossless (low QP). Dark green: no faults, quality not at top. Yellow: high QP or 1–5% loss. Red: freezes, &gt;5% loss, or keyframe requests."></span>
+    <span id="m-health" title="Overall stream quality. Bright green = lossless (no information thrown away by the encoder). Green = visually lossless (a viewer cannot tell it apart from the source). Dark green = no faults, but quality is not at the top tier. Yellow = degraded: heavy compression or some packet loss. Red = broken: stalls, heavy loss, or keyframe requests. The colours next to each value show that metric's contribution to the overall verdict."></span>
     <span id="m-name">--</span><span id="m-screen"></span>
-    &nbsp;&nbsp;FPS: <span id="m-fps">--</span>
-    &nbsp;&nbsp;RTT/2 (ms): <span id="m-lat" title="Half of the WebRTC round-trip time. Network only — does not include encode, jitter buffer, decode or render delay.">--</span>
-    &nbsp;&nbsp;Res: <span id="m-res">--</span>
-    &nbsp;&nbsp;QP: <span id="m-qp" title="Average quantization parameter over the rolling 10s window. Higher = more compression. Codec-dependent scale (H.264: 0–51, VP9/AV1: 0–255, VP8: 0–127).">--</span>
-    &nbsp;&nbsp;Freezes/min: <span id="m-frz" title="Stalls &gt;150 ms detected by the browser, scaled to per-minute rate over the rolling 10s window.">--</span>
-    &nbsp;&nbsp;JBD (ms): <span id="m-jbd" title="Average jitter buffer delay per frame over the rolling 10s window. The receiver holds each frame this long after arrival to absorb network timing variance. Rising values usually predict freezes a few seconds before they happen.">--</span>
+    <span class="metric" title="Frames per second: how many video frames your browser is decoding each second. Should match the stream's target framerate (typically 30). Lower numbers mean the encoder or network is dropping frames and motion will look choppy. 0 means no video is being received."
+      >&nbsp;&nbsp;FPS: <span id="m-fps">--</span></span><span class="metric" title="Latency (RTT/2): roughly how long it takes a packet to travel from the streaming service to your browser, in milliseconds. Network only — encoding, jitter buffering, decoding, and screen refresh are NOT included. Under 20 ms is LAN-quality. Under 50 ms feels instant. 50–150 ms is acceptable but noticeable for interactive use. Above 150 ms feels sluggish."
+      >&nbsp;&nbsp;RTT/2 (ms): <span id="m-lat">--</span></span><span class="metric" title="Resolution: the width × height of the frames your browser is currently receiving. When the network is constrained the encoder can shrink the picture (downscale) to keep playback smooth. Matching the source resolution = full picture. Smaller than source = the encoder is sending a smaller image so it fits in the available bandwidth."
+      >&nbsp;&nbsp;Res: <span id="m-res">--</span></span><span class="metric" title="QP (quantization parameter): how aggressively the encoder is compressing each frame. Lower is better — every increment of 6 in H.264 roughly doubles the compression. 0 = mathematically lossless. Under ~18 (H.264) is visually indistinguishable from the source. Above ~35 is visibly blocky or smeared. The exact scale depends on the codec (H.264: 0–51, VP8: 0–127, VP9/AV1: 0–255). Averaged over the last 10 seconds."
+      >&nbsp;&nbsp;QP: <span id="m-qp">--</span></span><span class="metric" title="Freezes per minute: the number of stalls longer than 150 ms your browser detected, scaled to a per-minute rate over the last 10 seconds. 0 is what you want. Anything &gt; 0 means the picture briefly stopped moving. More than 2 per minute is jarring and usually means the network can't keep up."
+      >&nbsp;&nbsp;Freezes/min: <span id="m-frz">--</span></span><span class="metric" title="JBD (jitter buffer delay): how long, on average, your browser holds each frame after it arrives before showing it. The browser deliberately delays frames to absorb network timing variation; without this buffer, packets arriving slightly out of order would cause stutter. Under 100 ms is excellent. 100–200 ms is fine. Rising JBD typically predicts freezes a few seconds before they occur."
+      >&nbsp;&nbsp;JBD (ms): <span id="m-jbd">--</span></span>
   </div>
   <div id="video-area">
     <p id="status">Connecting to signalling server…</p>
@@ -252,6 +274,76 @@
     // ~100 ms the receiver is absorbing visible jitter even if no freeze fired.
     const JBD_TOP_TIER_MAX_MS = 100;
 
+    // Per-metric tier classifiers.  Each returns one of:
+    //   'lossless' | 'visually-lossless' | 'good' | 'yellow' | 'red' | null
+    // null means "not enough data yet" — the value renders without a colour.
+    //
+    // The tiers line up with the overall classifier so a metric in the
+    // 'yellow' tier is exactly the metric that would push the gumball to
+    // yellow, and so on.  Most metrics don't differentiate lossless from
+    // visually-lossless (only QP does); they jump straight from bright-green
+    // to dark-green.
+    const QUALITY_CLASSES = ['q-lossless', 'q-visually-lossless',
+                             'q-good', 'q-yellow', 'q-red'];
+
+    function setQuality(el, tier) {
+      el.classList.remove(...QUALITY_CLASSES);
+      if (tier) el.classList.add('q-' + tier);
+    }
+
+    function fpsTier(fps, target) {
+      if (fps == null || fps === 0) return 'red';
+      if (target != null && fps >= target - 1) return 'lossless';
+      if (target == null)            return 'good';
+      if (fps >= target * 0.9)       return 'good';
+      if (fps >= target * 0.5)       return 'yellow';
+      return 'red';
+    }
+
+    function latTier(rttSec) {
+      if (rttSec == null) return null;
+      const ms = rttSec * 500;       // RTT/2
+      if (ms <  20) return 'lossless';
+      if (ms <  50) return 'good';
+      if (ms < 150) return 'yellow';
+      return 'red';
+    }
+
+    function resTier(w, h, tw, th) {
+      if (!w || !h) return 'red';
+      if (tw == null || th == null) return 'good';
+      if (w === tw && h === th)     return 'lossless';
+      const ratio = (w * h) / (tw * th);
+      if (ratio >= 0.5)  return 'good';
+      if (ratio >= 0.25) return 'yellow';
+      return 'red';
+    }
+
+    function qpTier(avgQp, mimeType) {
+      if (avgQp == null) return null;
+      if (avgQp <= QP_LOSSLESS_MAX) return 'lossless';
+      const vl = QP_VISUALLY_LOSSLESS[mimeType];
+      if (vl != null && avgQp <= vl) return 'visually-lossless';
+      const yellow = (QP_MAX[mimeType] ?? 51) * QP_YELLOW_RATIO;
+      if (avgQp <= yellow) return 'good';
+      return 'yellow';
+    }
+
+    function freezeTier(perMin) {
+      if (perMin == null) return null;
+      if (perMin === 0) return 'lossless';
+      if (perMin <= 2)  return 'yellow';
+      return 'red';
+    }
+
+    function jbdTier(ms) {
+      if (ms == null) return null;
+      if (ms <= JBD_TOP_TIER_MAX_MS) return 'lossless';
+      if (ms <= 200) return 'good';
+      if (ms <= 500) return 'yellow';
+      return 'red';
+    }
+
     async function updateMetrics() {
       const pc = window._streamPc;
       if (!pc || typeof pc.getStats !== 'function') return;
@@ -390,13 +482,34 @@
         }
       }
 
-      document.getElementById('m-fps').textContent = fps    != null ? fps.toFixed(1) : '--';
+      const fpsEl = document.getElementById('m-fps');
+      const latEl = document.getElementById('m-lat');
+      const resEl = document.getElementById('m-res');
+      const qpEl  = document.getElementById('m-qp');
+      const frzEl = document.getElementById('m-frz');
+      const jbdEl = document.getElementById('m-jbd');
+
+      fpsEl.textContent = fps    != null ? fps.toFixed(1) : '--';
       // RTT/2 in ms = rttSec * 1000 / 2 = rttSec * 500
-      document.getElementById('m-lat').textContent = rttSec != null ? Math.round(rttSec * 500).toString() : '--';
-      document.getElementById('m-res').textContent = res    ?? '--';
-      document.getElementById('m-qp' ).textContent = avgQp  != null ? Math.round(avgQp).toString() : '--';
-      document.getElementById('m-frz').textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
-      document.getElementById('m-jbd').textContent = avgJbMs != null ? Math.round(avgJbMs).toString() : '--';
+      latEl.textContent = rttSec != null ? Math.round(rttSec * 500).toString() : '--';
+      resEl.textContent = res    ?? '--';
+      qpEl .textContent = avgQp  != null ? Math.round(avgQp).toString() : '--';
+      frzEl.textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
+      jbdEl.textContent = avgJbMs != null ? Math.round(avgJbMs).toString() : '--';
+
+      // Colour each value according to its individual tier, so the user can
+      // see at a glance which metric is keeping the overall gumball below
+      // bright-green.  Tier helpers run only after we have a few samples,
+      // mirroring the gating on the overall classifier.
+      if (_snapshots.length >= 3) {
+        setQuality(fpsEl, fpsTier(fps, _targetFps));
+        setQuality(latEl, latTier(rttSec));
+        setQuality(resEl, resTier(snap.frameWidth, snap.frameHeight,
+                                  _targetWidth, _targetHeight));
+        setQuality(qpEl,  qpTier(avgQp, snap.mimeType));
+        setQuality(frzEl, freezeTier(freezesPerMin));
+        setQuality(jbdEl, jbdTier(avgJbMs));
+      }
       const dot = document.getElementById('m-health');
       dot.classList.remove('lossless', 'visually-lossless', 'good',
                            'yellow', 'red');
@@ -416,7 +529,9 @@
       }
       _snapshots.length = 0;
       for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz', 'm-jbd']) {
-        document.getElementById(id).textContent = '--';
+        const el = document.getElementById(id);
+        el.textContent = '--';
+        setQuality(el, null);
       }
       document.getElementById('m-health').classList.remove(
         'lossless', 'visually-lossless', 'good', 'yellow', 'red');
