@@ -24,6 +24,11 @@ Inputs (environment variables, evaluated once at container start):
   STREAM_HEIGHT     Capture height. Host mode: empty = native screen height.
                     Caster mode: empty falls back to 1920x1080.
 
+  STREAM_FRAMERATE  Target frames-per-second.  Used by host mode to drive the
+                    videorate caps filter and surfaced in /config.json so the
+                    browser gumball can gate its top quality tiers on the
+                    delivered fps matching the target.  Default: 30.
+
   DESKTOP_SPLITS    Semicolon-separated 'WxH+X+Y' regions.  Empty in host
                     mode triggers RandR auto-detection; empty in caster
                     mode falls back to a CROP_HEIGHT-based top/bottom
@@ -288,7 +293,8 @@ def compute_config(env=None):
         width  = int(width_raw)  if width_raw  else 1920
         height = int(height_raw) if height_raw else 1080
 
-    sig_port = int(env.get('SIGNALLING_PORT', '8443'))
+    sig_port  = int(env.get('SIGNALLING_PORT', '8443'))
+    framerate = int((env.get('STREAM_FRAMERATE') or '30').strip())
 
     splits = _splits_from_env(env, host_mode, width, height, display)
     named = _name_regions([s['region'] for s in splits])
@@ -319,6 +325,7 @@ def compute_config(env=None):
         'mode':                'host' if host_mode else 'caster',
         'width':               width,
         'height':              height,
+        'framerate':           framerate,
         'fullSignallingPort':  sig_port,
         'screens':             screens,
     }
