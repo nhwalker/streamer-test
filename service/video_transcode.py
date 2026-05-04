@@ -21,6 +21,7 @@ Public API:
                        fill_color_argb, output_path,
                        default_width, default_height)
 """
+import functools
 import json
 import os
 import subprocess
@@ -29,10 +30,27 @@ from dataclasses import dataclass
 from archive_times import parse_segment_times
 
 _DEFAULT_FPS = '25/1'
+_ARCHIVE_BITRATE = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
+
+
+@functools.lru_cache(maxsize=None)
+def _nvenc_works():
+    """Return True if h264_nvenc can actually encode (GPU present and functional)."""
+    try:
+        r = subprocess.run(
+            ['ffmpeg', '-hide_banner',
+             '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.04',
+             '-frames:v', '1', '-c:v', 'h264_nvenc', '-f', 'null', '-'],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 def _detect_encoder_args():
     """Return ffmpeg output-encoder args for the best available video encoder."""
+    bitrate = str(_ARCHIVE_BITRATE)
     try:
         result = subprocess.run(
             ['ffmpeg', '-hide_banner', '-encoders'],
@@ -41,6 +59,9 @@ def _detect_encoder_args():
     except FileNotFoundError:
         return ['-c:v', 'libx264', '-preset', 'ultrafast']
     encoders = result.stdout
+    if 'h264_nvenc' in encoders and _nvenc_works():
+        return ['-c:v', 'h264_nvenc', '-preset', 'p4',
+                '-rc', 'vbr', '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k']
     if 'libx264' in encoders:
         return ['-c:v', 'libx264', '-preset', 'ultrafast']
     if 'mpeg4' in encoders:
