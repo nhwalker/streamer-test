@@ -481,7 +481,12 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
 
         // A segment that overlaps the request window [flipStartEpoch-5, flipEndEpoch+5]
         // may have started up to one full segment duration before the window start.
-        Instant windowStart = Instant.ofEpochSecond(flipStartEpoch - 5 - archiveSegmentSec());
+        // splitmuxsink rotates at the next keyframe AFTER max-size-time elapses, so
+        // actual segment durations exceed the nominal archiveSegmentSec() by up to
+        // one keyframe interval; allow a few seconds of slack to absorb that.
+        long segmentRotationSlackSec = 5;
+        Instant windowStart = Instant.ofEpochSecond(
+                flipStartEpoch - 5 - archiveSegmentSec() - segmentRotationSlackSec);
         Instant windowEnd   = Instant.ofEpochSecond(flipEndEpoch   + 65);
         Instant prevEnd     = null;
         for (Map.Entry<String, byte[]> seg : segments) {
