@@ -13,6 +13,12 @@ Two ingress modes, selected by CASTER_HOST:
 Either way, the tee fans out identically:
   tee. -> encoder -> h264parse -> splitmuxsink matroskamux    (archive)
   tee. -> tee_webrtc
+
+Archive segments are written as Matroska in ARCHIVE_LIVE_DIR (so the
+in-progress fragment is readable mid-write), then remuxed to MP4 with
+`+faststart` and moved into ARCHIVE_DIR when the fragment rotates.  The
+remux is `ffmpeg -c copy` — no re-encoding — and runs on a single
+background worker so the GStreamer streaming thread is never blocked.
             tee_webrtc. -> webrtcsink (full)                  (browser, per-peer encode)
             tee_webrtc. -> videocrop (region 0) -> webrtcsink (screen 0)
             tee_webrtc. -> videocrop (region 1) -> webrtcsink (screen 1)
@@ -28,10 +34,11 @@ Environment variables:
   DISPLAY                X11 display for host mode                (:0)
   STREAM_FRAMERATE       frames per second for host mode          (30)
 
-  ARCHIVE_DIR            output dir for completed .mkv segments   (/archive)
-  ARCHIVE_LIVE_DIR       output dir for the in-progress segment;
-                         each segment is moved to ARCHIVE_DIR when
-                         it rotates                              (/archive-live)
+  ARCHIVE_DIR            output dir for completed .mp4 segments   (/archive)
+                         (faststart MP4, web-player friendly)
+  ARCHIVE_LIVE_DIR       output dir for the in-progress .mkv      (/archive-live)
+                         segment; each segment is remuxed to MP4
+                         and moved to ARCHIVE_DIR when it rotates
   ARCHIVE_SEGMENT_SEC    segment duration in seconds              (600)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps            (6000)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
@@ -46,9 +53,12 @@ See desktop_config.py for DESKTOP_NAME, STREAM_WIDTH, STREAM_HEIGHT,
 DESKTOP_SPLITS, CROP_HEIGHT, and SIGNALLING_PORT.
 """
 import os
+import queue
 import shutil
 import signal
+import subprocess
 import sys
+import threading
 import time
 
 import gi
@@ -214,36 +224,138 @@ def main():
     archive.set_property('location', archive_pattern)
     archive.set_property('max-size-time', segment_ns)
 
-    # ── Rename completed segments to embed their recording timestamps
+    # ── Finalize completed segments: remux MKV → MP4 (faststart), then move
     # GStreamer's internal clock and Python's time.time() may use different
     # reference points (host CLOCK_MONOTONIC vs container-scoped monotonic).
     # Avoid the mismatch entirely by stamping segments with time.time() at
     # callback invocation.  The end of one fragment == start of the next
     # because both reads happen in the same callback call.
-    _fragment_starts = {}  # fragment_id -> start nanoseconds (Unix wall-clock)
+    #
+    # The remux runs on a single background daemon thread so the GStreamer
+    # streaming thread (the one that fires format-location-full) never blocks
+    # on ffmpeg I/O.  ffmpeg is invoked with `-c copy` so no re-encoding
+    # happens; `+faststart` rewrites the moov atom to the front of the file
+    # for web-player progressive playback.
+    _fragment_starts = {}    # fragment_id -> start nanoseconds (Unix wall-clock)
+    _finalize_queue  = queue.Queue()
 
-    def _rename_fragment(frag_id, end_ns):
+    def _remux_to_mp4(src, dst):
+        """Remux MKV → MP4 with faststart.  Returns True on success.
+
+        `-f mp4` is passed explicitly because the on-disk filename has a
+        `.mp4.part` suffix during the write — ffmpeg's normal
+        extension-based muxer detection sees `.part` and fails with
+        "Unable to choose an output format".  The atomic rename to the
+        final `.mp4` happens after this call returns.
+        """
+        result = subprocess.run(
+            ['ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+             '-fflags', '+genpts', '-i', src,
+             '-c', 'copy', '-map', '0:v:0',
+             '-movflags', '+faststart',
+             '-f', 'mp4', dst],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode('utf-8', errors='replace')[-1000:]
+            print(f'[service] ERROR: ffmpeg remux {src} -> {dst} failed '
+                  f'(exit {result.returncode}): {stderr}',
+                  file=sys.stderr, flush=True)
+            return False
+        return True
+
+    def _finalize_fragment(src, dst):
+        """Remux src .mkv to dst .mp4 (faststart) and remove the source.
+
+        ffmpeg writes the new MP4 alongside the source in ARCHIVE_LIVE_DIR
+        (under a `.part` suffix) so /archive never sees a partial file.
+        `+faststart` does a 2-pass write — the file passes through several
+        intermediate states before the moov atom lands at the front — and
+        keeping all of that confined to ARCHIVE_LIVE_DIR means /archive's
+        `*.mp4` glob only ever lists fully-finalized segments.
+
+        Once ffmpeg succeeds we publish to ARCHIVE_DIR via a `.part` →
+        final-name rename so the publication itself is atomic within
+        ARCHIVE_DIR even when ARCHIVE_LIVE_DIR and ARCHIVE_DIR are on
+        different filesystems (the cross-fs copy lands under .part; the
+        rename to the final name is on a single filesystem).
+
+        Falls back to moving the .mkv (under a .mkv name in ARCHIVE_DIR)
+        when ffmpeg fails so we never lose the recording.
+        """
+        tmp_dst        = os.path.join(ARCHIVE_LIVE_DIR,
+                                      os.path.basename(dst) + '.part')
+        publish_part   = dst + '.part'
+
+        if _remux_to_mp4(src, tmp_dst):
+            try:
+                shutil.move(tmp_dst, publish_part)
+                os.rename(publish_part, dst)
+            except OSError as exc:
+                print(f'[service] WARNING: could not publish {tmp_dst} as '
+                      f'{dst}: {exc}', file=sys.stderr, flush=True)
+                for path in (tmp_dst, publish_part):
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                return
+            try:
+                os.unlink(src)
+            except OSError as exc:
+                print(f'[service] WARNING: could not unlink {src}: {exc}',
+                      file=sys.stderr, flush=True)
+            print(f'[service] archive: {os.path.basename(src)}'
+                  f' -> {os.path.basename(dst)}', flush=True)
+            return
+
+        # ffmpeg failed — clean up its partial output and keep the .mkv.
+        try:
+            os.unlink(tmp_dst)
+        except FileNotFoundError:
+            pass
+
+        fallback      = os.path.splitext(dst)[0] + '.mkv'
+        fallback_part = fallback + '.part'
+        try:
+            shutil.move(src, fallback_part)
+            os.rename(fallback_part, fallback)
+            print(f'[service] archive: fallback move {os.path.basename(src)}'
+                  f' -> {os.path.basename(fallback)}', flush=True)
+        except OSError as exc:
+            print(f'[service] WARNING: could not move {src} to {fallback}: {exc}',
+                  file=sys.stderr, flush=True)
+            try:
+                os.unlink(fallback_part)
+            except FileNotFoundError:
+                pass
+
+    def _finalize_worker():
+        while True:
+            item = _finalize_queue.get()
+            try:
+                if item is None:
+                    return
+                src, dst = item
+                _finalize_fragment(src, dst)
+            finally:
+                _finalize_queue.task_done()
+
+    threading.Thread(target=_finalize_worker, name='archive-finalize',
+                     daemon=True).start()
+
+    def _enqueue_fragment(frag_id, end_ns):
         if frag_id not in _fragment_starts:
             return
         start_ns = _fragment_starts.pop(frag_id)
         src = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-{frag_id:05d}.mkv')
         dst = renamed_segment_path(src, start_ns, end_ns, archive_prefix,
-                                   dest_dir=ARCHIVE_DIR)
-        try:
-            # shutil.move is os.rename on the same filesystem; falls back to
-            # copy + delete when ARCHIVE_LIVE_DIR and ARCHIVE_DIR live on
-            # different filesystems (e.g. live on tmpfs, archive on a slower
-            # bulk volume).
-            shutil.move(src, dst)
-            print(f'[service] archive: {os.path.basename(src)}'
-                  f' -> {os.path.basename(dst)}', flush=True)
-        except OSError as exc:
-            print(f'[service] WARNING: could not move {src} to {dst}: {exc}',
-                  file=sys.stderr, flush=True)
+                                   dest_dir=ARCHIVE_DIR, ext='.mp4')
+        _finalize_queue.put((src, dst))
 
     def _on_format_location_full(_splitmux, fragment_id, first_sample):
         now_ns = time.time_ns()
-        _rename_fragment(fragment_id - 1, now_ns)
+        _enqueue_fragment(fragment_id - 1, now_ns)
         _fragment_starts[fragment_id] = now_ns
         return None
 
@@ -343,10 +455,10 @@ def main():
         t = msg.type
         if t == Gst.MessageType.EOS:
             print('[service] EOS received')
-            # Rename the last fragment — format-location-full won't fire for it.
+            # Finalize the last fragment — format-location-full won't fire for it.
             if _fragment_starts:
                 end_ns = time.time_ns()
-                _rename_fragment(max(_fragment_starts), end_ns)
+                _enqueue_fragment(max(_fragment_starts), end_ns)
             loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
@@ -388,6 +500,9 @@ def main():
         loop.run()
     finally:
         pipeline.set_state(Gst.State.NULL)
+        # Drain pending finalizations so the last fragment lands in /archive
+        # before we exit.
+        _finalize_queue.join()
         print('[service] Pipeline stopped')
 
 

@@ -27,7 +27,8 @@ web server that serves the archive download and video-assembly endpoints.
 │                              ├─ q_arch → encoder         │
 │                              │         → h264parse       │
 │                              │         → splitmuxsink    │
-│                              │           (.mkv segments) │
+│                              │   (live .mkv → .mp4 on    │
+│                              │    rotation, faststart)   │
 │                              └─ q_webrtc → tee_webrtc   │
 │                                           ├─ q_full      │
 │                                           │  → webrtcsink (full,   :8443) │
@@ -298,65 +299,116 @@ bandwidth.
 Parses the raw H.264 byte stream and manages SPS (Sequence Parameter Set) and
 PPS (Picture Parameter Set) NAL units. With `config-interval=-1` the SPS/PPS
 are repeated before every IDR (keyframe). This is critical for archive
-segmentation: each `.mkv` segment must be independently decodable from its
-first frame. Without inline SPS/PPS, a segment starting on a non-IDR frame
-would be undecodable without seeking back to the previous segment.
+segmentation: each segment must be independently decodable from its first
+frame. Without inline SPS/PPS, a segment starting on a non-IDR frame would be
+undecodable without seeking back to the previous segment.  The same property
+is also what allows the post-rotation MP4 remux to be a pure `-c copy`
+operation — the bitstream already carries the codec parameters in-band, so
+the new MP4 muxer can synthesize the `avcC` box without re-encoding.
 
 #### `splitmuxsink` (name: `archive`)
 
 | Property | Value | Purpose |
 |---|---|---|
-| `muxer-factory` | `matroskamux` | Wrap H.264 in Matroska (.mkv) container |
+| `muxer-factory` | `matroskamux` | Live container; readable mid-write |
 | `location` | `${ARCHIVE_LIVE_DIR}/{prefix}-%05d.mkv` | Output path for the in-progress segment |
 | `max-size-time` | `ARCHIVE_SEGMENT_SEC × Gst.SECOND` | Rotate to a new file every N seconds |
 
-Muxes the H.264 stream into rotating Matroska segments. `splitmuxsink` opens a
-new file automatically when the current segment reaches the `max-size-time`
-limit, ensuring no single file grows unboundedly. Matroska was chosen over MP4
-because it handles non-monotonic timestamps and open-ended streams gracefully,
-and does not require a final `moov` atom write to be playable.
+Muxes the H.264 stream into rotating Matroska fragments. `splitmuxsink` opens
+a new file automatically when the current segment reaches the
+`max-size-time` limit, ensuring no single file grows unboundedly.
 
-The in-progress segment is written into `ARCHIVE_LIVE_DIR` (default
-`/archive-live`).  When the segment rotates, it is moved into `ARCHIVE_DIR`
-(default `/archive`) under its final timestamp-based name.  Keeping the live
-write path on its own filesystem (e.g. tmpfs or a fast local disk) and the
-completed archive on a slower bulk volume is supported transparently —
-`shutil.move` handles cross-filesystem moves.
+**Why MKV here, MP4 elsewhere?**  Matroska handles non-monotonic timestamps
+and open-ended streams gracefully, and does not require a final `moov` atom
+to be readable — meaning the in-progress fragment can be opened and read
+mid-write.  This is what lets `/archive` include the active segment in
+responses while a recording is still ongoing.  Web players, however, want
+MP4 (universal browser support) with the `moov` atom at the front of the
+file (faststart, so playback can begin before the full file has been
+received).  We get both by keeping MKV as the live container and remuxing
+to MP4 on rotation.
+
+#### Post-rotation: MKV → MP4 finalize
+
+When `splitmuxsink` rotates a fragment, `pipeline.py` enqueues the
+just-completed `.mkv` for remux on a single background daemon thread.
+ffmpeg writes the new MP4 alongside the source in `ARCHIVE_LIVE_DIR`
+under a `.part` suffix, then the finished file is published into
+`ARCHIVE_DIR` via an atomic rename:
+
+```
+# 1. ffmpeg writes the new MP4 next to the source, in ARCHIVE_LIVE_DIR
+ffmpeg -y -nostdin -hide_banner -loglevel error \
+       -fflags +genpts -i ${LIVE}/${prefix}-NNNNN.mkv \
+       -c copy -map 0:v:0 -movflags +faststart \
+       ${LIVE}/${prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mp4.part
+
+# 2. Move into ARCHIVE_DIR under .part; cross-fs copies land there, not
+#    under the final name.  Then atomic rename to the final name.
+shutil.move(    ${LIVE}/${name}.mp4.part,    ${ARCHIVE}/${name}.mp4.part )
+os.rename(      ${ARCHIVE}/${name}.mp4.part, ${ARCHIVE}/${name}.mp4     )
+
+# 3. Source MKV deleted only after publication succeeds.
+os.unlink(${LIVE}/${prefix}-NNNNN.mkv)
+```
+
+Key properties:
+
+- **`-c copy`** — the H.264 packets are remuxed verbatim.  No re-encoding,
+  no quality loss, near-instant compared to a transcode.
+- **`-movflags +faststart`** — ffmpeg does a 2-pass write to place the
+  `moov` atom at the front of the MP4, allowing web players to start
+  decoding from the first received bytes.  The 2-pass intermediate
+  states stay confined to `ARCHIVE_LIVE_DIR` because the work file is
+  written there.
+- **Atomic publication** — `ARCHIVE_DIR`'s `*.mp4` glob never matches a
+  partially-written file.  ffmpeg's output is hidden under `.part` in
+  `ARCHIVE_LIVE_DIR`; the cross-filesystem copy lands under `.part` in
+  `ARCHIVE_DIR`; only the final `os.rename` makes the new segment
+  visible to readers.
+- **Background worker** — the `format-location-full` callback returns
+  immediately; the remux runs off the GStreamer streaming thread so it
+  cannot back up the pipeline queues.
+- **Fallback** — if ffmpeg ever fails (corrupt fragment, missing tool),
+  the pipeline cleans up the partial `.mp4.part` and moves the original
+  `.mkv` into `ARCHIVE_DIR` (also via a `.part`-then-rename publication)
+  so a recording is never lost.  The fallback `.mkv` is not picked up by
+  `/archive` (which globs `*.mp4`); it sits on disk until an admin
+  recovers it.
+
+Keeping the live write path on its own filesystem (e.g. tmpfs or a fast
+local disk) and the completed archive on a slower bulk volume is
+supported transparently — the cross-fs copy and the in-place rename are
+both handled correctly.
 
 ---
 
 ### Segment Naming and Timestamping
 
 Segments are written into `ARCHIVE_LIVE_DIR` with sequential numeric names
-(`{prefix}-00000.mkv`, `{prefix}-00001.mkv`, …).  When a segment is completed,
-it is moved into `ARCHIVE_DIR` and renamed to embed its precise wall-clock
-recording interval:
+(`{prefix}-00000.mkv`, `{prefix}-00001.mkv`, …).  When a segment is
+completed it is remuxed (no re-encode) to a faststart MP4 in `ARCHIVE_DIR`
+under its final timestamp-based name:
 
 ```
-{prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mkv
+{prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mp4
 ```
 
 **How timestamps are derived:**
 
 The `format-location-full` signal fires on `splitmuxsink` at the start of each
-new fragment.  The callback (`_on_format_location_full`) computes the wall-clock
-time of the first frame in the new fragment as:
+new fragment.  The callback (`_on_format_location_full`) stamps the boundary
+with `time.time_ns()`.  This value simultaneously becomes the **end**
+timestamp of the just-completed fragment and the **start** timestamp of the
+new one — both reads happen in the same callback call, so adjacent segments
+abut exactly.  The old fragment is enqueued for finalize (MKV → MP4 remux
+on a background worker), with the new name computed by
+`archive_times.renamed_segment_path(..., ext='.mp4')`.
 
-```
-now_ns = pipeline.get_base_time() + buf.pts
-```
-
-(falling back to `time.time()` if `buf.pts` is unavailable)
-
-This value simultaneously becomes the **end** timestamp of the just-completed
-fragment and the **start** timestamp of the new one.  The old fragment is
-moved from `ARCHIVE_LIVE_DIR` to `ARCHIVE_DIR` immediately, with the new name
-computed by `archive_times.renamed_segment_path()`.
-
-On pipeline shutdown (EOS), `format-location-full` does not fire for the final
-fragment.  The EOS handler (`on_message`) renames it using
-`pipeline.get_base_time() + pipeline.query_position(Gst.Format.TIME)` as the
-end timestamp, falling back to `time.time()` if the clock query fails.
+On pipeline shutdown (EOS), `format-location-full` does not fire for the
+final fragment.  The EOS handler stamps it with `time.time_ns()`, enqueues
+it, and waits for the queue to drain so the last segment lands in
+`ARCHIVE_DIR` before the process exits.
 
 The timestamp precision is millisecond-level, matching the filename format
 `YYYYMMDD-HHMMSS.SSS`.  The start of segment N+1 is always exactly equal to the
@@ -376,7 +428,7 @@ When either `ARCHIVE_MAX_BYTES` or `ARCHIVE_MAX_AGE_DAYS` is non-zero,
 
 The purge logic (`archive_purge.py`):
 
-1. Sorts all `.mkv` files in `ARCHIVE_DIR` (completed segments only) by mtime.
+1. Sorts all `.mp4` files in `ARCHIVE_DIR` (completed segments only) by mtime.
 2. Exempts the most recent file as a safety margin so at least one segment
    always survives.  The currently-writing segment lives in
    `ARCHIVE_LIVE_DIR` and is therefore never visible to the purger.
@@ -514,8 +566,8 @@ load.
 
 ### `GET /archive`
 
-Returns a `.zip` of all `.mkv` segments whose recorded time overlaps the
-requested window.
+Returns a `.zip` of all faststart `.mp4` segments whose recorded time
+overlaps the requested window.
 
 **Parameters** (one form required):
 
@@ -537,26 +589,32 @@ directly to the client.
 
 ### `GET /video`
 
-Returns a single `.mkv` covering **exactly** the requested time window.
-Requests longer than 12 hours are rejected with 400.
+Returns a single faststart `.mp4` covering **exactly** the requested time
+window.  Requests longer than 12 hours are rejected with 400.
 
 **Parameters:** same as `/archive`.
 
 **Implementation** (`stage_segments()` → `transcode_to_video()`):
 
-1. **Staging** (`stage_segments()`): overlapping segments are copied to a temp
-   directory.  All staged files receive timestamp-embedded names so downstream
-   code can rely purely on filename parsing.
+1. **Staging** (`stage_segments()`): overlapping segments are normalized into
+   a temp directory as faststart `.mp4` so downstream code only ever sees
+   one container format.
 
-   - **Completed segments** (timestamp names): copied as-is.
-   - **Active segment** (sequential numeric name — the file currently being
-     written by `splitmuxsink`): its start time is taken from the end timestamp
-     of the last completed segment (the same boundary `pipeline.py` will record
-     when it finalises the file).  The file is opened by file descriptor before
-     the copy begins; an `os.rename` by the pipeline after that point does not
-     interrupt the copy because the fd holds the inode reference.  If the rename
-     fires before the `open()` call, the now-completed file is found via a fresh
-     directory scan.
+   - **Completed segments** (timestamp names, already `.mp4` after the
+     pipeline's MKV → MP4 finalize): copied as-is.
+   - **Active segment** (sequential numeric `.mkv` — the fragment
+     currently being written by `splitmuxsink`): its start time is taken
+     from the end timestamp of the last completed segment (the same
+     boundary `pipeline.py` will record when it finalises the file).  The
+     file is opened by file descriptor before ffmpeg starts; ffmpeg reads
+     via `/proc/self/fd/<n>`, so a rotation by the pipeline after that
+     point does not interrupt the read because the fd holds the inode
+     reference.  If the rotation fires before the `os.open()` call, the
+     now-completed `.mp4` is found in `ARCHIVE_DIR` via a fresh directory
+     scan.  The active fragment is remuxed (`-c copy -movflags
+     +faststart` — no re-encode) into a faststart `.mp4` named with the
+     same `{prefix}_..._to_..._mp4` convention so the assembly step can
+     treat it identically to a completed segment.
 
 2. **Assembly** (`video_transcode.py`, `transcode_to_video()`): builds and runs
    an ffmpeg `filter_complex`:
@@ -574,8 +632,9 @@ Requests longer than 12 hours are rejected with 400.
    - Gaps (periods with no recorded content) are filled by the base colour
      showing through where no overlay is present.
 
-   The output is encoded with `libx264 -preset ultrafast` and streamed to the
-   client as `video/x-matroska`.
+   The output is encoded with `libx264 -preset ultrafast`, written with
+   `-movflags +faststart` so the `moov` atom is at the front of the file,
+   and streamed to the client as `video/mp4`.
 
 ---
 
@@ -604,8 +663,8 @@ Requests longer than 12 hours are rejected with 400.
 | `STREAM_WIDTH` | `1920` (caster) / native (host) | Capture width.  In host mode, leaving it unset reads the X server's native width via `xrandr` |
 | `STREAM_HEIGHT` | `1080` (caster) / native (host) | Capture height.  In host mode, leaving it unset reads the X server's native height via `xrandr` |
 | `DESKTOP_SPLITS` | _(empty)_ | `WxH+X+Y;WxH+X+Y;…` regions.  In host mode unset triggers `xrandr --listmonitors` auto-detection.  In caster mode unset falls back to a `CROP_HEIGHT`-based top/bottom split |
-| `ARCHIVE_DIR` | `/archive` | Directory for completed (timestamp-named) `.mkv` segments |
-| `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress segment is written into; each segment is moved into `ARCHIVE_DIR` when it rotates |
+| `ARCHIVE_DIR` | `/archive` | Directory for completed (timestamp-named) faststart `.mp4` segments |
+| `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress `.mkv` segment is written into; each segment is remuxed to `.mp4` (`-c copy -movflags +faststart`) and moved into `ARCHIVE_DIR` when it rotates |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
 | `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps |
 | `ARCHIVE_MAX_BYTES` | `0` | Delete oldest segments when archive exceeds this size; `0` = unlimited |

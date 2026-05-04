@@ -41,7 +41,7 @@ def _mock_video_file_info(monkeypatch):
 
 def _make_seg(directory, index, age_seconds=0):
     """Write a fake unnamed segment (no timestamp in name) and set its mtime."""
-    path = os.path.join(str(directory), f'stream-{index:05d}.mkv')
+    path = os.path.join(str(directory), f'stream-{index:05d}.mp4')
     with open(path, 'wb') as fh:
         fh.write(b'fake')
     mtime = time.time() - age_seconds
@@ -59,7 +59,7 @@ def _make_renamed(directory, start_epoch, end_epoch):
         d = _dt.datetime.fromtimestamp(e, tz=utc)
         return f'{d.strftime(fmt)}.{d.microsecond // 1000:03d}'
 
-    name = f'stream_{_fmt(start_epoch)}_to_{_fmt(end_epoch)}.mkv'
+    name = f'stream_{_fmt(start_epoch)}_to_{_fmt(end_epoch)}.mp4'
     path = os.path.join(str(directory), name)
     with open(path, 'wb') as fh:
         fh.write(b'fake')

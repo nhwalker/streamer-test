@@ -46,8 +46,8 @@ public final class EvidenceAttachmentExtension
      * test is running (the call becomes a no-op).
      *
      * @param name      attachment display name in the Allure report
-     * @param mimeType  MIME type, e.g. {@code "video/x-matroska"}
-     * @param extension file extension including the leading dot, e.g. {@code ".mkv"}
+     * @param mimeType  MIME type, e.g. {@code "video/mp4"}
+     * @param extension file extension including the leading dot, e.g. {@code ".mp4"}
      * @param content   raw bytes
      */
     public static void add(String name, String mimeType, String extension, byte[] content) {
