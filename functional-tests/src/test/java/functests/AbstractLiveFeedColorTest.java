@@ -181,8 +181,9 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
     @Description("Verifies the page header populates every stream metric and the health dot. "
             + "Asserts that within 30s of playback all of #m-lat (RTT/2 ms), #m-res (resolution), "
             + "#m-qp (avg QP), #m-frz (freezes/min), #m-jbd (jitter buffer delay ms) show a value "
-            + "other than '--' and that #m-health gets a green/yellow/red class. No thresholds "
-            + "are asserted on the values themselves.")
+            + "other than '--' and that #m-health gets one of the five quality classes "
+            + "(lossless, visually-lossless, good, yellow, red). No thresholds are asserted on "
+            + "the values themselves.")
     void metricsDisplayPopulates() throws InterruptedException {
         long deadline = System.currentTimeMillis() + 30_000;
         @SuppressWarnings("unchecked")
@@ -211,8 +212,14 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
             if (!(v instanceof String s) || s.isEmpty() || s.equals("--")) return false;
         }
         Object h = state.get("health");
+        // The gumball uses one of five quality tiers; any non-empty tier means
+        // the classifier ran and produced a verdict.
         return h instanceof String hs
-                && (hs.equals("green") || hs.equals("yellow") || hs.equals("red"));
+                && (hs.equals("lossless")
+                 || hs.equals("visually-lossless")
+                 || hs.equals("good")
+                 || hs.equals("yellow")
+                 || hs.equals("red"));
     }
 
     private String collectDiagnostics(String reason) {

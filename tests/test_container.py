@@ -351,7 +351,8 @@ class TestWebRTCStream:
         Asserts that within 30s of playback all of #m-lat (RTT/2 ms),
         #m-res (resolution), #m-qp (avg QP), #m-frz (freezes/min),
         #m-jbd (jitter buffer delay ms) show a value other than '--' and that
-        #m-health gets a green/yellow/red class.  No thresholds are asserted
+        #m-health gets one of the five quality classes (lossless,
+        visually-lossless, good, yellow, red).  No thresholds are asserted
         on the values themselves — RTT/2 and QP are not absolute quality
         measures, and CI hardware varies too much for a meaningful bound.
         """
@@ -493,7 +494,11 @@ def _wait_for_metrics(driver, timeout=30):
             last_state.get(k) not in (None, '', '--')
             for k in ('lat', 'res', 'qp', 'frz', 'jbd')
         )
-        health_ok = last_state.get('health') in ('green', 'yellow', 'red')
+        # The gumball uses one of five quality tiers; any non-empty tier
+        # means the classifier ran and produced a verdict.
+        health_ok = last_state.get('health') in (
+            'lossless', 'visually-lossless', 'good', 'yellow', 'red',
+        )
         if text_ok and health_ok:
             return last_state
         time.sleep(0.5)
