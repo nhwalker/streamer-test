@@ -288,36 +288,50 @@ Re-encodes the raw decoded video to H.264 for the archive.  The encoder is
 selected at runtime (`build_archive_encoder()`) based on `ARCHIVE_QUALITY`,
 which has three modes:
 
-**`ARCHIVE_QUALITY=visually-lossless`** *(default)* — CRF/CQP at
-`ARCHIVE_QP` (default 18).  Indistinguishable from the source on screen
-content; ~2-4× the file size of `legacy` mode.
+**`ARCHIVE_QUALITY=visually-lossless`** *(default)* — constant-quantizer
+encoding at `ARCHIVE_QP` (default 18).  Indistinguishable from the source
+on screen content; ~2-4× the file size of `legacy` mode.
 
 | Encoder | Property | Value | Purpose |
 |---|---|---|---|
 | `nvh264enc` | `rc-mode` | `constqp` | Quality-targeted (not bitrate-targeted) |
 | `nvh264enc` | `qp-const{,-i,-p,-b}` | `ARCHIVE_QP` | All QP knobs at the configured value (build-version compat) |
-| `nvh264enc` | `preset` | `high-quality` | Trade encode time for compression efficiency |
-| `nvh264enc` | `gop-size` | `60` | Keyframe every 2 s at 30 fps |
+| `nvh264enc` | `preset` | `low-latency-hq` | Same as legacy mode — see note below |
+| `nvh264enc` | `gop-size` | `30` | Same as legacy mode |
 | `nvh264enc` | `max-bitrate` | `ARCHIVE_BITRATE_CAP` kbps (default 100 000) | Ceiling so a chaotic frame can't blow up segment size |
-| `x264enc`   | `pass` | `5` (qual) | CRF (rate-distortion-optimised quality) |
-| `x264enc`   | `quantizer` | `ARCHIVE_QP` | Effective CRF value |
-| `x264enc`   | `qp-min` / `qp-max` | `0` / `51` | Full QP range |
-| `x264enc`   | `speed-preset` | `4` (faster) | Better compression than legacy `ultrafast` |
-| `x264enc`   | `key-int-max` | `60` | Keyframe every 2 s at 30 fps |
+| `x264enc`   | `pass` | `4` (quant) | Constant quantizer at `ARCHIVE_QP` |
+| `x264enc`   | `quantizer` | `ARCHIVE_QP` | Constant QP value |
+| `x264enc`   | `tune` | `0x4` (zerolatency) | Same as legacy mode — see note below |
+| `x264enc`   | `speed-preset` | `1` (ultrafast) | Same as legacy mode |
+| `x264enc`   | `key-int-max` | `30` | Same as legacy mode |
 
 **`ARCHIVE_QUALITY=lossless`** — true lossless (QP=0).  Files can be very
 large (50–200 Mbps during heavy motion); set `ARCHIVE_MAX_BYTES`.
 
 | Encoder | Property | Value |
 |---|---|---|
-| `nvh264enc` | `preset` (if available) | `lossless-hp` |
 | `nvh264enc` | `rc-mode` | `constqp` |
 | `nvh264enc` | `qp-const{,-i,-p,-b}` | `0` |
-| `nvh264enc` | `gop-size` | `60` |
+| `nvh264enc` | `preset` | `low-latency-hq` |
+| `nvh264enc` | `gop-size` | `30` |
 | `x264enc`   | `pass` | `4` (quant — true CQP) |
 | `x264enc`   | `quantizer` | `0` |
 | `x264enc`   | `qp-min` / `qp-max` | `0` / `0` |
-| `x264enc`   | `speed-preset` | `4` (faster) |
+| `x264enc`   | `tune` | `0x4` (zerolatency) |
+| `x264enc`   | `speed-preset` | `1` (ultrafast) |
+| `x264enc`   | `key-int-max` | `30` |
+
+**Why the new modes keep `tune=zerolatency`, `speed-preset=ultrafast`, and
+`preset=low-latency-hq`:** an earlier draft dropped these settings on the
+grounds that the archive isn't latency-sensitive, and pushed `x264enc` to
+`speed-preset=faster` / `pass=qual` (CRF) and `nvh264enc` to
+`preset=high-quality`.  CI surfaced a hang — the archive encoder never
+produced its first buffer, so the pipeline got stuck in PAUSED and
+`splitmuxsink` never opened a segment.  Reverting the latency tunings to
+exactly match `legacy` mode keeps the encoder on the same negotiation
+path, and switching only `rc-mode` / `pass` / `quantizer` is enough to
+move from bitrate-targeted to quality-targeted output.  We can revisit
+the slower presets in a follow-up once the interaction is understood.
 
 **`ARCHIVE_QUALITY=legacy`** — byte-for-byte compatible with the
 configuration shipped before the archive quality work.  `ARCHIVE_BITRATE`

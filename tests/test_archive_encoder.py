@@ -51,20 +51,23 @@ def test_unknown_mode_raises():
 
 # ── visually-lossless: the default tier ─────────────────────────────────────
 
-def test_visually_lossless_x264enc_uses_crf_at_qp():
+def test_visually_lossless_x264enc_uses_cqp_at_qp():
     props = _props(archive_encoder_plan(quality='visually-lossless', qp=18),
                    'x264enc')
-    # pass=5 == qual (CRF), and quantizer is the CRF value.
-    assert props['pass']      == 5
+    # pass=4 == quant (constant quantizer); quantizer is the CQP value.
+    assert props['pass']      == 4
     assert props['quantizer'] == 18
-    # QP range left wide open so the encoder can pick whatever it needs.
-    assert props['qp-min']    == 0
-    assert props['qp-max']    == 51
-    # speed-preset 4 (faster) — better compression than today's ultrafast(1)
-    # since this hop has no latency requirement.
-    assert props['speed-preset'] == 4
-    # No tune=zerolatency — that's a legacy-mode setting.
-    assert 'tune' not in props
+    # Latency-tuned preset and tune are kept so the encoder negotiates and
+    # prerolls the same way it did in legacy mode — the only quality change
+    # is rate-control mode.  CI flushed out a hang when these were dropped.
+    assert props['tune']         == 0x4
+    assert props['speed-preset'] == 1
+    assert props['key-int-max']  == 30
+    # qp-min / qp-max are NOT set in this mode — left at encoder defaults.
+    # Setting qp-min=0 only matters for true lossless and may interact badly
+    # with pass=quant on some builds.
+    assert 'qp-min' not in props
+    assert 'qp-max' not in props
 
 
 def test_visually_lossless_nvh264enc_uses_constqp_at_qp():
@@ -76,6 +79,10 @@ def test_visually_lossless_nvh264enc_uses_constqp_at_qp():
     assert props['qp-const-i'] == 18
     assert props['qp-const-p'] == 18
     assert props['qp-const-b'] == 18
+    # Latency-tuned preset and gop-size match legacy so we know the encoder
+    # negotiates / prerolls the same way it did before quality tuning.
+    assert props['preset']      == 'low-latency-hq'
+    assert props['gop-size']    == 30
     # max-bitrate caps a chaotic frame so we never blow up segment size.
     assert props['max-bitrate'] == 100000
 
@@ -99,9 +106,14 @@ def test_lossless_x264enc_pins_qp_to_zero():
     props = _props(archive_encoder_plan(quality='lossless'), 'x264enc')
     assert props['pass']      == 4    # quant — true CQP at QP=0
     assert props['quantizer'] == 0
+    # qp-min=0 and qp-max=0 are required so the encoder cannot wander above 0.
     assert props['qp-min']    == 0
     assert props['qp-max']    == 0
-    assert 'tune' not in props
+    # Latency-tuned preset and tune are kept (same rationale as
+    # visually-lossless): preserve the legacy preroll path.
+    assert props['tune']         == 0x4
+    assert props['speed-preset'] == 1
+    assert props['key-int-max']  == 30
 
 
 def test_lossless_nvh264enc_pins_qp_to_zero():
@@ -112,6 +124,11 @@ def test_lossless_nvh264enc_pins_qp_to_zero():
     assert props['qp-const-p'] == 0
     assert props['qp-const-b'] == 0
     assert props['rc-mode']    == 'constqp'
+    # Latency-tuned preset kept rather than 'lossless-hp', because not every
+    # gst-plugins-rs build exposes that preset and we'd rather negotiate
+    # against the same preset legacy used and rely on rc-mode/qp-const for
+    # the actual lossless behavior.
+    assert props['preset']     == 'low-latency-hq'
 
 
 def test_lossless_ignores_qp_override():
@@ -152,16 +169,27 @@ def test_legacy_bitrate_override_propagates():
     assert _props(plan, 'nvh264enc')['max-bitrate'] == 12000
 
 
-# ── No latency tunings on the new modes ─────────────────────────────────────
+# ── Rate-control switch is the only intentional change vs legacy ────────────
 
 @pytest.mark.parametrize('quality', ['visually-lossless', 'lossless'])
-def test_new_modes_drop_latency_tunings(quality):
-    """Archive isn't a latency-sensitive path — viewers go through WebRTC."""
+def test_new_modes_match_legacy_cpu_profile(quality):
+    """The new modes deliberately keep the legacy preset / tune / speed-preset
+    triple so the encoder negotiates and prerolls along the same code path.
+
+    An earlier draft of this PR dropped tune=zerolatency and switched to
+    speed-preset=4 (faster) / pass=qual / qp-min=0 in the new modes.  CI
+    found that the service pipeline got stuck in PAUSED — the archive
+    encoder never produced its first buffer, so splitmuxsink never opened
+    a segment and `awaitFirstSegment()` timed out.  Until we have a way
+    to investigate that interaction (likely qp-min=0 with pass=qual on
+    this build of x264enc), the safer move is to keep the latency tunings
+    and only flip rate-control mode.
+    """
     plan = archive_encoder_plan(quality=quality)
     x264_props = _props(plan, 'x264enc')
     nv_props   = _props(plan, 'nvh264enc')
-    # x264enc: no zerolatency tune, slower preset.
-    assert 'tune' not in x264_props
-    assert x264_props['speed-preset'] != 1
-    # nvh264enc: no low-latency preset.
-    assert nv_props.get('preset') != 'low-latency-hq'
+    assert x264_props['tune']         == 0x4
+    assert x264_props['speed-preset'] == 1
+    assert x264_props['key-int-max']  == 30
+    assert nv_props['preset']         == 'low-latency-hq'
+    assert nv_props['gop-size']       == 30

@@ -62,44 +62,54 @@ def archive_encoder_plan(quality='visually-lossless', qp=18,
     if quality == 'lossless':
         return [
             ('nvh264enc', {
-                # Try the named preset first; on builds that don't expose it,
-                # the rc-mode + qp-const path below still produces lossless.
-                'preset':      'lossless-hp',
+                # Latency-tuned preset is kept; the encoder still has no real
+                # latency requirement on the archive path, but gst-plugins-rs
+                # builds on different hosts disagree on which other presets
+                # exist (e.g. 'lossless-hp' is absent on some), and matching
+                # the legacy preset means we know the encoder negotiates and
+                # prerolls correctly.  rc-mode=constqp + qp-const=0 is the
+                # actual lossless switch.
+                'preset':      'low-latency-hq',
                 'rc-mode':     'constqp',
                 'qp-const':    0,
                 'qp-const-i':  0,
                 'qp-const-p':  0,
                 'qp-const-b':  0,
-                'gop-size':    60,
+                'gop-size':    30,
             }),
             ('x264enc', {
+                'tune':         0x4,    # zerolatency (match legacy CPU profile)
+                'speed-preset': 1,      # ultrafast (match legacy CPU profile)
                 'pass':         4,      # 4 = quant (constant quantizer)
                 'quantizer':    0,
-                'qp-min':       0,
+                'qp-min':       0,      # required for true QP=0 lossless
                 'qp-max':       0,
-                'speed-preset': 4,      # faster
-                'key-int-max':  60,
+                'key-int-max':  30,
             }),
         ]
 
     # visually-lossless
     return [
         ('nvh264enc', {
+            # Same preset and gop-size as legacy mode — the only real change
+            # is rc-mode/qp-const, which redirects rate control from bitrate-
+            # targeted (vbr-hq) to quality-targeted (constqp).  Latency-tuned
+            # preset is kept for build-version compatibility (see the lossless
+            # comment above).
+            'preset':      'low-latency-hq',
             'rc-mode':     'constqp',
             'qp-const':    qp,
             'qp-const-i':  qp,
             'qp-const-p':  qp,
             'qp-const-b':  qp,
-            'preset':      'high-quality',
-            'gop-size':    60,
+            'gop-size':    30,
             'max-bitrate': bitrate_cap,
         }),
         ('x264enc', {
-            'pass':         5,          # 5 = qual (CRF)
+            'tune':         0x4,        # zerolatency (match legacy CPU profile)
+            'speed-preset': 1,          # ultrafast (match legacy CPU profile)
+            'pass':         4,          # 4 = quant (constant quantizer at QP)
             'quantizer':    qp,
-            'qp-min':       0,
-            'qp-max':       51,
-            'speed-preset': 4,          # faster
-            'key-int-max':  60,
+            'key-int-max':  30,
         }),
     ]
