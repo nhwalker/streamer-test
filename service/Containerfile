@@ -137,14 +137,15 @@ COPY web/index.html /var/www/html/index.html
 COPY entrypoint.sh       /usr/local/bin/entrypoint.sh
 COPY pipeline.py         /usr/local/bin/pipeline.py
 COPY web_server.py       /usr/local/bin/web_server.py
+COPY archive_encoder.py  /usr/local/bin/archive_encoder.py
 COPY archive_purge.py    /usr/local/bin/archive_purge.py
 COPY archive_times.py    /usr/local/bin/archive_times.py
 COPY video_transcode.py  /usr/local/bin/video_transcode.py
 COPY desktop_config.py   /usr/local/bin/desktop_config.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
-             /usr/local/bin/web_server.py /usr/local/bin/archive_purge.py \
-             /usr/local/bin/archive_times.py /usr/local/bin/video_transcode.py \
-             /usr/local/bin/desktop_config.py
+             /usr/local/bin/web_server.py /usr/local/bin/archive_encoder.py \
+             /usr/local/bin/archive_purge.py /usr/local/bin/archive_times.py \
+             /usr/local/bin/video_transcode.py /usr/local/bin/desktop_config.py
 
 # ── Default archive volumes ───────────────────────────────────────────────────
 # /archive holds completed (timestamp-named) segments.
