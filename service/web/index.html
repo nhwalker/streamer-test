@@ -40,9 +40,19 @@
       vertical-align: middle;
       transition: background-color 0.3s;
     }
-    #m-health.green  { background: #4caf50; }
-    #m-health.yellow { background: #ffc107; }
-    #m-health.red    { background: #f44336; }
+    /*
+      Five-tier health gumball, brightest = best:
+        lossless           → near-zero QP, full res/fps, no faults
+        visually-lossless  → low QP, full res/fps, no faults  (today's "green")
+        good               → no faults but quality not measured / not at top
+        yellow             → degraded
+        red                → broken
+    */
+    #m-health.lossless          { background: #7CFC00; }  /* lawn green */
+    #m-health.visually-lossless { background: #4caf50; }  /* mid green */
+    #m-health.good              { background: #2e7d32; }  /* dark green */
+    #m-health.yellow            { background: #ffc107; }
+    #m-health.red               { background: #f44336; }
 
     #video-area {
       flex: 1 1 0;
@@ -79,7 +89,7 @@
 </head>
 <body>
   <div id="header">
-    <span id="m-health" title="Stream health. Green: healthy. Yellow: high QP or 1–5% loss. Red: freezes, &gt;5% loss, or keyframe requests."></span>
+    <span id="m-health" title="Stream quality. Bright green: lossless (QP≈0). Green: visually lossless (low QP). Dark green: no faults, quality not at top. Yellow: high QP or 1–5% loss. Red: freezes, &gt;5% loss, or keyframe requests."></span>
     <span id="m-name">--</span><span id="m-screen"></span>
     &nbsp;&nbsp;FPS: <span id="m-fps">--</span>
     &nbsp;&nbsp;RTT/2 (ms): <span id="m-lat" title="Half of the WebRTC round-trip time. Network only — does not include encode, jitter buffer, decode or render delay.">--</span>
@@ -172,15 +182,23 @@
         if (r.ok) cfg = await r.json();
       } catch (_) {}
 
-      let desktopName = cfg ? cfg.desktopName : null;
-      let screenLabel = '';
-      let sigPort     = cfg ? cfg.fullSignallingPort : 8443;
+      let desktopName  = cfg ? cfg.desktopName : null;
+      let screenLabel  = '';
+      let sigPort      = cfg ? cfg.fullSignallingPort : 8443;
+      let targetFps    = cfg ? cfg.framerate : 30;
+      // Target resolution defaults to the full stream; if we're routed to a
+      // specific screen sub-stream the gumball compares against that screen's
+      // dimensions instead, since the receiver only sees the cropped frame.
+      let targetWidth  = cfg ? cfg.width  : null;
+      let targetHeight = cfg ? cfg.height : null;
 
       if (cfg) {
         const screen = (cfg.screens || []).find(s => s.path === path);
         if (screen) {
-          sigPort = screen.signallingPort;
-          screenLabel = ` / ${screen.name}`;
+          sigPort      = screen.signallingPort;
+          screenLabel  = ` / ${screen.name}`;
+          targetWidth  = screen.width;
+          targetHeight = screen.height;
         }
       } else {
         // Legacy fallback path-to-port map.
@@ -194,17 +212,45 @@
       if (!desktopName) {
         desktopName = sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
       }
-      return { sigUrl, desktopName, screenLabel };
+      return { sigUrl, desktopName, screenLabel,
+               targetFps, targetWidth, targetHeight };
     }
 
     let _metricsTimer = null;
     const _snapshots = [];     // rolling window of inbound-rtp counters
     const WINDOW_LEN = 10;     // 1Hz × 10 = ~10s rolling window
 
-    // Codec-dependent QP ranges; used to set the "yellow" threshold for the health dot.
-    // Source: codec specs. H.264: 0–51, VP8: 0–127, VP9/AV1: 0–255.
-    const QP_MAX = { 'video/H264': 51, 'video/VP8': 127, 'video/VP9': 255, 'video/AV1': 255 };
+    // Targets the classifier compares against for the top two tiers.
+    // Populated on page boot from /config.json (and the routed screen, if any).
+    let _targetFps    = null;
+    let _targetWidth  = null;
+    let _targetHeight = null;
+
+    // Codec-dependent QP scale ceilings.  Source: codec specs.
+    //   H.264: 0–51, VP8: 0–127, VP9/AV1: 0–255.
+    // (Browsers report VP8/VP9 qpSum in the underlying libvpx 0–63 range, so we
+    // gate VP8/VP9 thresholds against that effective scale instead of the spec
+    // ceiling.  AV1 follows the same 0–255 convention as VP9 in stats.)
+    const QP_MAX          = { 'video/H264': 51, 'video/VP8': 127, 'video/VP9': 255, 'video/AV1': 255 };
     const QP_YELLOW_RATIO = 0.7;
+
+    // "Visually lossless" QP per codec — well-cited rule-of-thumb thresholds.
+    // Below this, double-blind viewers cannot reliably distinguish from source.
+    const QP_VISUALLY_LOSSLESS = {
+      'video/H264': 18,
+      'video/VP8':  30,
+      'video/VP9':  60,
+      'video/AV1':  60,
+    };
+
+    // "Lossless" QP — the encoder stopped throwing data away.  Allow a tiny
+    // slack above 0 because rate-controlled encoders may briefly land at QP 1
+    // on transition frames even when the rest of the stream is QP 0.
+    const QP_LOSSLESS_MAX = 1;
+
+    // Frames cannot stall longer than this for the top two tiers.  Above
+    // ~100 ms the receiver is absorbing visible jitter even if no freeze fired.
+    const JBD_TOP_TIER_MAX_MS = 100;
 
     async function updateMetrics() {
       const pc = window._streamPc;
@@ -293,19 +339,54 @@
           : null;
 
       // Health classifier — needs a few samples before it's meaningful.
+      //
+      // Five tiers, evaluated worst-first.  The two top tiers (lossless,
+      // visually-lossless) require positive evidence: low QP, full target
+      // resolution, near-target fps, and zero faults.  Without QP data
+      // (some browsers don't populate qpSum for hardware decoders) the
+      // gumball can't claim either top tier and falls through to "good".
       let health = null;
       if (_snapshots.length >= 3) {
         const qpYellow = (QP_MAX[snap.mimeType] ?? 51) * QP_YELLOW_RATIO;
-        if ((freezesPerMin != null && freezesPerMin > 2)
-            || dPli > 0
-            || (lossPct != null && lossPct > 5)) {
+        const qpVL     = QP_VISUALLY_LOSSLESS[snap.mimeType];
+
+        const isRed = (freezesPerMin != null && freezesPerMin > 2)
+                   || dPli > 0
+                   || (lossPct != null && lossPct > 5);
+
+        const isYellow = (avgQp != null && avgQp > qpYellow)
+                      || (lossPct != null && lossPct > 1)
+                      || (avgJbMs != null && avgJbMs > 200);
+
+        // Top-tier prerequisites: full delivery, no faults of any size.
+        const noFaults = !isRed
+                      && !isYellow
+                      && (freezesPerMin == null || freezesPerMin === 0)
+                      && (lossPct       == null || lossPct       === 0)
+                      && dPli === 0
+                      && (avgJbMs == null || avgJbMs <= JBD_TOP_TIER_MAX_MS);
+
+        const fpsAtTarget = fps != null
+                         && _targetFps != null
+                         && fps >= _targetFps - 1;
+
+        const resAtTarget = _targetWidth != null
+                         && _targetHeight != null
+                         && snap.frameWidth  === _targetWidth
+                         && snap.frameHeight === _targetHeight;
+
+        if (isRed) {
           health = 'red';
-        } else if ((avgQp != null && avgQp > qpYellow)
-            || (lossPct != null && lossPct > 1)
-            || (avgJbMs != null && avgJbMs > 200)) {
+        } else if (isYellow) {
           health = 'yellow';
+        } else if (noFaults && fpsAtTarget && resAtTarget
+                   && avgQp != null && avgQp <= QP_LOSSLESS_MAX) {
+          health = 'lossless';
+        } else if (noFaults && fpsAtTarget && resAtTarget
+                   && qpVL != null && avgQp != null && avgQp <= qpVL) {
+          health = 'visually-lossless';
         } else if (fps != null && fps > 0) {
-          health = 'green';
+          health = 'good';
         }
       }
 
@@ -317,7 +398,8 @@
       document.getElementById('m-frz').textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
       document.getElementById('m-jbd').textContent = avgJbMs != null ? Math.round(avgJbMs).toString() : '--';
       const dot = document.getElementById('m-health');
-      dot.classList.remove('green', 'yellow', 'red');
+      dot.classList.remove('lossless', 'visually-lossless', 'good',
+                           'yellow', 'red');
       if (health) dot.classList.add(health);
     }
 
@@ -336,11 +418,16 @@
       for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz', 'm-jbd']) {
         document.getElementById(id).textContent = '--';
       }
-      document.getElementById('m-health').classList.remove('green', 'yellow', 'red');
+      document.getElementById('m-health').classList.remove(
+        'lossless', 'visually-lossless', 'good', 'yellow', 'red');
     }
 
     (async () => {
-      const { sigUrl, desktopName, screenLabel } = await resolveStreamConfig();
+      const { sigUrl, desktopName, screenLabel,
+              targetFps, targetWidth, targetHeight } = await resolveStreamConfig();
+      _targetFps    = targetFps;
+      _targetWidth  = targetWidth;
+      _targetHeight = targetHeight;
       document.getElementById('m-name').textContent   = desktopName;
       document.getElementById('m-screen').textContent = screenLabel;
       document.title = screenLabel

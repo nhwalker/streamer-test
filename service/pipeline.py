@@ -87,7 +87,66 @@ ARCHIVE_MAX_AGE_DAYS  = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 STUN                  = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 
+# Per-peer bitrate window for browser-facing webrtcsink instances.  These are
+# the bounds REMB / transport-cc is allowed to drive the encoder between; the
+# encoder targets whatever the network estimator currently reports inside this
+# window.  The ceiling is set high enough that a fat link can carry visually-
+# lossless (and occasionally true-lossless) 1080p30 — the encoder will never
+# spend it on static content, only burst into it when motion demands.
+WEBRTC_MIN_BITRATE   = int(os.environ.get('WEBRTC_MIN_BITRATE',   '500000'))    #   0.5 Mbps
+WEBRTC_START_BITRATE = int(os.environ.get('WEBRTC_START_BITRATE', '10000000'))  #  10   Mbps
+WEBRTC_MAX_BITRATE   = int(os.environ.get('WEBRTC_MAX_BITRATE',   '80000000'))  #  80   Mbps
+
 WEBRTC_VIDEO_CAPS     = 'video/x-vp9;video/x-h264'
+
+
+def _set_if_present(element, name, value):
+    """Set element[name] = value when the property exists; ignore otherwise.
+
+    The encoders fronted by webrtcsink vary between hosts (NVENC vs. x264 vs.
+    libvpx vs. rav1e) and across GStreamer versions.  We probe rather than
+    branch hard so a missing property on one build doesn't crash the pipeline.
+    """
+    try:
+        if element.find_property(name) is not None:
+            element.set_property(name, value)
+    except Exception:
+        pass
+
+
+def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
+    """Allow the per-peer encoder to reach lossless / near-lossless quality.
+
+    `webrtcsink` instantiates a fresh encoder per consumer and emits this
+    signal so we can override its defaults.  All we do here is widen the QP
+    floor down to 0 — without that, x264enc's default `qp-min=10` mathematically
+    forbids true lossless output even when REMB tells the encoder it has the
+    bandwidth to spend.  Latency-affecting properties (preset, tune, lookahead)
+    are deliberately left at webrtcsink's defaults so this stays a quality
+    change, not a latency change.
+    """
+    factory = encoder.get_factory()
+    name    = factory.get_name() if factory else '<unknown>'
+    if name in ('x264enc', 'nvh264enc'):
+        # H.264 QP scale is 0–51.
+        _set_if_present(encoder, 'qp-min', 0)
+        _set_if_present(encoder, 'qp-max', 51)
+    elif name in ('vp8enc', 'vp9enc'):
+        # libvpx uses 0–63 internally; gstreamer exposes that range.
+        _set_if_present(encoder, 'min-quantizer', 0)
+        _set_if_present(encoder, 'max-quantizer', 63)
+    elif name in ('av1enc', 'rav1enc', 'svtav1enc', 'aomenc'):
+        # AV1 QP scale per the spec is 0–255; encoder bindings vary, so we
+        # just probe both common spellings.
+        _set_if_present(encoder, 'min-quantizer', 0)
+        _set_if_present(encoder, 'max-quantizer', 255)
+        _set_if_present(encoder, 'min-qp', 0)
+        _set_if_present(encoder, 'max-qp', 255)
+    print(f'[service] encoder-setup: tuned {name} for lossless QP floor',
+          flush=True)
+    # Returning False tells webrtcsink we did not replace the encoder, only
+    # adjusted its properties — webrtcsink keeps managing rate control.
+    return False
 
 
 def build_archive_encoder():
@@ -375,11 +434,23 @@ def main():
         vc.set_property('bottom', s['cropBottom'])
 
     # ── Configure browser webrtcsink instances
+    #
+    # The min/start/max bitrate triple expands the window REMB is allowed to
+    # drive the per-peer encoder between.  webrtcsink defaults cap the ceiling
+    # near 8 Mbps which is well below visually-lossless 1080p30 territory; we
+    # raise it so the encoder can actually reach the lossless / visually-
+    # lossless tiers when the network has the headroom.  The encoder will not
+    # *spend* the ceiling on static content — it'll just sit at low QP and low
+    # bitrate, and burst into the headroom when motion appears.
     sinks = [(ws_full, full_sig_port)]
     sinks.extend((wsk, s['signallingPort']) for s, _q, _vc, wsk in screen_branches)
     for sink, port in sinks:
         sink.get_property('signaller').set_property('uri', f'ws://127.0.0.1:{port}')
         sink.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
+        sink.set_property('min-bitrate',   WEBRTC_MIN_BITRATE)
+        sink.set_property('start-bitrate', WEBRTC_START_BITRATE)
+        sink.set_property('max-bitrate',   WEBRTC_MAX_BITRATE)
+        sink.connect('encoder-setup', _on_encoder_setup)
         if STUN:
             sink.set_property('stun-server', STUN)
 
