@@ -30,7 +30,12 @@ from dataclasses import dataclass
 from archive_times import parse_segment_times
 
 _DEFAULT_FPS = '25/1'
-_ARCHIVE_BITRATE = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
+
+# /video output uses CRF/CQP (quality-targeted) so the assembled MP4 preserves
+# the archive's quality on download.  The default tracks ARCHIVE_QP so the two
+# stay in sync without a second knob to tune; can be overridden with VIDEO_QP.
+# Lower is better; 18 is the conventional visually-lossless threshold for H.264.
+_VIDEO_QP = int(os.environ.get('VIDEO_QP', os.environ.get('ARCHIVE_QP', '18')))
 
 
 @functools.lru_cache(maxsize=None)
@@ -49,21 +54,28 @@ def _nvenc_works():
 
 
 def _detect_encoder_args():
-    """Return ffmpeg output-encoder args for the best available video encoder."""
-    bitrate = str(_ARCHIVE_BITRATE)
+    """Return ffmpeg output-encoder args for the best available video encoder.
+
+    Uses quality-targeted (CRF / NVENC constqp) modes so the assembled
+    /video output preserves whatever quality the archive segments carry
+    rather than capping at the legacy 6 Mbps VBR.
+    """
+    qp = str(_VIDEO_QP)
     try:
         result = subprocess.run(
             ['ffmpeg', '-hide_banner', '-encoders'],
             capture_output=True, text=True, timeout=10,
         )
     except FileNotFoundError:
-        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+        return ['-c:v', 'libx264', '-preset', 'medium',
+                '-crf', qp, '-pix_fmt', 'yuv420p']
     encoders = result.stdout
     if 'h264_nvenc' in encoders and _nvenc_works():
-        return ['-c:v', 'h264_nvenc', '-preset', 'p4',
-                '-rc', 'vbr', '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k']
+        return ['-c:v', 'h264_nvenc', '-preset', 'p5',
+                '-rc', 'constqp', '-qp', qp]
     if 'libx264' in encoders:
-        return ['-c:v', 'libx264', '-preset', 'ultrafast']
+        return ['-c:v', 'libx264', '-preset', 'medium',
+                '-crf', qp, '-pix_fmt', 'yuv420p']
     if 'mpeg4' in encoders:
         return ['-c:v', 'mpeg4', '-q:v', '5']
     return ['-c:v', 'ffv1']

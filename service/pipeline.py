@@ -40,7 +40,38 @@ Environment variables:
                          segment; each segment is remuxed to MP4
                          and moved to ARCHIVE_DIR when it rotates
   ARCHIVE_SEGMENT_SEC    segment duration in seconds              (600)
-  ARCHIVE_BITRATE        archive H.264 bitrate in kbps            (6000)
+  ARCHIVE_QUALITY        quality mode for the archive H.264 encoder.
+                         One of:                                  (visually-lossless)
+                           'visually-lossless'  CRF/CQP at ARCHIVE_QP — looks
+                                                indistinguishable from source
+                                                on screen content; ~2-4× the
+                                                file size of the legacy mode.
+                           'lossless'           true lossless (QP=0).  Files
+                                                can be very large during heavy
+                                                motion (50-200 Mbps); set
+                                                ARCHIVE_MAX_BYTES.
+                           'legacy'             the pre-tuning behaviour:
+                                                fixed-bitrate VBR at
+                                                ARCHIVE_BITRATE kbps with
+                                                latency-tuned presets.
+  ARCHIVE_QP             integer 0-51, QP for 'visually-lossless' mode.  Lower
+                         is better; QP 18 is the conventional visually-
+                         lossless threshold for H.264.  Ignored in 'lossless'
+                         and 'legacy' modes.                              (18)
+  ARCHIVE_BITRATE_CAP    kbps ceiling on instantaneous bitrate in CQP modes
+                         so a chaotic frame can't blow up segment size.
+                         100000 = 100 Mbps.                          (100000)
+  ARCHIVE_BITRATE        archive H.264 bitrate in kbps; used only by
+                         ARCHIVE_QUALITY=legacy.                       (6000)
+  ARCHIVE_QUEUE_MAX_BYTES bytes of raw video the q_arch queue may buffer
+                         before dropping oldest frames.  At 1080p30 YUV420
+                         (~93 MB/s) the default absorbs ~5.5s of encoder
+                         lag.  Set to 0 to disable the byte gate (combine
+                         with ARCHIVE_QUEUE_MAX_SEC=0 for the legacy
+                         unbounded behaviour).             (536870912 = 512 MB)
+  ARCHIVE_QUEUE_MAX_SEC  seconds of running-time the q_arch queue may
+                         buffer before dropping oldest frames.  Set to 0
+                         to disable the time gate.                       (5)
   ARCHIVE_MAX_BYTES      delete oldest segments when total archive size
                          exceeds this many bytes; 0 = unlimited          (0)
   ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
@@ -62,6 +93,7 @@ import threading
 import time
 
 import gi
+from archive_encoder import archive_encoder_plan
 from archive_purge import purge_archive
 from archive_times import renamed_segment_path
 from desktop_config import load_config
@@ -77,12 +109,17 @@ HOST_MODE             = not bool(CASTER_HOST)
 DISPLAY               = os.environ.get('DISPLAY', ':0')
 FRAMERATE             = os.environ.get('STREAM_FRAMERATE', '30')
 
-ARCHIVE_DIR           = os.environ.get('ARCHIVE_DIR', '/archive')
-ARCHIVE_LIVE_DIR      = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
-ARCHIVE_SEGMENT_SEC   = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
-ARCHIVE_BITRATE       = int(os.environ.get('ARCHIVE_BITRATE', '6000'))
-ARCHIVE_MAX_BYTES     = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
-ARCHIVE_MAX_AGE_DAYS  = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
+ARCHIVE_DIR             = os.environ.get('ARCHIVE_DIR', '/archive')
+ARCHIVE_LIVE_DIR        = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
+ARCHIVE_SEGMENT_SEC     = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
+ARCHIVE_QUALITY         = os.environ.get('ARCHIVE_QUALITY', 'visually-lossless').strip().lower()
+ARCHIVE_QP              = int(os.environ.get('ARCHIVE_QP', '18'))
+ARCHIVE_BITRATE_CAP     = int(os.environ.get('ARCHIVE_BITRATE_CAP', '100000'))   # kbps
+ARCHIVE_BITRATE         = int(os.environ.get('ARCHIVE_BITRATE', '6000'))         # kbps, legacy mode
+ARCHIVE_QUEUE_MAX_BYTES = int(os.environ.get('ARCHIVE_QUEUE_MAX_BYTES', str(512 * 1024 * 1024)))
+ARCHIVE_QUEUE_MAX_SEC   = int(os.environ.get('ARCHIVE_QUEUE_MAX_SEC',   '5'))
+ARCHIVE_MAX_BYTES       = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
+ARCHIVE_MAX_AGE_DAYS    = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 
 STUN                  = os.environ.get('GST_WEBRTC_STUN_SERVER', '')
 TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
@@ -149,26 +186,64 @@ def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
     return False
 
 
+# Debounce state for the q_arch overrun warning — fires at most once per 30s
+# of overrun activity so a sustained encoder lag doesn't flood the log.
+_Q_ARCH_OVERRUN_LOG_INTERVAL_SEC = 30
+_q_arch_overrun_state = {'last_warn_ts': 0.0}
+
+
+def _on_q_arch_overrun(_queue):
+    """Log a debounced warning when q_arch evicts a frame.
+
+    The queue runs with leaky=downstream, so when it fills the oldest
+    buffer is dropped and the tee push returns immediately — the WebRTC
+    branch stays smooth.  We deliberately don't block: a `tee` element's
+    chain function is synchronous, so blocking on q_arch would also
+    block the push to q_webrtc and stall the live viewer.
+
+    The cost is that a sustained archive encoder lag produces visible
+    jumps in the recording.  This handler surfaces that to the operator
+    so they can act (lower ARCHIVE_QP, switch ARCHIVE_QUALITY=legacy,
+    raise ARCHIVE_QUEUE_MAX_BYTES, or add hardware encoding).
+    """
+    now = time.monotonic()
+    if now - _q_arch_overrun_state['last_warn_ts'] < _Q_ARCH_OVERRUN_LOG_INTERVAL_SEC:
+        return
+    _q_arch_overrun_state['last_warn_ts'] = now
+    print('[service] WARNING: q_arch overflowed — archive encoder is falling '
+          'behind; dropping oldest queued frames to keep WebRTC smooth. '
+          'Consider lowering ARCHIVE_QP, switching ARCHIVE_QUALITY=legacy, '
+          'raising ARCHIVE_QUEUE_MAX_BYTES, or adding hardware encoding.',
+          file=sys.stderr, flush=True)
+
+
 def build_archive_encoder():
-    """Return (factory_name, element) for the archive H.264 encoder."""
-    if Gst.ElementFactory.find('nvh264enc'):
-        print('[service] NVIDIA NVENC detected: using nvh264enc for archive',
-              flush=True)
-        enc = Gst.ElementFactory.make('nvh264enc', 'arch_enc')
-        enc.set_property('preset', 'low-latency-hq')
-        enc.set_property('rc-mode', 'vbr-hq')
-        enc.set_property('bitrate', ARCHIVE_BITRATE)
-        enc.set_property('max-bitrate', ARCHIVE_BITRATE)
-        enc.set_property('gop-size', 30)
+    """Pick the first available encoder factory and apply its properties."""
+    plan = archive_encoder_plan(
+        quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP,
+        bitrate_cap=ARCHIVE_BITRATE_CAP, bitrate_legacy=ARCHIVE_BITRATE,
+    )
+    for factory_name, props in plan:
+        if not Gst.ElementFactory.find(factory_name):
+            continue
+        enc = Gst.ElementFactory.make(factory_name, 'arch_enc')
+        for prop_name, value in props.items():
+            _set_if_present(enc, prop_name, value)
+        if ARCHIVE_QUALITY == 'legacy':
+            print(f'[service] archive encoder: {factory_name} '
+                  f'mode=legacy bitrate={ARCHIVE_BITRATE}kbps', flush=True)
+        elif ARCHIVE_QUALITY == 'lossless':
+            print(f'[service] archive encoder: {factory_name} '
+                  f'mode=lossless (QP=0, max={ARCHIVE_BITRATE_CAP}kbps)',
+                  flush=True)
+        else:
+            print(f'[service] archive encoder: {factory_name} '
+                  f'mode=visually-lossless (QP={ARCHIVE_QP}, '
+                  f'max={ARCHIVE_BITRATE_CAP}kbps)', flush=True)
         return enc
-    print('[service] NVIDIA NVENC not detected: using x264enc for archive',
-          flush=True)
-    enc = Gst.ElementFactory.make('x264enc', 'arch_enc')
-    enc.set_property('tune', 0x4)        # zerolatency
-    enc.set_property('speed-preset', 1)  # ultrafast
-    enc.set_property('bitrate', ARCHIVE_BITRATE)
-    enc.set_property('key-int-max', 30)
-    return enc
+    print('[service] ERROR: no archive encoder available '
+          '(need nvh264enc or x264enc)', file=sys.stderr)
+    sys.exit(1)
 
 
 def main():
@@ -206,7 +281,12 @@ def main():
         print(f'  Resolution        : {width}x{height}')
     print(f'  Live segments     : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Completed archive : {ARCHIVE_DIR}')
-    print(f'  Archive bitrate   : {ARCHIVE_BITRATE} kbps')
+    print(f'  Archive quality   : {ARCHIVE_QUALITY}'
+          + (f' (QP={ARCHIVE_QP})' if ARCHIVE_QUALITY == 'visually-lossless'
+             else f' (legacy bitrate={ARCHIVE_BITRATE}kbps)' if ARCHIVE_QUALITY == 'legacy'
+             else ''))
+    print(f'  Archive q cap     : {ARCHIVE_QUEUE_MAX_BYTES} bytes / '
+          f'{ARCHIVE_QUEUE_MAX_SEC}s (leaky=downstream)')
     print(f'  Signalling /      : ws://127.0.0.1:{full_sig_port}')
     for s in screens:
         print(f'  Signalling {s["path"]:<7s}: ws://127.0.0.1:{s["signallingPort"]}'
@@ -234,6 +314,15 @@ def main():
 
     # ── Archive branch
     q_arch    = make('queue',        'q_arch')
+    # Bound q_arch and leak the oldest buffer when full.  See the comment on
+    # _on_q_arch_overrun below for the rationale; in short, leaky=downstream
+    # keeps the WebRTC branch isolated from a slow archive encoder at the
+    # cost of dropping archive frames during sustained lag.
+    q_arch.set_property('max-size-buffers', 0)        # gate via bytes/time only
+    q_arch.set_property('max-size-bytes',   ARCHIVE_QUEUE_MAX_BYTES)
+    q_arch.set_property('max-size-time',    ARCHIVE_QUEUE_MAX_SEC * Gst.SECOND)
+    q_arch.set_property('leaky', 2)                   # 2 = downstream, drop oldest
+    q_arch.connect('overrun', _on_q_arch_overrun)
     arch_enc  = build_archive_encoder()
     pipeline.add(arch_enc)
     arch_h264 = make('h264parse',    'arch_h264')

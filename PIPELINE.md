@@ -256,39 +256,108 @@ and decoding work is done exactly once for both consumers.
 
 #### `queue` (name: `q_arch`)
 
-Decouples the `tee` from the encoder. Without a queue here, back-pressure from
-a slow encoder (particularly `x264enc` on a loaded CPU) would stall the `tee`
-and starve the browser WebRTC branch. The queue absorbs bursts and lets each
-branch run at its own pace.
+Decouples the `tee` from the encoder.  Configured with explicit bounds and
+`leaky=downstream` so the WebRTC branch is isolated from a slow archive
+encoder:
+
+| Property | Value | Purpose |
+|---|---|---|
+| `max-size-buffers` | `0` | Use byte/time gating only |
+| `max-size-bytes`   | `ARCHIVE_QUEUE_MAX_BYTES` (default 512 MB) | Bound memory; raw 1080p30 is ~93 MB/s so 512 MB ≈ 5.5 s of headroom |
+| `max-size-time`    | `ARCHIVE_QUEUE_MAX_SEC × Gst.SECOND` (default 5 s) | Bound time-domain buffering |
+| `leaky`            | `2` (downstream) | When full, drop the oldest buffer instead of blocking |
+
+**Why `leaky=downstream` rather than `leaky=0` (block):** a `tee` element's
+chain function is synchronous — it pushes each buffer to *all* src pads
+before returning.  With `leaky=0`, when `q_arch` filled, the tee push to it
+would block, the tee never gets to its push to `q_webrtc`, and after
+`q_webrtc` drains downstream the live viewer freezes.  `leaky=downstream`
+makes `q_arch.sink.push` return immediately by evicting the oldest buffer,
+so the tee continues to `q_webrtc` without delay.  The cost is that a
+sustained archive encoder lag produces visible jumps in the recording; an
+`overrun` signal handler in `pipeline.py` logs a debounced warning when this
+happens (at most one message per 30 s) so the operator can act.
+
+Setting `ARCHIVE_QUEUE_MAX_BYTES=0` and `ARCHIVE_QUEUE_MAX_SEC=0` reverts to
+the legacy unbounded behaviour: zero archive frame loss, but the queue can
+grow without limit if the encoder cannot keep up.
 
 #### `nvh264enc` or `x264enc` (name: `arch_enc`)
 
-Re-encodes the raw decoded video to H.264 for the archive. The encoder is
-selected at runtime (`build_archive_encoder()`):
+Re-encodes the raw decoded video to H.264 for the archive.  The encoder is
+selected at runtime (`build_archive_encoder()`) based on `ARCHIVE_QUALITY`,
+which has three modes:
 
-**NVIDIA GPU present — `nvh264enc`:**
+**`ARCHIVE_QUALITY=visually-lossless`** *(default)* — constant-quantizer
+encoding at `ARCHIVE_QP` (default 18).  Indistinguishable from the source
+on screen content; ~2-4× the file size of `legacy` mode.
 
-| Property | Value | Purpose |
+| Encoder | Property | Value | Purpose |
+|---|---|---|---|
+| `nvh264enc` | `rc-mode` | `constqp` | Quality-targeted (not bitrate-targeted) |
+| `nvh264enc` | `qp-const{,-i,-p,-b}` | `ARCHIVE_QP` | All QP knobs at the configured value (build-version compat) |
+| `nvh264enc` | `preset` | `low-latency-hq` | Same as legacy mode — see note below |
+| `nvh264enc` | `gop-size` | `30` | Same as legacy mode |
+| `nvh264enc` | `max-bitrate` | `ARCHIVE_BITRATE_CAP` kbps (default 100 000) | Ceiling so a chaotic frame can't blow up segment size |
+| `x264enc`   | `pass` | `4` (quant) | Constant quantizer at `ARCHIVE_QP` |
+| `x264enc`   | `quantizer` | `ARCHIVE_QP` | Constant QP value |
+| `x264enc`   | `tune` | `0x4` (zerolatency) | Same as legacy mode — see note below |
+| `x264enc`   | `speed-preset` | `1` (ultrafast) | Same as legacy mode |
+| `x264enc`   | `key-int-max` | `30` | Same as legacy mode |
+
+**`ARCHIVE_QUALITY=lossless`** — true lossless (QP=0).  Files can be very
+large (50–200 Mbps during heavy motion); set `ARCHIVE_MAX_BYTES`.
+
+| Encoder | Property | Value |
 |---|---|---|
-| `preset` | `low-latency-hq` | Balance encode speed with quality |
-| `rc-mode` | `vbr-hq` | Variable bitrate, high quality |
-| `bitrate` | `6000` kbps | Target archive bitrate |
-| `max-bitrate` | `6000` kbps | Cap to prevent segment size spikes |
-| `gop-size` | `30` | Keyframe every 30 frames (1 s at 30 fps) |
+| `nvh264enc` | `rc-mode` | `constqp` |
+| `nvh264enc` | `qp-const{,-i,-p,-b}` | `0` |
+| `nvh264enc` | `preset` | `low-latency-hq` |
+| `nvh264enc` | `gop-size` | `30` |
+| `x264enc`   | `pass` | `4` (quant — true CQP) |
+| `x264enc`   | `quantizer` | `0` |
+| `x264enc`   | `qp-min` / `qp-max` | `0` / `0` |
+| `x264enc`   | `tune` | `0x4` (zerolatency) |
+| `x264enc`   | `speed-preset` | `1` (ultrafast) |
+| `x264enc`   | `key-int-max` | `30` |
 
-**No GPU — `x264enc`:**
+**Why the new modes keep `tune=zerolatency`, `speed-preset=ultrafast`, and
+`preset=low-latency-hq`:** an earlier draft dropped these settings on the
+grounds that the archive isn't latency-sensitive, and pushed `x264enc` to
+`speed-preset=faster` / `pass=qual` (CRF) and `nvh264enc` to
+`preset=high-quality`.  CI surfaced a hang — the archive encoder never
+produced its first buffer, so the pipeline got stuck in PAUSED and
+`splitmuxsink` never opened a segment.  Reverting the latency tunings to
+exactly match `legacy` mode keeps the encoder on the same negotiation
+path, and switching only `rc-mode` / `pass` / `quantizer` is enough to
+move from bitrate-targeted to quality-targeted output.  We can revisit
+the slower presets in a follow-up once the interaction is understood.
 
-| Property | Value | Purpose |
+**`ARCHIVE_QUALITY=legacy`** — byte-for-byte compatible with the
+configuration shipped before the archive quality work.  `ARCHIVE_BITRATE`
+(default 6000 kbps) is consulted only in this mode.
+
+| Encoder | Property | Value |
 |---|---|---|
-| `tune` | `0x4` (zerolatency) | Minimise encode latency |
-| `speed-preset` | `1` (ultrafast) | Use fewest CPU cycles per frame |
-| `bitrate` | `6000` kbps | Target archive bitrate |
-| `key-int-max` | `30` | Keyframe every 30 frames |
+| `nvh264enc` | `preset` | `low-latency-hq` |
+| `nvh264enc` | `rc-mode` | `vbr-hq` |
+| `nvh264enc` | `bitrate` / `max-bitrate` | `ARCHIVE_BITRATE` kbps |
+| `nvh264enc` | `gop-size` | `30` |
+| `x264enc`   | `tune` | `0x4` (zerolatency) |
+| `x264enc`   | `speed-preset` | `1` (ultrafast) |
+| `x264enc`   | `bitrate` | `ARCHIVE_BITRATE` kbps |
+| `x264enc`   | `key-int-max` | `30` |
 
 The archive encoder runs independently of the browser-facing `webrtcsink`
-instances, so its bitrate is fixed rather than adaptive. This ensures the
-archived recording is always at full quality even if a browser viewer has poor
-bandwidth.
+instances and the network — its quality is fixed at the configured QP rather
+than reactive to viewer bandwidth.  This means the archived recording always
+carries the configured quality, even when individual viewers are throttled.
+
+The `visually-lossless` and `lossless` modes deliberately drop the
+`tune=zerolatency` / `preset=low-latency-hq` settings: viewers see the
+screen via the WebRTC branch, so the archive encoder has no latency
+requirement and is free to use larger lookahead and B-frames for better
+compression.
 
 #### `h264parse` (name: `arch_h264`)
 
@@ -666,9 +735,15 @@ window.  Requests longer than 12 hours are rejected with 400.
 | `ARCHIVE_DIR` | `/archive` | Directory for completed (timestamp-named) faststart `.mp4` segments |
 | `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress `.mkv` segment is written into; each segment is remuxed to `.mp4` (`-c copy -movflags +faststart`) and moved into `ARCHIVE_DIR` when it rotates |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
-| `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps |
+| `ARCHIVE_QUALITY` | `visually-lossless` | Encoder quality mode: `visually-lossless` (CRF/CQP at `ARCHIVE_QP`), `lossless` (true QP=0), or `legacy` (fixed-bitrate VBR using `ARCHIVE_BITRATE`) |
+| `ARCHIVE_QP` | `18` | QP for `visually-lossless` mode (0–51, lower is better; 18 is the conventional visually-lossless threshold for H.264).  Ignored in other modes |
+| `ARCHIVE_BITRATE_CAP` | `100000` | kbps ceiling on instantaneous bitrate in CQP modes — caps a chaotic frame from blowing up segment size |
+| `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps; consulted only when `ARCHIVE_QUALITY=legacy` |
+| `ARCHIVE_QUEUE_MAX_BYTES` | `536870912` (512 MB) | Bytes of raw video the `q_arch` queue may buffer before dropping the oldest frame.  Set to `0` to disable the byte gate |
+| `ARCHIVE_QUEUE_MAX_SEC` | `5` | Seconds of running-time the `q_arch` queue may buffer before dropping the oldest frame.  Set to `0` to disable the time gate |
 | `ARCHIVE_MAX_BYTES` | `0` | Delete oldest segments when archive exceeds this size; `0` = unlimited |
 | `ARCHIVE_MAX_AGE_DAYS` | `0` | Delete segments older than this many days; `0` = unlimited |
+| `VIDEO_QP` | `ARCHIVE_QP` (`18`) | CRF (libx264) / QP (h264_nvenc) used by `/video` to assemble its output.  Defaults to `ARCHIVE_QP` so /video preserves whatever quality the archive carries |
 | `SIGNALLING_PORT` | `8443` | Base port for browser-facing signalling servers; screen `i` uses `SIGNALLING_PORT + 1 + i` |
 | `CROP_HEIGHT` | _(unset)_ | Legacy split point; only consulted when `DESKTOP_SPLITS` is unset and (host mode) xrandr returns fewer than 2 monitors |
 | `WEB_PORT` | `8080` | HTTP server listening port |
