@@ -169,6 +169,51 @@ def test_legacy_bitrate_override_propagates():
     assert _props(plan, 'nvh264enc')['max-bitrate'] == 12000
 
 
+# ── gop_size override propagates everywhere a keyframe interval is set ──────
+
+@pytest.mark.parametrize('quality', VALID_ARCHIVE_QUALITIES)
+def test_gop_size_default_is_30(quality):
+    """Default gop_size keeps pre-tuning behaviour byte-for-byte."""
+    plan = archive_encoder_plan(quality=quality)
+    assert _props(plan, 'x264enc')['key-int-max']  == 30
+    assert _props(plan, 'nvh264enc')['gop-size']    == 30
+
+
+@pytest.mark.parametrize('quality', VALID_ARCHIVE_QUALITIES)
+def test_gop_size_override_propagates_to_both_encoders(quality):
+    """ARCHIVE_GOP_SIZE flows through to both encoders' keyframe-interval knobs.
+
+    nvh264enc spells it `gop-size`; x264enc spells it `key-int-max`; the plan
+    sets both off the same gop_size argument so the operator only has to
+    think about one number regardless of which encoder ends up running.
+    """
+    plan = archive_encoder_plan(quality=quality, gop_size=120)
+    assert _props(plan, 'x264enc')['key-int-max']  == 120
+    assert _props(plan, 'nvh264enc')['gop-size']    == 120
+
+
+def test_gop_size_does_not_disturb_other_props():
+    """Overriding gop_size leaves rate-control, QP and bitrate alone."""
+    base   = archive_encoder_plan(quality='visually-lossless', qp=18,
+                                  bitrate_cap=100000)
+    tuned  = archive_encoder_plan(quality='visually-lossless', qp=18,
+                                  bitrate_cap=100000, gop_size=15)
+
+    base_x264   = _props(base,  'x264enc').copy()
+    tuned_x264  = _props(tuned, 'x264enc').copy()
+    base_nv     = _props(base,  'nvh264enc').copy()
+    tuned_nv    = _props(tuned, 'nvh264enc').copy()
+
+    # Pop the keyframe-interval knobs so the rest of the dicts must match.
+    assert tuned_x264.pop('key-int-max') == 15
+    assert base_x264.pop('key-int-max')  == 30
+    assert tuned_nv.pop('gop-size')      == 15
+    assert base_nv.pop('gop-size')       == 30
+
+    assert tuned_x264 == base_x264
+    assert tuned_nv   == base_nv
+
+
 # ── Rate-control switch is the only intentional change vs legacy ────────────
 
 @pytest.mark.parametrize('quality', ['visually-lossless', 'lossless'])
