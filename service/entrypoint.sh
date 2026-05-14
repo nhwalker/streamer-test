@@ -5,11 +5,7 @@
 #   1. desktop_config.py                (writes /run/desktop-stream/config.json)
 #   2. gst-webrtc-signalling-server xN  (one per configured screen + full-frame)
 #   3. web_server.py                    (background, :WEB_PORT, serves /var/www/html)
-#   4. pipeline.py                      (background, host or caster mode, serves browsers)
-#
-# Mode is selected by CASTER_HOST:
-#   CASTER_HOST set   -> caster mode: ingest stream from a remote caster via webrtcsrc
-#   CASTER_HOST empty -> host mode:   capture X11 directly via ximagesrc
+#   4. pipeline.py                      (background, captures X11 via ximagesrc)
 set -euo pipefail
 
 mkdir -p "${ARCHIVE_DIR}" "${ARCHIVE_LIVE_DIR}"
@@ -23,20 +19,16 @@ else
     echo "[service] No NVIDIA GPU detected (software decode + encode will be used)."
 fi
 
-# ── Mode selection ────────────────────────────────────────────────────────────
-if [ -z "${CASTER_HOST:-}" ]; then
-    echo "[service] Mode: host (X11 direct capture on ${DISPLAY})"
-    if ! gst-launch-1.0 ximagesrc num-buffers=1 ! fakesink sync=false 2>/dev/null; then
-        echo "[service] ERROR: Cannot access X display '${DISPLAY}'."
-        echo "  * On the host run:  xhost +local:docker"
-        echo "  * Run container with: -e DISPLAY=\$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro"
-        echo "  * If using Xauthority: -v \"\$HOME/.Xauthority:/root/.Xauthority:ro\" -e XAUTHORITY=/root/.Xauthority"
-        exit 1
-    fi
-    echo "[service] X11 display OK."
-else
-    echo "[service] Mode: caster (ingest from ${CASTER_HOST}:${CASTER_SIGNALLING_PORT})"
+# ── X11 pre-flight ────────────────────────────────────────────────────────────
+echo "[service] X11 direct capture on ${DISPLAY}"
+if ! gst-launch-1.0 ximagesrc num-buffers=1 ! fakesink sync=false 2>/dev/null; then
+    echo "[service] ERROR: Cannot access X display '${DISPLAY}'."
+    echo "  * On the host run:  xhost +local:docker"
+    echo "  * Run container with: -e DISPLAY=\$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro"
+    echo "  * If using Xauthority: -v \"\$HOME/.Xauthority:/root/.Xauthority:ro\" -e XAUTHORITY=/root/.Xauthority"
+    exit 1
 fi
+echo "[service] X11 display OK."
 
 # ── Compute and persist the runtime config (desktop name, resolution, splits) ─
 # pipeline.py and web_server.py both read /run/desktop-stream/config.json so
@@ -109,11 +101,7 @@ for s in cfg["screens"]:
           f"  (ws :{s['signallingPort']})")
 print(f"│  Signalling / : ws://{host_ip}:{cfg['fullSignallingPort']}")
 PYEOF
-if [ -z "${CASTER_HOST:-}" ]; then
-echo "│  Ingest    : X11 display ${DISPLAY} (host mode)       "
-else
-echo "│  Ingest    : ws://${CASTER_HOST}:${CASTER_SIGNALLING_PORT} (caster)  "
-fi
+echo "│  Ingest    : X11 display ${DISPLAY}                  "
 echo "│  Archive   : ${ARCHIVE_DIR} (live: ${ARCHIVE_LIVE_DIR})"
 echo "└─────────────────────────────────────────────────────┘"
 echo ""

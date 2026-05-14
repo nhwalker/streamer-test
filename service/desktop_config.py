@@ -15,27 +15,18 @@ Inputs (environment variables, evaluated once at container start):
   DESKTOP_NAME      Page-header label and archive filename prefix.
                     Default: 'desktop'.
 
-  CASTER_HOST       Empty selects host mode (X RandR auto-detection via
-                    python-xlib).  Non-empty selects caster mode.
+  DISPLAY           X11 display.
 
-  DISPLAY           X11 display, used in host mode only.
+  STREAM_WIDTH      Capture width.  Empty = native screen width via xrandr.
+  STREAM_HEIGHT     Capture height. Empty = native screen height via xrandr.
 
-  STREAM_WIDTH      Capture width.  Host mode: empty = native screen width.
-  STREAM_HEIGHT     Capture height. Host mode: empty = native screen height.
-                    Caster mode: empty falls back to 1920x1080.
+  STREAM_FRAMERATE  Target frames-per-second.  Drives the videorate caps
+                    filter and surfaced in /config.json so the browser
+                    gumball can gate its top quality tiers on the delivered
+                    fps matching the target.  Default: 30.
 
-  STREAM_FRAMERATE  Target frames-per-second.  Used by host mode to drive the
-                    videorate caps filter and surfaced in /config.json so the
-                    browser gumball can gate its top quality tiers on the
-                    delivered fps matching the target.  Default: 30.
-
-  DESKTOP_SPLITS    Semicolon-separated 'WxH+X+Y' regions.  Empty in host
-                    mode triggers RandR auto-detection; empty in caster
-                    mode falls back to a CROP_HEIGHT-based top/bottom
-                    split for backward compatibility.
-
-  CROP_HEIGHT       Caster-mode legacy split point.  Also used in host
-                    mode when RandR returns fewer than 2 monitors.
+  DESKTOP_SPLITS    Semicolon-separated 'WxH+X+Y' regions.  Empty triggers
+                    RandR auto-detection of the connected monitors.
 
   SIGNALLING_PORT   Base port for browser-facing signalling servers.
                     Screen i uses SIGNALLING_PORT + 1 + i.
@@ -182,12 +173,7 @@ def _name_regions(regions):
 
 
 def _crops_from_region(region, frame_w, frame_h):
-    """Compute videocrop edge trims that select *region* out of frame_w x frame_h.
-
-    Used when the source's actual dimensions are known to match frame_w x frame_h
-    (host mode where videoscale enforces the configured size, or caster mode
-    where the user supplied DESKTOP_SPLITS together with explicit dimensions).
-    """
+    """Compute videocrop edge trims that select *region* out of frame_w x frame_h."""
     return {
         'left':   max(0, region['x']),
         'top':    max(0, region['y']),
@@ -196,40 +182,7 @@ def _crops_from_region(region, frame_w, frame_h):
     }
 
 
-def _legacy_crop_split(env, frame_w, frame_h):
-    """Source-size-agnostic CROP_HEIGHT vertical split (legacy behaviour).
-
-    Returns a list of {'region': ..., 'crop': ...} dicts, or None when
-    CROP_HEIGHT is unset or unusable.  The crop trims use CROP_HEIGHT
-    directly so they remain correct even when the actual source height
-    does not match the configured one (which happens in caster mode when
-    the user does not set STREAM_HEIGHT explicitly).
-    """
-    crop_raw = env.get('CROP_HEIGHT')
-    if not crop_raw:
-        return None
-    try:
-        crop = int(crop_raw)
-    except ValueError:
-        return None
-    if crop <= 0 or crop >= frame_h:
-        return None
-    return [
-        {
-            'region': {'x': 0, 'y': 0, 'width': frame_w, 'height': crop},
-            # 'bottom = crop' = trim that many pixels from the bottom of the
-            # source, keeping the top portion.  Source-size-agnostic.
-            'crop':   {'left': 0, 'top': 0, 'right': 0, 'bottom': crop},
-        },
-        {
-            'region': {'x': 0, 'y': crop,
-                       'width': frame_w, 'height': frame_h - crop},
-            'crop':   {'left': 0, 'top': crop, 'right': 0, 'bottom': 0},
-        },
-    ]
-
-
-def _splits_from_env(env, host_mode, frame_w, frame_h, display):
+def _splits_from_env(env, frame_w, frame_h, display):
     """Return list of {'region': ..., 'crop': ...} dicts for the configured splits."""
     raw = (env.get('DESKTOP_SPLITS') or '').strip()
     if raw:
@@ -237,30 +190,13 @@ def _splits_from_env(env, host_mode, frame_w, frame_h, display):
         return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
                 for r in regions]
 
-    if host_mode:
-        regions = _query_x_monitors(display)
-        if len(regions) >= 2:
-            return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
-                    for r in regions]
-        # 0-1 monitors from RandR — fall back to legacy CROP_HEIGHT if set,
-        # otherwise use the single monitor (or whole frame).
-        legacy = _legacy_crop_split(env, frame_w, frame_h)
-        if legacy is not None:
-            return legacy
-        if regions:
-            return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
-                    for r in regions]
-        print('[desktop_config] WARNING: no monitor geometry available and '
-              'CROP_HEIGHT is unset; falling back to a single full-frame '
-              'screen.', file=sys.stderr)
-        full = {'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}
-        return [{'region': full, 'crop': {'left': 0, 'top': 0, 'right': 0, 'bottom': 0}}]
+    regions = _query_x_monitors(display)
+    if regions:
+        return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
+                for r in regions]
 
-    # Caster mode: there is no X server to query.  Use CROP_HEIGHT if set,
-    # otherwise serve a single full-frame screen.
-    legacy = _legacy_crop_split(env, frame_w, frame_h)
-    if legacy is not None:
-        return legacy
+    print('[desktop_config] WARNING: no monitor geometry available; '
+          'falling back to a single full-frame screen.', file=sys.stderr)
     full = {'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}
     return [{'region': full, 'crop': {'left': 0, 'top': 0, 'right': 0, 'bottom': 0}}]
 
@@ -272,7 +208,6 @@ def compute_config(env=None):
     """
     env = env if env is not None else os.environ
 
-    host_mode = not bool(env.get('CASTER_HOST', '').strip())
     display   = env.get('DISPLAY', ':0')
 
     width_raw  = (env.get('STREAM_WIDTH')  or '').strip()
@@ -280,7 +215,7 @@ def compute_config(env=None):
 
     if width_raw and height_raw:
         width, height = int(width_raw), int(height_raw)
-    elif host_mode:
+    else:
         native = _query_x_screen(display)
         if native is None:
             print('[desktop_config] WARNING: X screen size unavailable; '
@@ -289,14 +224,11 @@ def compute_config(env=None):
         native_w, native_h = native
         width  = int(width_raw)  if width_raw  else native_w
         height = int(height_raw) if height_raw else native_h
-    else:
-        width  = int(width_raw)  if width_raw  else 1920
-        height = int(height_raw) if height_raw else 1080
 
     sig_port  = int(env.get('SIGNALLING_PORT', '8443'))
     framerate = int((env.get('STREAM_FRAMERATE') or '30').strip())
 
-    splits = _splits_from_env(env, host_mode, width, height, display)
+    splits = _splits_from_env(env, width, height, display)
     named = _name_regions([s['region'] for s in splits])
 
     # Pair each named region back with its crop info.  _name_regions may
@@ -322,7 +254,6 @@ def compute_config(env=None):
 
     return {
         'desktopName':         env.get('DESKTOP_NAME', 'desktop'),
-        'mode':                'host' if host_mode else 'caster',
         'width':               width,
         'height':              height,
         'framerate':           framerate,

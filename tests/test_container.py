@@ -1,6 +1,5 @@
 """
-Integration tests for the streamer-test two-container stack
-(desktop-caster + desktop-stream-service).
+Integration tests for the streamer-test desktop-stream-service container.
 
 Level 1 (TestServiceAvailability): verifies the service container's HTTP
   and WebSocket endpoints are reachable and return expected content. No
@@ -8,8 +7,8 @@ Level 1 (TestServiceAvailability): verifies the service container's HTTP
 
 Level 2 (TestWebRTCStream): drives a headless Chrome browser to load the
   service container's streaming page and confirms a WebRTC video stream
-  actually plays — exercises the full pipeline (caster → SRT → service →
-  WebRTC → browser).
+  actually plays — exercises the full pipeline (Xvfb → ximagesrc →
+  service → WebRTC → browser).
 """
 import asyncio
 import re
@@ -94,7 +93,6 @@ class TestServiceAvailability:
         assert r.status_code == 200
         cfg = r.json()
         assert cfg["desktopName"] == "stream"
-        assert cfg["mode"] == "caster"
         assert cfg["fullSignallingPort"] == 8443
         names = [s["name"] for s in cfg["screens"]]
         assert names == ["top", "bottom"], (
@@ -147,7 +145,7 @@ class TestServiceAvailability:
 class TestWebRTCStream:
     """Browser-driven test that verifies live video playback over WebRTC."""
 
-    def test_webrtc_video_plays(self, streaming_container, _caster, _service,
+    def test_webrtc_video_plays(self, streaming_container, _service,
                                 browser, turn_params):
         """
         Headless Chrome loads the streaming page and receives a WebRTC stream.
@@ -240,7 +238,6 @@ class TestWebRTCStream:
             except Exception:
                 console_logs = []
             service_out, service_err = _service.get_logs()
-            caster_out,  caster_err  = _caster.get_logs()
             console_text = "\n".join(
                 f"    [{e['level']}] {e['message']}" for e in console_logs
             ) or "    (no browser console output)"
@@ -249,8 +246,6 @@ class TestWebRTCStream:
                 f"  video state    : {video_state}\n"
                 f"  page status    : {status_text!r}\n"
                 f"  browser console:\n{console_text}\n"
-                f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
-                f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
                 f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
                 f"===== service stderr =====\n{service_err.decode(errors='replace')}"
             )
@@ -344,7 +339,7 @@ class TestWebRTCStream:
                 f"from the red Xvfb root. Last sample: {last_stats}"
             )
 
-    def test_metrics_displayed(self, streaming_container, _caster, _service, browser, turn_params):
+    def test_metrics_displayed(self, streaming_container, _service, browser, turn_params):
         """
         Verify the page header populates every stream metric and the health dot.
 
@@ -361,7 +356,7 @@ class TestWebRTCStream:
         try:
             _wait_for_metrics(browser)
         except TimeoutError as exc:
-            _dump_diagnostics(browser, _caster, _service, str(exc))
+            _dump_diagnostics(browser, _service, str(exc))
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -429,8 +424,8 @@ def _capture_frame(browser):
     return last
 
 
-def _dump_diagnostics(browser, caster, service, reason):
-    """Dump browser console + service/caster container logs and pytest.fail."""
+def _dump_diagnostics(browser, service, reason):
+    """Dump browser console + service container logs and pytest.fail."""
     try:
         console_logs = browser.get_log("browser")
     except Exception:
@@ -463,13 +458,10 @@ def _dump_diagnostics(browser, caster, service, reason):
     except Exception as exc:
         page_state = {'error': str(exc)}
     service_out, service_err = service.get_logs()
-    caster_out,  caster_err  = caster.get_logs()
     pytest.fail(
         f"Latency test failed: {reason}\n"
         f"  page state     : {page_state}\n"
         f"  browser console:\n{console_text}\n"
-        f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
-        f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
         f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
         f"===== service stderr =====\n{service_err.decode(errors='replace')}"
     )
@@ -552,7 +544,7 @@ class TestSplitStreamCrop:
     """
     Prove that /top and /bottom serve the correct halves of the source frame.
 
-    Uses the two-tone container chain: the caster captures an Xvfb whose top
+    Uses the two-tone container chain: the service captures an Xvfb whose top
     CROP_HEIGHT rows are red and bottom CROP_HEIGHT rows are blue.
 
     /top  must produce a red frame  (rows 0 – CROP_HEIGHT-1 of the source).
