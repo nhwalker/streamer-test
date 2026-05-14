@@ -129,11 +129,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: desktop-caster
-            context: ./caster
-            cache_scope: caster-buildcache
-            artifact: caster-image
-            tarball: /tmp/desktop-caster.tar
           - image: desktop-stream-service
             context: ./service
             cache_scope: service-buildcache
@@ -235,13 +230,6 @@ jobs:
       - name: Install Python test dependencies
         run: pip install -r tests/requirements.txt
 
-      - name: Download caster image
-        uses: actions/download-artifact@v4
-        with:
-          name: caster-image
-          path: /tmp/artifacts/caster
-          merge-multiple: false
-
       - name: Download service image
         uses: actions/download-artifact@v4
         with:
@@ -258,10 +246,6 @@ jobs:
 
       - name: Load images into Docker
         run: |
-          CASTER_LOADED=$(docker load -i /tmp/artifacts/caster/desktop-caster.tar \
-                          | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${CASTER_LOADED}"  desktop-caster:ci
-
           SERVICE_LOADED=$(docker load -i /tmp/artifacts/service/desktop-stream-service.tar \
                            | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${SERVICE_LOADED}" desktop-stream-service:ci
@@ -270,7 +254,7 @@ jobs:
                        | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${HUB_LOADED}" desktop-stream-hub:ci
 
-          docker images | grep -E '^(desktop-caster|desktop-stream-service|desktop-stream-hub)\s+ci\s'
+          docker images | grep -E '^(desktop-stream-service|desktop-stream-hub)\s+ci\s'
 
       - name: Start local TURN relay
         run: |
@@ -299,7 +283,6 @@ jobs:
       - name: Run integration tests
         env:
           # conftest.py reads these to pick which images to run against.
-          CASTER_IMAGE:  "desktop-caster:ci"
           SERVICE_IMAGE: "desktop-stream-service:ci"
           HUB_IMAGE:     "desktop-stream-hub:ci"
           # GStreamer side: service/pipeline.py passes this to webrtcbin.
@@ -342,29 +325,19 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Download caster image
-        uses: actions/download-artifact@v4
-        with:
-          name: caster-image
-          path: /tmp/artifacts/caster
-
       - name: Download service image
         uses: actions/download-artifact@v4
         with:
           name: service-image
           path: /tmp/artifacts/service
 
-      - name: Load images into Docker
+      - name: Load image into Docker
         run: |
-          CASTER_LOADED=$(docker load -i /tmp/artifacts/caster/desktop-caster.tar \
-                          | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${CASTER_LOADED}" desktop-caster:ci
-
           SERVICE_LOADED=$(docker load -i /tmp/artifacts/service/desktop-stream-service.tar \
                            | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${SERVICE_LOADED}" desktop-stream-service:ci
 
-          docker images | grep -E '^(desktop-caster|desktop-stream-service)\s+ci\s'
+          docker images | grep -E '^desktop-stream-service\s+ci\s'
 
       - name: Start local TURN relay
         run: |
@@ -391,7 +364,6 @@ jobs:
       - name: Run functional tests
         working-directory: functional-tests
         env:
-          CASTER_IMAGE:           "desktop-caster:ci"
           SERVICE_IMAGE:          "desktop-stream-service:ci"
           GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
         run: ./gradlew test

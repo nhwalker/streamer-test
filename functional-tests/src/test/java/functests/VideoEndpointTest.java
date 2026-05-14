@@ -8,8 +8,8 @@ import org.junit.jupiter.api.Order;
 import java.time.Duration;
 import java.time.Instant;
 
-@Order(3)
-@DisplayName("Video endpoint — caster mode (GET /video)")
+@Order(9)
+@DisplayName("Video endpoint (GET /video)")
 class VideoEndpointTest extends AbstractVideoEndpointTest {
 
     @BeforeAll

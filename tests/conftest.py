@@ -6,10 +6,8 @@ Fixture dependency graph:
     xvfb_display (session)              archive_dir, archive_live_dir (session)
          │                                                 │
          ▼                                                 │
-    _caster (session)  ── runs caster container            │
-         │  webrtcsink published to caster's signalling    │
-         ▼  server on CASTER_SIGNALLING_PORT               ▼
-    _service (session)  ── runs service container; webrtcsrc dials caster,
+    _service (session)  ── runs service container;        │
+         │                  ximagesrc captures xvfb_display,
          │                  mounts archive_dir as /archive,
          │                  mounts archive_live_dir as /archive-live
          ▼
@@ -19,7 +17,6 @@ Fixture dependency graph:
     browser (function)
 """
 import os
-import re
 import subprocess
 import time
 
@@ -34,7 +31,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-CASTER_IMAGE  = os.environ.get("CASTER_IMAGE",  "desktop-caster:ci")
 SERVICE_IMAGE = os.environ.get("SERVICE_IMAGE", "desktop-stream-service:ci")
 HUB_IMAGE     = os.environ.get("HUB_IMAGE",     "desktop-stream-hub:ci")
 
@@ -44,18 +40,21 @@ STREAM_WIDTH  = 1280
 STREAM_HEIGHT = 720
 CROP_HEIGHT   = STREAM_HEIGHT // 2   # 360 — split point for top/bottom tests
 
-# The caster's signalling server port must not collide with the service's
-# signalling servers (8443/8444/8445); use 8448 on the test host.
-CASTER_SIGNALLING_PORT  = 8448   # caster exposes this; service's webrtcsrc dials it
 SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling (full stream)
 WS_PORT_TOP             = 8444   # service top-half signalling
 WS_PORT_BOTTOM          = 8445   # service bottom-half signalling
 HTTP_PORT               = 8080
 
-# Two-tone chain (separate Xvfb/caster/service for crop-offset colour tests).
+# Two-tone chain (separate Xvfb/service for crop-offset colour tests).
 # Ports are kept well apart from the regular chain to allow both to coexist in
 # the same pytest session on a host-networked Docker setup.
 HUB_HTTP_PORT = 8091
+
+# DESKTOP_SPLITS that produce a top/bottom pair of CROP_HEIGHT-tall regions.
+TOP_BOTTOM_SPLITS = (
+    f"{STREAM_WIDTH}x{CROP_HEIGHT}+0+0;"
+    f"{STREAM_WIDTH}x{CROP_HEIGHT}+0+{CROP_HEIGHT}"
+)
 
 # Test data written to a temp file and mounted as /etc/hub/web/streams.json.
 HUB_TEST_STREAMS = [
@@ -64,7 +63,6 @@ HUB_TEST_STREAMS = [
 ]
 
 TWO_TONE_DISPLAY                  = ":98"
-CASTER_TWO_TONE_SIGNALLING_PORT   = 8449
 TWO_TONE_SIGNALLING_PORT          = 8453   # +1 = 8454 (top), +2 = 8455 (bottom)
 TWO_TONE_WS_PORT_TOP              = 8454
 TWO_TONE_WS_PORT_BOTTOM           = 8455
@@ -227,84 +225,27 @@ def archive_live_dir(tmp_path_factory):
     return str(path)
 
 
-# ── Caster ───────────────────────────────────────────────────────────────────
-@pytest.fixture(scope="session")
-def _caster(xvfb_display):
-    """
-    The caster container: X11 capture → webrtcsink (publishes to its own
-    signalling server on CASTER_SIGNALLING_PORT).
-
-    Must start before the service so the signalling server is ready when
-    webrtcsrc on the service tries to connect.
-    """
-    container = (
-        DockerContainer(CASTER_IMAGE)
-        .with_env("DISPLAY", xvfb_display)
-        .with_env("STREAM_WIDTH", "1280")
-        .with_env("STREAM_HEIGHT", "720")
-        .with_env("SIGNALLING_PORT", str(CASTER_SIGNALLING_PORT))
-        .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
-        .with_kwargs(network_mode="host", ipc_mode="host")
-    )
-    with container:
-        # Wait until the caster's signalling server is confirmed ready.
-        wait_for_logs(container, "Signalling server ready", timeout=30)
-        time.sleep(1.0)   # give webrtcsink time to register as producer
-        yield container
-
-
-# ── Caster peer ID ───────────────────────────────────────────────────────────
-_UUID_RE = re.compile(
-    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-    re.IGNORECASE,
-)
-
-
-@pytest.fixture(scope="session")
-def caster_peer_id(_caster):
-    """Extract the caster's randomly-assigned signalling peer ID from its logs."""
-    wait_for_logs(_caster, "registered as a producer", timeout=15)
-    stdout, _ = _caster.get_logs()
-    log_text = stdout.decode(errors='replace')
-    for line in log_text.splitlines():
-        if 'registered as a producer' in line:
-            m = _UUID_RE.search(line)
-            if m:
-                peer_id = m.group(0)
-                print(f'[conftest] caster peer_id = {peer_id}', flush=True)
-                return peer_id
-    raise RuntimeError(
-        f"Could not find a UUID on the 'registered as a producer' line in caster logs.\n"
-        f"Relevant caster log lines:\n"
-        + '\n'.join(l for l in log_text.splitlines()
-                    if 'producer' in l or 'peer' in l)
-    )
-
-
 # ── Service ──────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
-def _service(_caster, caster_peer_id, archive_dir, archive_live_dir):
+def _service(xvfb_display, archive_dir, archive_live_dir):
     """
-    The service container: webrtcsrc dials caster → tee → archive + webrtcsink.
-
-    Depends on _caster so the caster's signalling server is up before
-    webrtcsrc attempts to connect.
+    The service container: ximagesrc captures the Xvfb display → tee →
+    archive + webrtcsink.
     """
     container = (
         DockerContainer(SERVICE_IMAGE)
-        .with_env("CASTER_HOST", "127.0.0.1")
-        .with_env("CASTER_SIGNALLING_PORT", str(CASTER_SIGNALLING_PORT))
-        .with_env("CASTER_PEER_ID", caster_peer_id)
+        .with_env("DISPLAY", xvfb_display)
         .with_env("SIGNALLING_PORT", str(SERVICE_SIGNALLING_PORT))
         .with_env("DESKTOP_NAME", "stream")
         .with_env("STREAM_WIDTH", str(STREAM_WIDTH))
         .with_env("STREAM_HEIGHT", str(STREAM_HEIGHT))
-        .with_env("CROP_HEIGHT", str(CROP_HEIGHT))
+        .with_env("DESKTOP_SPLITS", TOP_BOTTOM_SPLITS)
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
+        .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         .with_volume_mapping(archive_dir, "/archive", "rw")
         .with_volume_mapping(archive_live_dir, "/archive-live", "rw")
-        .with_kwargs(network_mode="host")
+        .with_kwargs(network_mode="host", ipc_mode="host")
     )
     with container:
         yield container
@@ -376,8 +317,7 @@ def _wait_for_first_segment(live_dir, timeout=30.0):
 
 
 @pytest.fixture(scope="session")
-def first_segment(streaming_container, archive_live_dir, archive_dir,
-                  _caster, _service):
+def first_segment(streaming_container, archive_live_dir, archive_dir, _service):
     """Path to the first in-progress .mkv segment, waiting up to 30 s.
 
     The active segment is written into archive_live_dir; only after a
@@ -387,7 +327,6 @@ def first_segment(streaming_container, archive_live_dir, archive_dir,
     path = _wait_for_first_segment(archive_live_dir, timeout=30.0)
     if path is None:
         service_out, service_err = _service.get_logs()
-        caster_out, caster_err   = _caster.get_logs()
         live_listing = os.listdir(archive_live_dir) \
             if os.path.isdir(archive_live_dir) else []
         archive_listing = os.listdir(archive_dir) \
@@ -396,8 +335,6 @@ def first_segment(streaming_container, archive_live_dir, archive_dir,
             f"No stream-*.mkv appeared in {archive_live_dir} within 30 s.\n"
             f"Live dir listing:    {live_listing}\n"
             f"Archive dir listing: {archive_listing}\n"
-            f"===== caster stdout =====\n{caster_out.decode(errors='replace')}\n"
-            f"===== caster stderr =====\n{caster_err.decode(errors='replace')}\n"
             f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
             f"===== service stderr =====\n{service_err.decode(errors='replace')}"
         )
@@ -526,57 +463,21 @@ def xvfb_two_tone():
 
 
 @pytest.fixture(scope="session")
-def _caster_two_tone(xvfb_two_tone):
-    """Caster capturing the two-tone display, publishing on its own signalling port."""
-    container = (
-        DockerContainer(CASTER_IMAGE)
-        .with_env("DISPLAY", xvfb_two_tone)
-        .with_env("STREAM_WIDTH", str(STREAM_WIDTH))
-        .with_env("STREAM_HEIGHT", str(STREAM_HEIGHT))
-        .with_env("SIGNALLING_PORT", str(CASTER_TWO_TONE_SIGNALLING_PORT))
-        .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
-        .with_kwargs(network_mode="host", ipc_mode="host")
-    )
-    with container:
-        wait_for_logs(container, "Signalling server ready", timeout=30)
-        time.sleep(1.0)
-        yield container
-
-
-@pytest.fixture(scope="session")
-def caster_two_tone_peer_id(_caster_two_tone):
-    """Peer ID of the two-tone caster producer."""
-    wait_for_logs(_caster_two_tone, "registered as a producer", timeout=15)
-    stdout, _ = _caster_two_tone.get_logs()
-    log_text = stdout.decode(errors="replace")
-    for line in log_text.splitlines():
-        if "registered as a producer" in line:
-            m = _UUID_RE.search(line)
-            if m:
-                return m.group(0)
-    raise RuntimeError(
-        "Could not find UUID in two-tone caster 'registered as a producer' log.\n"
-        + "\n".join(l for l in log_text.splitlines() if "producer" in l or "peer" in l)
-    )
-
-
-@pytest.fixture(scope="session")
-def _service_two_tone(_caster_two_tone, caster_two_tone_peer_id):
-    """Service container connected to the two-tone caster, with CROP_HEIGHT=360."""
+def _service_two_tone(xvfb_two_tone):
+    """Service container capturing the two-tone Xvfb display directly."""
     container = (
         DockerContainer(SERVICE_IMAGE)
-        .with_env("CASTER_HOST", "127.0.0.1")
-        .with_env("CASTER_SIGNALLING_PORT", str(CASTER_TWO_TONE_SIGNALLING_PORT))
-        .with_env("CASTER_PEER_ID", caster_two_tone_peer_id)
+        .with_env("DISPLAY", xvfb_two_tone)
         .with_env("SIGNALLING_PORT", str(TWO_TONE_SIGNALLING_PORT))
         .with_env("DESKTOP_NAME", "stream")
         .with_env("STREAM_WIDTH", str(STREAM_WIDTH))
         .with_env("STREAM_HEIGHT", str(STREAM_HEIGHT))
-        .with_env("CROP_HEIGHT", str(CROP_HEIGHT))
+        .with_env("DESKTOP_SPLITS", TOP_BOTTOM_SPLITS)
         .with_env("WEB_PORT", str(TWO_TONE_HTTP_PORT))
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
-        .with_kwargs(network_mode="host")
+        .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
+        .with_kwargs(network_mode="host", ipc_mode="host")
     )
     with container:
         yield container

@@ -7,8 +7,8 @@ import org.junit.jupiter.api.Order;
 
 import java.time.Duration;
 
-@Order(1)
-@DisplayName("Static endpoints — caster mode (/, /top, /bottom)")
+@Order(7)
+@DisplayName("Static endpoints (/, /top, /bottom)")
 class StaticEndpointTest extends AbstractStaticEndpointTest {
 
     @BeforeAll

@@ -1,12 +1,12 @@
 # ─── Base Builder ─────────────────────────────────────────────────────────────
-# Produces compiled GStreamer artifacts shared by both the caster and service:
+# Produces compiled GStreamer artifacts consumed by the service container:
 #   /opt/gst-rs/                 — all gst-plugins-rs Rust plugins
 #   /opt/gst-nvcodec/            — nvcodec (nvh264enc/dec) + webrtcbin rebuilt
 #                                  with libsrtp2 + libnice (RHEL10 omits both)
 #   /opt/gst-webrtc-signalling-server — WebSocket signalling server binary
 #   /src/                        — gst-plugins-rs source (kept for JS bundle)
 #
-# The caster and service Containerfiles each do:
+# The service Containerfile does:
 #   FROM streamer-base:latest AS base
 #   FROM ubi10 AS runtime
 #   COPY --from=base /opt/... /...
@@ -141,8 +141,8 @@ RUN GST_VER="$(pkg-config --modversion gstreamer-1.0)" \
 # ── Strip debug symbols from all native artifacts ────────────────────────────
 # cargo --release leaves debug info in cdylibs by default, and meson install
 # copies nvcodec/webrtc .so files unstripped. Strip everything in /opt here so
-# the caster and service runtime images receive pre-stripped artifacts and do
-# not need binutils themselves.
+# the service runtime image receives pre-stripped artifacts and does not need
+# binutils itself.
 RUN find /opt -type f \( -name '*.so' -o -name '*.so.*' \) \
         -exec strip --strip-unneeded {} + 2>/dev/null || true \
     && strip --strip-unneeded /opt/gst-webrtc-signalling-server 2>/dev/null || true

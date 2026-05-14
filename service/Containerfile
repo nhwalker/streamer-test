@@ -157,13 +157,8 @@ VOLUME /archive-live
 
 # ── Environment defaults (all overridable at runtime via -e) ────────────────
 # STREAM_WIDTH/STREAM_HEIGHT and DESKTOP_SPLITS are intentionally unset —
-# in host mode the runtime auto-detects native screen size + monitor
-# geometry from xrandr; in caster mode unset width/height fall back to
-# 1920x1080 and unset DESKTOP_SPLITS falls back to a CROP_HEIGHT-based
-# top/bottom split (matching the legacy default).
+# the runtime auto-detects native screen size + monitor geometry from xrandr.
 ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
-    CASTER_HOST="" \
-    CASTER_SIGNALLING_PORT=8443 \
     DISPLAY=:0 \
     DESKTOP_NAME=desktop \
     STREAM_FRAMERATE=30 \

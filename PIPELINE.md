@@ -1,45 +1,35 @@
 # GStreamer Pipeline Documentation
 
-This document describes every element in the GStreamer pipelines used by the
-caster and service containers, and traces the full WebRTC signalling and media
-flow from X11 screen capture to a viewer's browser.  It also covers the HTTP
-web server that serves the archive download and video-assembly endpoints.
+This document describes every element in the GStreamer pipeline used by the
+service container, and traces the full WebRTC signalling and media flow from
+X11 screen capture to a viewer's browser.  It also covers the HTTP web server
+that serves the archive download and video-assembly endpoints.
 
 ---
 
 ## End-to-End Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  CASTER CONTAINER                                        │
-│                                                          │
-│  ximagesrc → videorate → videoscale → videoconvert       │
-│                                    → webrtcsink (H.264)  │
-│                                           │              │
-│  gst-webrtc-signalling-server (:8443) ◄───┘              │
-└──────────────────────────────────────────────────────────┘
-                        │ WebRTC (SRTP/RTP + WebSocket)
-                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  SERVICE CONTAINER                                       │
-│                                                          │
-│  webrtcsrc → videoconvert → tee                          │
-│                              ├─ q_arch → encoder         │
-│                              │         → h264parse       │
-│                              │         → splitmuxsink    │
-│                              │   (live .mkv → .mp4 on    │
-│                              │    rotation, faststart)   │
-│                              └─ q_webrtc → tee_webrtc   │
-│                                           ├─ q_full      │
-│                                           │  → webrtcsink (full,   :8443) │
-│                                           ├─ q_top       │
-│                                           │  → videocrop → webrtcsink (top,    :8444) │
-│                                           └─ q_bot       │
-│                                              → videocrop → webrtcsink (bottom, :8445) │
-│                                                          │
-│  gst-webrtc-signalling-server ×3 (:8443 / :8444 / :8445) │
-│  HTTP web server (:8080)                                 │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  SERVICE CONTAINER                                                       │
+│                                                                          │
+│  ximagesrc → videorate → videoscale → videoconvert → tee                 │
+│                                                       ├─ q_arch → encoder │
+│                                                       │          → h264parse │
+│                                                       │          → splitmuxsink │
+│                                                       │   (live .mkv → .mp4 on │
+│                                                       │    rotation, faststart)│
+│                                                       └─ q_webrtc → tee_webrtc │
+│                                                                  ├─ q_full     │
+│                                                                  │  → webrtcsink (full,   :8443) │
+│                                                                  ├─ q_top      │
+│                                                                  │  → videocrop → webrtcsink (top,    :8444) │
+│                                                                  └─ q_bot      │
+│                                                                     → videocrop → webrtcsink (bottom, :8445) │
+│                                                                          │
+│  gst-webrtc-signalling-server ×3 (:8443 / :8444 / :8445)                 │
+│  HTTP web server (:8080)                                                 │
+└──────────────────────────────────────────────────────────────────────────┘
                         │ WebRTC (SRTP/RTP + WebSocket)
                         ▼
               Browser (RTCPeerConnection + <video>)
@@ -49,45 +39,20 @@ web server that serves the archive download and video-assembly endpoints.
 
 ## WebRTC Signalling and Connection Sequence
 
-The diagram below covers two independent connection phases: the service
-connecting to the caster as a consumer, and a browser connecting to the service
-as a viewer.
-
 ```mermaid
 sequenceDiagram
     participant X11 as X11 Display
-    participant CastPipe as Caster Pipeline<br/>(webrtcsink)
-    participant CastSig as Caster Signalling<br/>Server :8443
-    participant SvcPipe as Service Pipeline<br/>(webrtcsrc)
+    participant SvcPipe as Service Pipeline<br/>(ximagesrc + webrtcsinks)
     participant SvcSig as Service Signalling<br/>Server :8443–8445
     participant Browser
 
-    note over CastPipe,CastSig: Phase 1 – Caster startup
-    CastPipe->>CastSig: WebSocket connect
-    CastSig-->>CastPipe: Assign producer peer-id ("desktop-caster")
-    CastPipe->>CastSig: Register as producer
-
-    note over SvcPipe,CastSig: Phase 2 – Service ingests caster stream
-    SvcPipe->>CastSig: WebSocket connect (request producer "desktop-caster")
-    CastSig-->>CastPipe: Notify: new consumer arrived
-    CastPipe->>CastSig: SDP Offer (H.264 codec + RTP params)
-    CastSig-->>SvcPipe: Forward SDP Offer
-    SvcPipe->>CastSig: SDP Answer (accept codec)
-    CastSig-->>CastPipe: Forward SDP Answer
-    CastPipe->>CastSig: ICE candidates (network addresses)
-    CastSig-->>SvcPipe: Forward ICE candidates
-    SvcPipe->>CastSig: ICE candidates
-    CastSig-->>CastPipe: Forward ICE candidates
-    note over CastPipe,SvcPipe: DTLS handshake → SRTP keys exchanged
-    X11-->>CastPipe: Raw video frames
-    CastPipe-->>SvcPipe: H.264 SRTP/RTP stream (UDP)
-
-    note over SvcPipe,SvcSig: Phase 3 – Service registers browser-facing streams
+    note over SvcPipe,SvcSig: Phase 1 – Service registers browser-facing streams
+    X11-->>SvcPipe: Raw video frames
     SvcPipe->>SvcSig: webrtcsink (full)   registers on :8443
     SvcPipe->>SvcSig: webrtcsink (top)    registers on :8444
     SvcPipe->>SvcSig: webrtcsink (bottom) registers on :8445
 
-    note over SvcSig,Browser: Phase 4 – Browser viewer connects
+    note over SvcSig,Browser: Phase 2 – Browser viewer connects
     Browser->>SvcSig: WebSocket connect (picks :8443, :8444, or :8445)
     SvcSig-->>Browser: Assign peer-id
     SvcSig-->>Browser: SDP Offer (VP9 or H.264 options)
@@ -104,9 +69,12 @@ sequenceDiagram
 
 ---
 
-## Caster Pipeline
+## Service Pipeline
 
-**Pipeline string** (`caster/pipeline.py`, `main()`):
+The pipeline is constructed programmatically (`service/pipeline.py`,
+`main()`).
+
+**Pipeline string** (equivalent gst-launch form):
 ```
 ximagesrc display-name=:0 use-damage=false
   ! videorate
@@ -114,7 +82,12 @@ ximagesrc display-name=:0 use-damage=false
   ! videoscale
   ! video/x-raw,width=1920,height=1080
   ! videoconvert
-  ! webrtcsink name=ws video-caps="video/x-h264"
+  ! tee name=t
+      t. ! queue ! encoder ! h264parse ! splitmuxsink (archive)
+      t. ! queue ! tee name=t_webrtc
+          t_webrtc. ! queue ! webrtcsink           (full,   :8443)
+          t_webrtc. ! queue ! videocrop ! webrtcsink  (top,    :8444)
+          t_webrtc. ! queue ! videocrop ! webrtcsink  (bottom, :8445)
 ```
 
 ### `ximagesrc`
@@ -161,94 +134,19 @@ Like the framerate caps filter, this is the negotiation contract between
 link-time if the upstream element cannot produce the specified dimensions,
 catching misconfiguration before any frames are processed.
 
-### `videoconvert`
-
-Converts pixel formats between elements whose capabilities do not match. X11
-captures in BGR or BGRA; the H.264 encoder expects I420 (YUV planar). Without
-`videoconvert` in the chain, caps negotiation would fail when `webrtcsink` tries
-to find a common format with `ximagesrc`. Placing `videoconvert` immediately
-before `webrtcsink` allows the encoder inside `webrtcsink` to request whichever
-input format it prefers and have it satisfied automatically.
-
-### `webrtcsink` (name: `ws`)
-
-| Property | Value | Purpose |
-|---|---|---|
-| `video-caps` | `video/x-h264` | Restrict codec negotiation to H.264 only |
-| `signaller.uri` | `ws://127.0.0.1:8443` | Address of the local signalling server |
-| `stun-server` | `$GST_WEBRTC_STUN_SERVER` | Optional STUN for NAT traversal |
-
-`webrtcsink` is a high-level element from `gst-plugins-rs` that bundles an
-encoder, an RTP payloader, a `webrtcbin` instance, and a signalling client into
-one unit. It:
-
-1. Registers itself as a **producer** on the signalling server.
-2. For each consumer that connects, performs an SDP offer/answer exchange and
-   ICE candidate exchange through the signalling server.
-3. Spins up an independent `webrtcbin` per consumer so bitrate adaptation is
-   fully isolated between viewers.
-4. Encodes raw video using `nvh264enc` when an NVIDIA GPU is available, falling
-   back to `x264enc` otherwise — this selection is made automatically at
-   negotiation time.
-5. Handles RTCP receiver reports and REMB feedback to adapt the encoder bitrate
-   up or down based on each consumer's measured bandwidth.
-6. Encrypts the RTP payload with DTLS-SRTP before sending over UDP.
-
-`video-caps="video/x-h264"` is set on the caster because the service's
-`webrtcsrc` decodes the stream and re-encodes it for archive and browser
-delivery. H.264 decoding is universally hardware-accelerated, making it the
-most efficient codec for the internal caster→service leg.
-
-TURN server configuration is applied per `webrtcbin` via the `deep-element-added`
-signal (`caster/pipeline.py`, `on_deep_element_added`) because `webrtcsink`
-creates a new `webrtcbin` for each peer and TURN credentials must be injected
-after creation.
-
----
-
-## Service Pipeline
-
-The service pipeline is constructed programmatically (`service/pipeline.py`,
-`main()`).
-
-### `webrtcsrc` (name: `wsrc`)
-
-| Property | Value | Purpose |
-|---|---|---|
-| `signaller.uri` | `ws://$CASTER_HOST:8443` | Caster's signalling server address |
-| `signaller.producer-peer-id` | `desktop-caster` | Which producer to consume |
-
-`webrtcsrc` is the consumer counterpart to `webrtcsink`, also from
-`gst-plugins-rs`. It:
-
-1. Connects to the caster's signalling server as a **consumer**.
-2. Requests the specific producer peer identified by `CASTER_PEER_ID`.
-3. Participates in the SDP offer/answer and ICE candidate exchange.
-4. Completes the DTLS handshake to establish an SRTP session.
-5. Receives the SRTP-protected RTP stream and decrypts it.
-6. Decodes the H.264 stream to raw YUV frames.
-7. Exposes the decoded video on a **dynamically created** `src` pad.
-
-Because `webrtcsrc` does not know the stream's properties at construction time,
-the `src` pad is only added once the remote SDP is processed. The `pad-added`
-signal handler (`on_pad_added`) listens for this event and links the first video
-pad to `videoconvert`'s sink pad.
-
 ### `videoconvert` (name: `vconvert`)
 
-Normalises the pixel format coming out of `webrtcsrc`. The decoded frames may
-be in NV12 or I420 depending on which decoder was used (NVDEC vs. software).
+Converts pixel formats between elements whose capabilities do not match. X11
+captures in BGR or BGRA; the downstream encoders expect I420 (YUV planar).
 `videoconvert` ensures all downstream elements always see a consistent format
-regardless of the decoder path, preventing caps negotiation failures further
+regardless of the source format, preventing caps negotiation failures further
 down the pipeline.
 
 ### `tee` (name: `t`)
 
-Duplicates the single decoded video stream into two independent branches: the
+Duplicates the single video stream into two independent branches: the
 **archive branch** and the **browser WebRTC branch**. `tee` pushes each buffer
 to all downstream sink pads in turn, so both branches receive every frame.
-Using `tee` instead of duplicating the `webrtcsrc` element means the network
-and decoding work is done exactly once for both consumers.
 
 ---
 
@@ -531,10 +429,9 @@ views independently.
 | `video-caps` | `video/x-vp9;video/x-h264` | Offer VP9 and H.264 to browsers |
 | `stun-server` | `$GST_WEBRTC_STUN_SERVER` | Optional STUN for NAT traversal |
 
-`q_full` isolates `ws_full`'s encoder from the sibling sinks. `ws_full` then
-operates identically to the caster's `webrtcsink` but serves browser viewers
-instead of the service. It handles per-peer encoding, SDP/ICE negotiation, DTLS,
-and adaptive bitrate entirely internally.
+`q_full` isolates `ws_full`'s encoder from the sibling sinks. `ws_full`
+serves browser viewers and handles per-peer encoding, SDP/ICE negotiation,
+DTLS, and adaptive bitrate entirely internally.
 
 Both VP9 and H.264 are offered because VP9 delivers better quality at lower
 bitrates (benefiting viewers on slow connections) while H.264 has broader
@@ -546,27 +443,28 @@ prefers.
 | Element | Property | Value | Purpose |
 |---|---|---|---|
 | `q_top` | — | — | Isolate top branch from sibling branches |
-| `crop_top` | `bottom` | `CROP_HEIGHT` px | Remove the bottom half of the frame |
+| `crop_top` | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region |
 | `ws_top` | `signaller.uri` | `ws://127.0.0.1:8444` | Top-half signalling server |
 
-`videocrop` removes pixels from the named edge. Setting `bottom=CROP_HEIGHT`
-removes `CROP_HEIGHT` rows from the bottom, leaving only the top half of the
-frame. The resulting cropped video is then streamed to browsers via `ws_top`
-with the same per-peer adaptive bitrate behaviour as `ws_full`.
+`videocrop` removes pixels from the named edge. The four trim properties are
+pre-computed by `desktop_config._crops_from_region()` from the
+`DESKTOP_SPLITS` region for this screen (or from the auto-detected RandR
+monitor geometry). For a top/bottom split, the top branch sets `bottom = H/2`
+to remove the lower half of the frame.
 
 #### `queue` → `videocrop` → `webrtcsink` (bottom half, name: `ws_bot`)
 
 | Element | Property | Value | Purpose |
 |---|---|---|---|
 | `q_bot` | — | — | Isolate bottom branch from sibling branches |
-| `crop_bot` | `top` | `CROP_HEIGHT` px | Remove the top half of the frame |
+| `crop_bot` | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region |
 | `ws_bot` | `signaller.uri` | `ws://127.0.0.1:8445` | Bottom-half signalling server |
 
-Mirror of the top-half branch. Setting `top=CROP_HEIGHT` removes `CROP_HEIGHT`
-rows from the top of the frame, leaving only the bottom half. Together,
-`ws_top` and `ws_bot` allow one physical screen to be presented as two
-independent sub-streams, each served through its own signalling endpoint and
-each with independent per-viewer adaptive bitrate.
+Mirror of the top-half branch — for a top/bottom split, the bottom branch
+sets `top = H/2` to remove the upper half. Together, `ws_top` and `ws_bot`
+allow one physical screen to be presented as two independent sub-streams,
+each served through its own signalling endpoint and each with independent
+per-viewer adaptive bitrate.
 
 ---
 
@@ -605,13 +503,12 @@ fixed at `ARCHIVE_BITRATE` kbps and is never reduced due to network conditions.
 ## TURN Server Configuration
 
 TURN server credentials are injected per `webrtcbin` instance via the
-`deep-element-added` pipeline signal (both `caster/pipeline.py` and
-`service/pipeline.py`, `on_deep_element_added`). `webrtcsink` and `webrtcsrc`
-create a new internal `webrtcbin` element for each peer connection; the signal
-fires each time one is added to the pipeline hierarchy, at which point
-`element.emit('add-turn-server', TURN)` registers the relay. This approach is
-required because there is no single `webrtcbin` element to configure upfront —
-it is a dynamic, per-peer resource.
+`deep-element-added` pipeline signal (`service/pipeline.py`,
+`on_deep_element_added`). `webrtcsink` creates a new internal `webrtcbin`
+element for each peer connection; the signal fires each time one is added to
+the pipeline hierarchy, at which point `element.emit('add-turn-server', TURN)`
+registers the relay. This approach is required because there is no single
+`webrtcbin` element to configure upfront — it is a dynamic, per-peer resource.
 
 ---
 
@@ -709,29 +606,14 @@ window.  Requests longer than 12 hours are rejected with 400.
 
 ## Environment Variable Reference
 
-### Caster
-
 | Variable | Default | Description |
 |---|---|---|
 | `DISPLAY` | `:0` | X11 display to capture |
-| `STREAM_WIDTH` | `1920` | Capture width in pixels |
-| `STREAM_HEIGHT` | `1080` | Capture height in pixels |
-| `STREAM_FRAMERATE` | `30` | Target frames per second |
-| `SIGNALLING_PORT` | `8443` | Local signalling server port |
-| `GST_WEBRTC_STUN_SERVER` | `` | STUN URI (e.g. `stun://stun.l.google.com:19302`) |
-| `GST_WEBRTC_TURN_SERVER` | `` | TURN URI (e.g. `turn://user:pass@host:3478`) |
-
-### Service
-
-| Variable | Default | Description |
-|---|---|---|
-| `CASTER_HOST` | *(required)* | Hostname or IP of the caster container |
-| `CASTER_SIGNALLING_PORT` | `8443` | Caster's signalling server port |
-| `CASTER_PEER_ID` | `desktop-caster` | Producer peer-id to request from caster |
 | `DESKTOP_NAME` | `desktop` | Label shown in the page header and used as the archive filename prefix |
-| `STREAM_WIDTH` | `1920` (caster) / native (host) | Capture width.  In host mode, leaving it unset reads the X server's native width via `xrandr` |
-| `STREAM_HEIGHT` | `1080` (caster) / native (host) | Capture height.  In host mode, leaving it unset reads the X server's native height via `xrandr` |
-| `DESKTOP_SPLITS` | _(empty)_ | `WxH+X+Y;WxH+X+Y;…` regions.  In host mode unset triggers `xrandr --listmonitors` auto-detection.  In caster mode unset falls back to a `CROP_HEIGHT`-based top/bottom split |
+| `STREAM_WIDTH` | _(native)_ | Capture width.  Leaving it unset reads the X server's native width via `xrandr` |
+| `STREAM_HEIGHT` | _(native)_ | Capture height.  Leaving it unset reads the X server's native height via `xrandr` |
+| `STREAM_FRAMERATE` | `30` | Target frames per second |
+| `DESKTOP_SPLITS` | _(empty)_ | `WxH+X+Y;WxH+X+Y;…` regions.  Unset triggers `xrandr --listmonitors` auto-detection |
 | `ARCHIVE_DIR` | `/archive` | Directory for completed (timestamp-named) faststart `.mp4` segments |
 | `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress `.mkv` segment is written into; each segment is remuxed to `.mp4` (`-c copy -movflags +faststart`) and moved into `ARCHIVE_DIR` when it rotates |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
@@ -745,7 +627,6 @@ window.  Requests longer than 12 hours are rejected with 400.
 | `ARCHIVE_MAX_AGE_DAYS` | `0` | Delete segments older than this many days; `0` = unlimited |
 | `VIDEO_QP` | `ARCHIVE_QP` (`18`) | CRF (libx264) / QP (h264_nvenc) used by `/video` to assemble its output.  Defaults to `ARCHIVE_QP` so /video preserves whatever quality the archive carries |
 | `SIGNALLING_PORT` | `8443` | Base port for browser-facing signalling servers; screen `i` uses `SIGNALLING_PORT + 1 + i` |
-| `CROP_HEIGHT` | _(unset)_ | Legacy split point; only consulted when `DESKTOP_SPLITS` is unset and (host mode) xrandr returns fewer than 2 monitors |
 | `WEB_PORT` | `8080` | HTTP server listening port |
 | `WEB_DIR` | `/var/www/html` | Static file root for the HTTP web server |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | ARGB fill colour for gaps in `/video` output (default: opaque black) |

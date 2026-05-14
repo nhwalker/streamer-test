@@ -2,15 +2,10 @@
 """
 pipeline.py -- desktop-stream-service: ingress -> tee -> archive + WebRTC.
 
-Two ingress modes, selected by CASTER_HOST:
+Ingress:
+  ximagesrc -> videorate -> videoscale -> videoconvert -> tee
 
-  Caster mode (CASTER_HOST set):
-    webrtcsrc (connects to caster's signalling server) -> videoconvert -> tee
-
-  Host mode (CASTER_HOST empty):
-    ximagesrc -> videorate -> videoscale -> videoconvert -> tee
-
-Either way, the tee fans out identically:
+The tee fans out:
   tee. -> encoder -> h264parse -> splitmuxsink matroskamux    (archive)
   tee. -> tee_webrtc
 
@@ -28,11 +23,8 @@ The resolution and the list of per-screen regions come from
 desktop_config.load_config(); see desktop_config.py for the env-var contract.
 
 Environment variables:
-  CASTER_HOST            caster hostname / IP; empty = host mode  ("")
-  CASTER_SIGNALLING_PORT caster's signalling server port          (8443)
-
-  DISPLAY                X11 display for host mode                (:0)
-  STREAM_FRAMERATE       frames per second for host mode          (30)
+  DISPLAY                X11 display                              (:0)
+  STREAM_FRAMERATE       frames per second                        (30)
 
   ARCHIVE_DIR            output dir for completed .mp4 segments   (/archive)
                          (faststart MP4, web-player friendly)
@@ -81,7 +73,7 @@ Environment variables:
   GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
 
 See desktop_config.py for DESKTOP_NAME, STREAM_WIDTH, STREAM_HEIGHT,
-DESKTOP_SPLITS, CROP_HEIGHT, and SIGNALLING_PORT.
+DESKTOP_SPLITS, and SIGNALLING_PORT.
 """
 import os
 import queue
@@ -101,11 +93,6 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib  # noqa: E402 - must follow gi.require_version
 
-CASTER_HOST           = os.environ.get('CASTER_HOST', '')
-CASTER_SIG_PORT       = os.environ.get('CASTER_SIGNALLING_PORT', '8443')
-CASTER_PEER_ID        = os.environ.get('CASTER_PEER_ID', 'desktop-caster')
-
-HOST_MODE             = not bool(CASTER_HOST)
 DISPLAY               = os.environ.get('DISPLAY', ':0')
 FRAMERATE             = os.environ.get('STREAM_FRAMERATE', '30')
 
@@ -247,12 +234,6 @@ def build_archive_encoder():
 
 
 def main():
-    if not HOST_MODE and not CASTER_HOST:
-        # Shouldn't be reached given HOST_MODE logic, but guard anyway.
-        print('[service] ERROR: CASTER_HOST is required in caster mode',
-              file=sys.stderr)
-        sys.exit(1)
-
     config         = load_config()
     desktop_name   = config['desktopName']
     width          = config['width']
@@ -270,15 +251,8 @@ def main():
 
     print('[service] Starting stream service:', flush=True)
     print(f'  Desktop name      : {desktop_name}')
-    if HOST_MODE:
-        print(f'  Mode              : host (X11 direct capture)')
-        print(f'  Display           : {DISPLAY}')
-        print(f'  Resolution        : {width}x{height} @ {FRAMERATE} fps')
-    else:
-        caster_sig_uri = f'ws://{CASTER_HOST}:{CASTER_SIG_PORT}'
-        print(f'  Mode              : caster')
-        print(f'  Caster signalling : {caster_sig_uri}')
-        print(f'  Resolution        : {width}x{height}')
+    print(f'  Display           : {DISPLAY}')
+    print(f'  Resolution        : {width}x{height} @ {FRAMERATE} fps')
     print(f'  Live segments     : {archive_pattern} ({ARCHIVE_SEGMENT_SEC}s segments)')
     print(f'  Completed archive : {ARCHIVE_DIR}')
     print(f'  Archive quality   : {ARCHIVE_QUALITY}'
@@ -308,7 +282,7 @@ def main():
         pipeline.add(el)
         return el
 
-    # ── Ingress source + videoconvert + tee (mode-dependent)
+    # ── Ingress source + videoconvert + tee
     vconvert  = make('videoconvert', 'vconvert')
     tee       = make('tee',          't')
 
@@ -344,25 +318,20 @@ def main():
         screen_branches.append((s, q, vc, wsk))
 
     # ── Configure ingress source
-    if HOST_MODE:
-        xsrc      = make('ximagesrc',   'xsrc')
-        vrate     = make('videorate',   'vrate')
-        vscale    = make('videoscale',  'vscale')
-        xsrc.set_property('display-name', DISPLAY)
-        xsrc.set_property('use-damage', False)
-        xsrc.link_filtered(
-            vrate,
-            Gst.Caps.from_string(f'video/x-raw,framerate={FRAMERATE}/1'),
-        )
-        vrate.link(vscale)
-        vscale.link_filtered(
-            vconvert,
-            Gst.Caps.from_string(f'video/x-raw,width={width},height={height}'),
-        )
-    else:
-        wsrc = make('webrtcsrc', 'wsrc')
-        wsrc.get_property('signaller').set_property('uri', caster_sig_uri)
-        wsrc.get_property('signaller').set_property('producer-peer-id', CASTER_PEER_ID)
+    xsrc      = make('ximagesrc',   'xsrc')
+    vrate     = make('videorate',   'vrate')
+    vscale    = make('videoscale',  'vscale')
+    xsrc.set_property('display-name', DISPLAY)
+    xsrc.set_property('use-damage', False)
+    xsrc.link_filtered(
+        vrate,
+        Gst.Caps.from_string(f'video/x-raw,framerate={FRAMERATE}/1'),
+    )
+    vrate.link(vscale)
+    vscale.link_filtered(
+        vconvert,
+        Gst.Caps.from_string(f'video/x-raw,width={width},height={height}'),
+    )
 
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
@@ -511,11 +480,7 @@ def main():
     print('[service] archive: using format-location-full (PTS-based timestamps)',
           flush=True)
 
-    # ── Configure videocrop per screen: each screen's crop trims are
-    # pre-computed by desktop_config so they remain correct in caster mode
-    # even when the source's actual dimensions differ from the configured
-    # ones (e.g. CROP_HEIGHT-based splits use trims expressed directly in
-    # source coordinates).
+    # ── Configure videocrop per screen: trims are pre-computed by desktop_config.
     for s, _q, vc, _wsk in screen_branches:
         vc.set_property('left',   s['cropLeft'])
         vc.set_property('top',    s['cropTop'])
@@ -569,27 +534,6 @@ def main():
         tee_webrtc.link(q)
         q.link(vc)
         vc.link(wsk)
-
-    # ── Dynamic src pad from webrtcsrc → videoconvert (caster mode only)
-    if not HOST_MODE:
-        vconvert_sink = vconvert.get_static_pad('sink')
-
-        def on_pad_added(_, pad):
-            if pad.get_direction() != Gst.PadDirection.SRC:
-                return
-            caps_str = pad.query_caps(None).to_string()
-            if 'video' not in caps_str:
-                return
-            if vconvert_sink.is_linked():
-                return
-            ret = pad.link(vconvert_sink)
-            if ret != Gst.PadLinkReturn.OK:
-                print(f'[service] ERROR: webrtcsrc pad link failed: {ret}',
-                      file=sys.stderr)
-            else:
-                print('[service] webrtcsrc → videoconvert linked', flush=True)
-
-        wsrc.connect('pad-added', on_pad_added)
 
     # ── TURN: injected per-webrtcbin instance when it is created
     if TURN:

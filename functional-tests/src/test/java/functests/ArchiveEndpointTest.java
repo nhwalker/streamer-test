@@ -7,8 +7,8 @@ import org.junit.jupiter.api.Order;
 
 import java.time.Duration;
 
-@Order(2)
-@DisplayName("Archive endpoint — caster mode (GET /archive)")
+@Order(8)
+@DisplayName("Archive endpoint (GET /archive)")
 class ArchiveEndpointTest extends AbstractArchiveEndpointTest {
 
     @BeforeAll

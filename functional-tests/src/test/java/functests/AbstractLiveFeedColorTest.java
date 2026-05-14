@@ -270,16 +270,6 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
             sb.append("===== service container logs: error: ").append(e.getMessage()).append("\n");
         }
 
-        // Caster container logs (caster mode only; empty string in host mode)
-        try {
-            String cl = stack.casterLogs();
-            if (!cl.isEmpty()) {
-                sb.append("===== caster container logs =====\n").append(cl).append("\n");
-            }
-        } catch (Exception e) {
-            sb.append("===== caster container logs: error: ").append(e.getMessage()).append("\n");
-        }
-
         return sb.toString();
     }
 

@@ -22,58 +22,8 @@ def _stub_x_probes(monkeypatch):
                         lambda _display: [])
 
 
-def test_caster_mode_defaults_to_one_full_screen():
-    cfg = desktop_config.compute_config({
-        'CASTER_HOST': '127.0.0.1',
-    })
-    assert cfg['mode'] == 'caster'
-    assert cfg['width'] == 1920
-    assert cfg['height'] == 1080
-    assert cfg['desktopName'] == 'desktop'
-    assert cfg['fullSignallingPort'] == 8443
-    assert len(cfg['screens']) == 1
-    s = cfg['screens'][0]
-    assert s['name'] == 'screen1'
-    assert s['signallingPort'] == 8444
-    assert (s['x'], s['y'], s['width'], s['height']) == (0, 0, 1920, 1080)
-    # No trimming for the single full-frame screen.
-    assert (s['cropLeft'], s['cropTop'], s['cropRight'], s['cropBottom']) == (0, 0, 0, 0)
-
-
-def test_caster_mode_crop_height_yields_top_bottom():
-    cfg = desktop_config.compute_config({
-        'CASTER_HOST': '127.0.0.1',
-        'STREAM_WIDTH': '1280',
-        'STREAM_HEIGHT': '720',
-        'CROP_HEIGHT': '360',
-    })
-    assert [s['name'] for s in cfg['screens']] == ['top', 'bottom']
-    top, bot = cfg['screens']
-    assert (top['y'], top['height']) == (0, 360)
-    assert (bot['y'], bot['height']) == (360, 360)
-    assert top['signallingPort'] == 8444
-    assert bot['signallingPort'] == 8445
-
-
-def test_caster_mode_crop_uses_crop_height_directly():
-    """The legacy CROP_HEIGHT split must use source-size-agnostic trims so
-    that crop values stay correct in caster mode even when the configured
-    height does not match the actual incoming stream height."""
-    cfg = desktop_config.compute_config({
-        'CASTER_HOST': '127.0.0.1',
-        # default STREAM_WIDTH=1920, STREAM_HEIGHT=1080
-        'CROP_HEIGHT': '360',
-    })
-    top, bot = cfg['screens']
-    assert (top['cropLeft'], top['cropTop'], top['cropRight'], top['cropBottom']) \
-        == (0, 0, 0, 360)
-    assert (bot['cropLeft'], bot['cropTop'], bot['cropRight'], bot['cropBottom']) \
-        == (0, 360, 0, 0)
-
-
 def test_explicit_desktop_splits_horizontal_pair():
     cfg = desktop_config.compute_config({
-        'CASTER_HOST': '127.0.0.1',
         'STREAM_WIDTH': '3840',
         'STREAM_HEIGHT': '1080',
         'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
@@ -92,7 +42,6 @@ def test_explicit_desktop_splits_horizontal_pair():
 
 def test_explicit_desktop_splits_three_screens_use_screen_n():
     cfg = desktop_config.compute_config({
-        'CASTER_HOST': '127.0.0.1',
         'STREAM_WIDTH': '3840',
         'STREAM_HEIGHT': '2160',
         # Out of reading order on purpose — code must sort.
@@ -107,7 +56,7 @@ def test_explicit_desktop_splits_three_screens_use_screen_n():
     ]
 
 
-def test_host_mode_native_resolution_from_x_server(monkeypatch):
+def test_native_resolution_from_x_server(monkeypatch):
     monkeypatch.setattr(desktop_config, '_query_x_screen',
                         lambda _d: (3840, 1080))
     monkeypatch.setattr(desktop_config, '_query_x_monitors',
@@ -116,13 +65,12 @@ def test_host_mode_native_resolution_from_x_server(monkeypatch):
                             {'x': 1920, 'y': 0, 'width': 1920, 'height': 1080},
                         ])
     cfg = desktop_config.compute_config({})
-    assert cfg['mode'] == 'host'
     assert cfg['width'] == 3840
     assert cfg['height'] == 1080
     assert [s['name'] for s in cfg['screens']] == ['left', 'right']
 
 
-def test_host_mode_explicit_dimensions_skip_screen_query(monkeypatch):
+def test_explicit_dimensions_skip_screen_query(monkeypatch):
     # _query_x_screen must not be called when both dims are given.
     def _fail(_d):
         raise AssertionError('_query_x_screen should not be called')
@@ -136,18 +84,20 @@ def test_host_mode_explicit_dimensions_skip_screen_query(monkeypatch):
     assert (cfg['width'], cfg['height']) == (1280, 720)
 
 
-def test_host_mode_falls_back_to_crop_height_when_x_quiet():
+def test_falls_back_to_full_frame_when_x_quiet():
     cfg = desktop_config.compute_config({
         'STREAM_WIDTH': '1280',
         'STREAM_HEIGHT': '720',
-        'CROP_HEIGHT': '360',
     })
-    assert [s['name'] for s in cfg['screens']] == ['top', 'bottom']
+    # No DESKTOP_SPLITS, no monitors from RandR → single full-frame screen.
+    assert [s['name'] for s in cfg['screens']] == ['screen1']
+    s = cfg['screens'][0]
+    assert (s['x'], s['y'], s['width'], s['height']) == (0, 0, 1280, 720)
+    assert (s['cropLeft'], s['cropTop'], s['cropRight'], s['cropBottom']) == (0, 0, 0, 0)
 
 
 def test_signalling_port_offset_uses_index():
     cfg = desktop_config.compute_config({
-        'CASTER_HOST': 'h',
         'STREAM_WIDTH': '3840',
         'STREAM_HEIGHT': '1080',
         'SIGNALLING_PORT': '9000',
@@ -161,7 +111,6 @@ def test_signalling_port_offset_uses_index():
 def test_invalid_desktop_splits_raises():
     with pytest.raises(ValueError):
         desktop_config.compute_config({
-            'CASTER_HOST': 'h',
             'DESKTOP_SPLITS': 'not-a-region',
         })
 
