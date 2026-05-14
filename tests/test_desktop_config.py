@@ -102,6 +102,10 @@ def test_signalling_port_offset_uses_index():
         'STREAM_HEIGHT': '1080',
         'SIGNALLING_PORT': '9000',
         'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
+        # Pin to a single tier so this test isolates the legacy
+        # signallingPort fields from the ladder math (which is exercised in
+        # its own dedicated tests below).
+        'WEBRTC_SCALE_LADDER': '1.0',
     })
     assert cfg['fullSignallingPort'] == 9000
     assert cfg['screens'][0]['signallingPort'] == 9001
@@ -118,3 +122,150 @@ def test_invalid_desktop_splits_raises():
 def test_desktop_name_propagates():
     cfg = desktop_config.compute_config({'DESKTOP_NAME': 'workstation-a'})
     assert cfg['desktopName'] == 'workstation-a'
+
+
+class TestScaleLadder:
+    """Cover _parse_scale_ladder + _compute_tiers + tier emission in
+    compute_config.  These all exercise the new ladder feature end-to-end
+    without standing up a real pipeline."""
+
+    def test_default_ladder(self):
+        assert desktop_config._parse_scale_ladder({}) == [1.0, 0.75, 0.5, 0.25]
+
+    def test_explicit_ladder_sorts_descending(self):
+        assert desktop_config._parse_scale_ladder(
+            {'WEBRTC_SCALE_LADDER': '0.5,1.0,0.25'}
+        ) == [1.0, 0.5, 0.25]
+
+    def test_ratio_form_parses(self):
+        # 1/3 ≈ 0.333; we accept it as a tier scale.
+        out = desktop_config._parse_scale_ladder(
+            {'WEBRTC_SCALE_LADDER': '1.0,1/3'}
+        )
+        assert out[0] == 1.0
+        assert abs(out[1] - 1/3) < 1e-9
+
+    def test_dedup_collapses_near_duplicates(self):
+        # Dedup uses a small float tolerance, so 0.5 and 0.50000001 are
+        # treated as the same tier.  Whichever appears first after the
+        # descending sort wins — we don't care which; we only care that
+        # the final list has exactly the two distinct tiers.
+        out = desktop_config._parse_scale_ladder(
+            {'WEBRTC_SCALE_LADDER': '1.0,0.5,0.5,0.50000001'}
+        )
+        assert len(out) == 2
+        assert out[0] == 1.0
+        assert abs(out[1] - 0.5) < 1e-6
+
+    def test_one_is_always_included(self):
+        # Operator forgot to include 1.0 — we silently add it so every
+        # stream has a passthrough tier.
+        assert desktop_config._parse_scale_ladder(
+            {'WEBRTC_SCALE_LADDER': '0.5,0.25'}
+        ) == [1.0, 0.5, 0.25]
+
+    @pytest.mark.parametrize('bad', ['0', '-0.5', '1.5', '2', 'abc', '1/0'])
+    def test_rejects_invalid_scales(self, bad):
+        with pytest.raises(ValueError):
+            desktop_config._parse_scale_ladder({'WEBRTC_SCALE_LADDER': bad})
+
+    def test_rejects_too_many_tiers(self):
+        ladder = ','.join(str(round(1 - i * 0.05, 3)) for i in range(20))
+        with pytest.raises(ValueError):
+            desktop_config._parse_scale_ladder(
+                {'WEBRTC_SCALE_LADDER': ladder})
+
+    def test_compute_tiers_snaps_to_even(self):
+        # Banker's rounding: 1.0×1281/2 = 640.5 → 640, ×2 = 1280.  Same for
+        # 721 → 720.  Down-snap is the right direction so we never ask
+        # videoscale to produce more pixels than the source can supply.
+        tiers = desktop_config._compute_tiers(1281, 721, [1.0, 0.5, 0.25])
+        assert tiers == [
+            {'scale': 1.0,  'width': 1280, 'height': 720},
+            {'scale': 0.5,  'width': 640,  'height': 360},
+            {'scale': 0.25, 'width': 320,  'height': 180},
+        ]
+
+    def test_compute_tiers_drops_below_min_dim(self):
+        # 1.0 tier always kept; 0.1 tier of 200x200 = 20x20 < 64 → dropped.
+        tiers = desktop_config._compute_tiers(
+            200, 200, [1.0, 0.5, 0.25, 0.1], min_dim=64)
+        scales = [t['scale'] for t in tiers]
+        assert 1.0 in scales
+        assert 0.1 not in scales
+
+    def test_compute_tiers_dedups_after_rounding(self):
+        # base=4 px: every non-trivial scale rounds to 2.  Only the 1.0
+        # tier is retained.
+        tiers = desktop_config._compute_tiers(4, 4, [1.0, 0.5, 0.49],
+                                              min_dim=2)
+        # Even-dim snapping makes 1.0 → 4x4, 0.5 and 0.49 both → 2x2;
+        # passthrough kept, the rest dedup.
+        assert tiers == [
+            {'scale': 1.0,  'width': 4, 'height': 4},
+            {'scale': 0.5,  'width': 2, 'height': 2},
+        ]
+
+    def test_full_and_screen_tiers_emitted(self):
+        cfg = desktop_config.compute_config({
+            'STREAM_WIDTH': '1920',
+            'STREAM_HEIGHT': '1080',
+            'DESKTOP_SPLITS': '1920x540+0+0;1920x540+0+540',
+            'WEBRTC_SCALE_LADDER': '1.0,0.5',
+            'SIGNALLING_PORT': '8443',
+            'SIGNALLING_PORT_STRIDE': '100',
+        })
+        # Full stream tiers.
+        assert cfg['fullSignallingPort'] == 8443
+        assert cfg['fullTiers'] == [
+            {'scale': 1.0, 'width': 1920, 'height': 1080,
+             'signallingPort': 8443},
+            {'scale': 0.5, 'width': 960,  'height': 540,
+             'signallingPort': 8543},
+        ]
+        # Per-screen tiers: top is index 0 (stream 1), bottom is index 1
+        # (stream 2); each cropped region is 1920x540.
+        top, bottom = cfg['screens']
+        assert top['signallingPort'] == 8444
+        assert top['tiers'] == [
+            {'scale': 1.0, 'width': 1920, 'height': 540,
+             'signallingPort': 8444},
+            {'scale': 0.5, 'width': 960,  'height': 270,
+             'signallingPort': 8544},
+        ]
+        assert bottom['signallingPort'] == 8445
+        assert bottom['tiers'] == [
+            {'scale': 1.0, 'width': 1920, 'height': 540,
+             'signallingPort': 8445},
+            {'scale': 0.5, 'width': 960,  'height': 270,
+             'signallingPort': 8545},
+        ]
+
+    def test_port_stride_per_tier(self):
+        cfg = desktop_config.compute_config({
+            'STREAM_WIDTH': '3840',
+            'STREAM_HEIGHT': '1080',
+            'SIGNALLING_PORT': '9000',
+            'SIGNALLING_PORT_STRIDE': '100',
+            'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
+            'WEBRTC_SCALE_LADDER': '1.0,0.5,0.25',
+        })
+        # Tier 0 (1.0) keeps the legacy port; tiers 1+ shift by stride.
+        full_ports = [t['signallingPort'] for t in cfg['fullTiers']]
+        assert full_ports == [9000, 9100, 9200]
+        left_ports = [t['signallingPort'] for t in cfg['screens'][0]['tiers']]
+        right_ports = [t['signallingPort'] for t in cfg['screens'][1]['tiers']]
+        assert left_ports  == [9001, 9101, 9201]
+        assert right_ports == [9002, 9102, 9202]
+
+    def test_signalling_stride_collision_check(self):
+        # Stride must be larger than (full + screen count) to avoid having
+        # tier 1's allocation collide with tier 0 of another stream.
+        with pytest.raises(ValueError):
+            desktop_config.compute_config({
+                'STREAM_WIDTH': '1920',
+                'STREAM_HEIGHT': '1080',
+                'SIGNALLING_PORT_STRIDE': '2',
+                'DESKTOP_SPLITS': ('1920x270+0+0;1920x270+0+270;'
+                                   '1920x270+0+540;1920x270+0+810'),
+            })

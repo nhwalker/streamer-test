@@ -177,9 +177,18 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=video,compute
 
+# Web UI.
 EXPOSE 8080/tcp
-EXPOSE 8443/tcp
-EXPOSE 8444/tcp
-EXPOSE 8445/tcp
+
+# WebRTC signalling: SIGNALLING_PORT (default 8443) + screen index + tier-stride.
+# With the default WEBRTC_SCALE_LADDER (1.0, 0.75, 0.5, 0.25) and SIGNALLING_PORT_STRIDE=100,
+# each stream uses 4 ports — tier 0 at 8443+screen_index, then +100 per tier.
+# The ranges below cover up to 8 screens × 4 tiers; non-default ladders or a
+# different stride require widening these.  Note: EXPOSE is Docker metadata only;
+# ports outside this range will still bind, but `docker run --publish-all` skips them.
+EXPOSE 8443-8451/tcp
+EXPOSE 8543-8551/tcp
+EXPOSE 8643-8651/tcp
+EXPOSE 8743-8751/tcp
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

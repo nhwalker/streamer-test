@@ -20,14 +20,15 @@ that serves the archive download and video-assembly endpoints.
 │                                                       │   (live .mkv → .mp4 on │
 │                                                       │    rotation, faststart)│
 │                                                       └─ q_webrtc → tee_webrtc │
-│                                                                  ├─ q_full     │
-│                                                                  │  → webrtcsink (full,   :8443) │
-│                                                                  ├─ q_top      │
-│                                                                  │  → videocrop → webrtcsink (top,    :8444) │
-│                                                                  └─ q_bot      │
-│                                                                     → videocrop → webrtcsink (bottom, :8445) │
+│                                                                  ├─ × N tiers of  full-stream branches  │
+│                                                                  │   (queue → valve → videoscale → capsfilter → webrtcsink) │
+│                                                                  └─ × N tiers of  per-screen   branches │
+│                                                                      (queue → videocrop → valve → videoscale → capsfilter → webrtcsink) │
 │                                                                          │
-│  gst-webrtc-signalling-server ×3 (:8443 / :8444 / :8445)                 │
+│  gst-webrtc-signalling-server: one per (stream, tier) pair               │
+│      default ports: 8443/8543/8643/8743 (full × 4 tiers)                 │
+│                     8444/8544/8644/8744 (top  × 4 tiers)                 │
+│                     8445/8545/8645/8745 (bottom × 4 tiers)               │
 │  HTTP web server (:8080)                                                 │
 └──────────────────────────────────────────────────────────────────────────┘
                         │ WebRTC (SRTP/RTP + WebSocket)
@@ -42,29 +43,37 @@ that serves the archive download and video-assembly endpoints.
 ```mermaid
 sequenceDiagram
     participant X11 as X11 Display
-    participant SvcPipe as Service Pipeline<br/>(ximagesrc + webrtcsinks)
-    participant SvcSig as Service Signalling<br/>Server :8443–8445
+    participant SvcPipe as Service Pipeline<br/>(ximagesrc + webrtcsink ladder)
+    participant SvcSig as Service Signalling<br/>Servers (one per tier port)
     participant Browser
 
-    note over SvcPipe,SvcSig: Phase 1 – Service registers browser-facing streams
+    note over SvcPipe,SvcSig: Phase 1 – Service registers one webrtcsink per (stream, tier)
     X11-->>SvcPipe: Raw video frames
-    SvcPipe->>SvcSig: webrtcsink (full)   registers on :8443
-    SvcPipe->>SvcSig: webrtcsink (top)    registers on :8444
-    SvcPipe->>SvcSig: webrtcsink (bottom) registers on :8445
+    SvcPipe->>SvcSig: webrtcsink (full,  tier 0–N)  on 8443, 8543, 8643, 8743
+    SvcPipe->>SvcSig: webrtcsink (top,   tier 0–N)  on 8444, 8544, 8644, 8744
+    SvcPipe->>SvcSig: webrtcsink (bottom, tier 0–N) on 8445, 8545, 8645, 8745
 
     note over SvcSig,Browser: Phase 2 – Browser viewer connects
-    Browser->>SvcSig: WebSocket connect (picks :8443, :8444, or :8445)
+    Browser->>Browser: Measure <video> size × devicePixelRatio
+    Browser->>Browser: Pick smallest tier whose pixels ≥ rendered size
+    Browser->>SvcSig: WebSocket connect to chosen tier's port
     SvcSig-->>Browser: Assign peer-id
     SvcSig-->>Browser: SDP Offer (VP9 or H.264 options)
     Browser->>SvcSig: SDP Answer (selects codec)
     SvcSig-->>Browser: ICE candidates
     Browser->>SvcSig: ICE candidates
-    note over SvcPipe,Browser: DTLS handshake → SRTP keys exchanged
+    note over SvcPipe,Browser: webrtcsink fires consumer-added → its tier's valve opens
     SvcPipe-->>Browser: Encoded video SRTP/RTP stream (UDP)
     Browser->>Browser: RTCPeerConnection decodes → <video> element
     Browser->>SvcSig: RTCP REMB (bandwidth estimate)
-    SvcSig-->>Browser: Forward RTCP feedback
     note over SvcPipe: webrtcsink adjusts encoder bitrate per-browser
+
+    note over SvcSig,Browser: Phase 3 (optional) – User resizes the window
+    Browser->>Browser: ResizeObserver fires (debounced 250 ms)
+    Browser->>Browser: pickTier() returns a different tier
+    Browser->>SvcSig: close old session, open new one on new tier's port
+    SvcPipe-->>SvcPipe: consumer-removed on old tier → valve closes
+    SvcPipe-->>Browser: New session on the new tier
 ```
 
 ---
@@ -85,9 +94,9 @@ ximagesrc display-name=:0 use-damage=false
   ! tee name=t
       t. ! queue ! encoder ! h264parse ! splitmuxsink (archive)
       t. ! queue ! tee name=t_webrtc
-          t_webrtc. ! queue ! webrtcsink           (full,   :8443)
-          t_webrtc. ! queue ! videocrop ! webrtcsink  (top,    :8444)
-          t_webrtc. ! queue ! videocrop ! webrtcsink  (bottom, :8445)
+          (per WEBRTC_SCALE_LADDER tier, per stream:)
+          t_webrtc. ! queue !            valve ! videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
+          t_webrtc. ! queue ! videocrop ! valve ! videoscale ! capsfilter(W,H) ! webrtcsink  (screen, tier i)
 ```
 
 ### `ximagesrc`
@@ -416,55 +425,73 @@ archive branch.
 
 #### `tee` (name: `t_webrtc`)
 
-Splits the single decoded stream into three parallel browser feeds: full frame,
-top half, and bottom half. Each feed is sent to a separate `webrtcsink` on its
-own signalling port, allowing a browser to subscribe to any one of the three
-views independently.
+Splits the single decoded stream into N × (1 + screens) parallel browser
+feeds, where N is the number of tiers configured by `WEBRTC_SCALE_LADDER`.
+Each (stream, tier) pair has its own `webrtcsink` on its own signalling
+port, so a browser independently picks the tier whose pixel dimensions
+match the size it's actually rendering the `<video>` element at.
 
-#### `queue` → `webrtcsink` (full stream, name: `ws_full`)
+#### Per-tier sub-branch
 
-| Property | Value | Purpose |
-|---|---|---|
-| `signaller.uri` | `ws://127.0.0.1:8443` | Browser-facing signalling server |
-| `video-caps` | `video/x-vp9;video/x-h264` | Offer VP9 and H.264 to browsers |
-| `stun-server` | `$GST_WEBRTC_STUN_SERVER` | Optional STUN for NAT traversal |
+Every (stream, tier) pair shares the same shape:
 
-`q_full` isolates `ws_full`'s encoder from the sibling sinks. `ws_full`
-serves browser viewers and handles per-peer encoding, SDP/ICE negotiation,
-DTLS, and adaptive bitrate entirely internally.
-
-Both VP9 and H.264 are offered because VP9 delivers better quality at lower
-bitrates (benefiting viewers on slow connections) while H.264 has broader
-hardware decode support on older devices. The browser selects whichever codec it
-prefers.
-
-#### `queue` → `videocrop` → `webrtcsink` (top half, name: `ws_top`)
+```
+tee_webrtc → queue → [videocrop] → valve → videoscale → capsfilter(W,H) → webrtcsink
+```
 
 | Element | Property | Value | Purpose |
 |---|---|---|---|
-| `q_top` | — | — | Isolate top branch from sibling branches |
-| `crop_top` | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region |
-| `ws_top` | `signaller.uri` | `ws://127.0.0.1:8444` | Top-half signalling server |
+| `q_<stream>_t<i>` | — | — | Isolate this branch from sibling branches |
+| `crop_<screen>_t<i>` (screens only) | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region; *duplicated per tier* so the upstream valve gates per-tier work cleanly |
+| `valve_<stream>_t<i>` | `drop` | `true` until first consumer joins | Stop the per-pixel `videoscale` work below when no consumer is watching this tier |
+| `scale_<stream>_t<i>` | — | — | Software downscale to the tier's dimensions |
+| `capsf_<stream>_t<i>` | `caps` | `video/x-raw,width=W,height=H` | Pin output dimensions (computed from the source size × tier scale, rounded to even pixels for YUV 4:2:0) |
+| `ws_<stream>_t<i>` | `signaller.uri` | `ws://127.0.0.1:PORT` | Tier-specific signalling endpoint |
+| `ws_<stream>_t<i>` | `video-caps` | `video/x-vp9;video/x-h264` | Offer VP9 and H.264 to browsers |
+| `ws_<stream>_t<i>` | `stun-server` | `$GST_WEBRTC_STUN_SERVER` | Optional STUN for NAT traversal |
 
-`videocrop` removes pixels from the named edge. The four trim properties are
-pre-computed by `desktop_config._crops_from_region()` from the
-`DESKTOP_SPLITS` region for this screen (or from the auto-detected RandR
-monitor geometry). For a top/bottom split, the top branch sets `bottom = H/2`
-to remove the lower half of the frame.
+The full stream branch omits `videocrop` and uses the source dimensions
+× scale; per-screen branches crop first (in source coordinates) and then
+scale the cropped output. Both VP9 and H.264 are offered because VP9
+delivers better quality at lower bitrates while H.264 has broader hardware
+decode support; the browser picks.
 
-#### `queue` → `videocrop` → `webrtcsink` (bottom half, name: `ws_bot`)
+#### Valve gating
 
-| Element | Property | Value | Purpose |
-|---|---|---|---|
-| `q_bot` | — | — | Isolate bottom branch from sibling branches |
-| `crop_bot` | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region |
-| `ws_bot` | `signaller.uri` | `ws://127.0.0.1:8445` | Bottom-half signalling server |
+Each `webrtcsink` emits `consumer-added` / `consumer-removed` signals
+when a browser joins or leaves. `pipeline.py` keeps a per-branch consumer
+counter and flips the tier's `valve.drop` between `true` (count == 0)
+and `false` (count > 0). This stops the upstream `videoscale` from
+spending CPU on tiers that nobody is watching — the queue ahead of the
+valve still receives buffers from `tee_webrtc`, but the valve drops them
+so the scale-down never runs. `webrtcsink` itself lazily constructs its
+per-consumer encoder, so the encoder cost is already zero when no one is
+subscribed; the valve covers the upstream pixel work.
 
-Mirror of the top-half branch — for a top/bottom split, the bottom branch
-sets `top = H/2` to remove the upper half. Together, `ws_top` and `ws_bot`
-allow one physical screen to be presented as two independent sub-streams,
-each served through its own signalling endpoint and each with independent
-per-viewer adaptive bitrate.
+#### Port allocation
+
+Ports are deterministic from the stream and tier indices:
+
+```
+port(stream_idx, tier_idx) = SIGNALLING_PORT + stream_idx + tier_idx * SIGNALLING_PORT_STRIDE
+```
+
+With the defaults (`SIGNALLING_PORT=8443`, `SIGNALLING_PORT_STRIDE=100`,
+`WEBRTC_SCALE_LADDER=1.0,0.75,0.5,0.25`) and a top/bottom screen split:
+
+|         | Full (s=0) | Top (s=1) | Bottom (s=2) |
+|---------|------------|-----------|--------------|
+| t=0 (1.0)  | 8443 | 8444 | 8445 |
+| t=1 (0.75) | 8543 | 8544 | 8545 |
+| t=2 (0.5)  | 8643 | 8644 | 8645 |
+| t=3 (0.25) | 8743 | 8744 | 8745 |
+
+Tier 0 keeps the legacy port for each stream, so callers that haven't
+been taught about the tier ladder still reach the source-resolution feed
+on the original port. The browser (`service/web/index.html`) auto-picks
+a tier based on its rendered video size on initial load and again
+whenever the video element resizes (debounced); a `?tier=<i>` query
+parameter pins a specific tier for deterministic functional tests.
 
 ---
 

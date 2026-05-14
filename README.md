@@ -421,10 +421,27 @@ All settings are environment variables passed to `docker run -e`:
 | `STREAM_FRAMERATE` | `30` | Frames per second |
 | `DESKTOP_SPLITS` | _(empty)_ | Per-screen regions in `WxH+X+Y;WxH+X+Y` form.  Unset triggers `xrandr --listmonitors` auto-detection |
 | `SIGNALLING_HOST` | `0.0.0.0` | Network interface for the signalling server |
-| `SIGNALLING_PORT` | `8443` | Port for the full-frame WebSocket signalling server; screen `i` uses `SIGNALLING_PORT + 1 + i` |
+| `SIGNALLING_PORT` | `8443` | Base port for the WebSocket signalling servers.  Each (stream, tier) pair uses `SIGNALLING_PORT + stream_index + SIGNALLING_PORT_STRIDE * tier_index`.  The full stream is stream 0; screens 1..N follow in name order |
+| `SIGNALLING_PORT_STRIDE` | `100` | Per-tier port spacing.  Tier 0 of each stream keeps the legacy port; tier 1 lands at +100, tier 2 at +200, etc. |
+| `WEBRTC_SCALE_LADDER` | `1.0,0.75,0.5,0.25` | Comma-separated fractional scales for the per-stream `webrtcsink` ladder.  Each browser auto-picks the smallest tier whose pixel dimensions still meet its rendered video size, so a viewer rendering at 540 px wide pulls a 1/2-scale stream instead of forcing the encoder to deliver source-resolution frames.  Accepts decimals (`0.5`), ints (`1`), and ratios (`1/3`); values must be in `(0, 1.0]`.  The `1.0` tier is always included |
 | `WEB_PORT` | `8080` | Port for the HTTP page server |
 | `GST_WEBRTC_STUN_SERVER` | _(empty)_ | STUN server URI, e.g. `stun://stun.l.google.com:19302` |
 | `GST_WEBRTC_TURN_SERVER` | _(empty)_ | TURN relay URI, e.g. `turn://user:pass@host:3478` — applied per-consumer via the `add-turn-server` signal |
+
+### Why a ladder?
+
+Encoding source-resolution frames for a browser that's rendering the
+`<video>` element at half size wastes bandwidth and encoder CPU — the
+extra pixels get thrown away on the client. The `webrtcsink` ladder
+sends each viewer the smallest pre-scaled feed that still meets their
+display size, so a 540 px viewer pulls a 540 px stream and a fullscreen
+1080 px viewer pulls the full 1080 px feed. `webrtcsink` only constructs
+its per-consumer encoder when a consumer actually subscribes, and a
+`valve` upstream of the per-tier `videoscale` is closed until that
+moment, so tiers nobody is watching cost no encoder or scaler CPU. When
+the browser resizes across a tier boundary it closes its session and
+reopens against the new tier; this is a brief (~250 ms) reconnect, not
+a permanent latency hit.
 
 \* H.264 and H.265 use NVENC hardware encoding when a GPU is available (`--gpus all`). Without a GPU, H.264 falls back to software encoding via `gstreamer1-plugins-ugly` (x264), which is included in the runtime stage via RPM Fusion Free. H.265 WebRTC is supported in Chrome/Edge but not Firefox.
 

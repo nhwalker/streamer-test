@@ -132,7 +132,15 @@
     Query parameters:
       ?signalling=ws://host:8443     Override the signalling server URL.
                                      The default is read from /config.json
-                                     based on the current URL path.
+                                     based on the current URL path.  Pins
+                                     the connection to a single endpoint —
+                                     no tier auto-switching.
+      ?tier=<N>                      Pin a specific tier index (0 = largest /
+                                     source resolution, N-1 = smallest).
+                                     Disables the ResizeObserver auto-switch.
+                                     Used by functional tests so the chosen
+                                     resolution is deterministic regardless
+                                     of headless viewport size.
       ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
                                      browser and container are on different hosts.
   -->
@@ -194,9 +202,16 @@
       status.className   = isError ? 'error' : '';
     };
 
-    // Resolve the desktop name + signalling port from the runtime config.
-    // Falls back to legacy /top|/bottom defaults if /config.json is missing
-    // (e.g. older container image cached during a rolling upgrade).
+    // Resolve the desktop name + tier ladder from the runtime config.
+    //
+    // Returns the routed stream's `tiers` array (descending order — entry 0
+    // is the source-resolution passthrough tier) along with display labels
+    // and the metric classifier targets.  Each tier carries a fully-formed
+    // `sigUrl` so callers don't have to know about ports or hostnames.
+    //
+    // Falls back to a single legacy-port tier if /config.json is missing
+    // (e.g. older container image cached during a rolling upgrade) or
+    // doesn't carry the `fullTiers` / `screens[*].tiers` fields.
     async function resolveStreamConfig() {
       let cfg = null;
       try {
@@ -204,38 +219,86 @@
         if (r.ok) cfg = await r.json();
       } catch (_) {}
 
+      const host = window.location.hostname;
+      const makeSigUrl = (port) => `ws://${host}:${port}`;
+
       let desktopName  = cfg ? cfg.desktopName : null;
       let screenLabel  = '';
-      let sigPort      = cfg ? cfg.fullSignallingPort : 8443;
       let targetFps    = cfg ? cfg.framerate : 30;
-      // Target resolution defaults to the full stream; if we're routed to a
-      // specific screen sub-stream the gumball compares against that screen's
-      // dimensions instead, since the receiver only sees the cropped frame.
-      let targetWidth  = cfg ? cfg.width  : null;
-      let targetHeight = cfg ? cfg.height : null;
 
+      // Find the routed stream's tier list (full vs. per-screen).
+      let rawTiers = null;
+      let streamWidth  = cfg ? cfg.width  : null;
+      let streamHeight = cfg ? cfg.height : null;
       if (cfg) {
         const screen = (cfg.screens || []).find(s => s.path === path);
         if (screen) {
-          sigPort      = screen.signallingPort;
           screenLabel  = ` / ${screen.name}`;
-          targetWidth  = screen.width;
-          targetHeight = screen.height;
+          streamWidth  = screen.width;
+          streamHeight = screen.height;
+          rawTiers     = screen.tiers || null;
+        } else {
+          rawTiers = cfg.fullTiers || null;
         }
-      } else {
-        // Legacy fallback path-to-port map.
-        if (path === '/top')    sigPort = 8444;
-        if (path === '/bottom') sigPort = 8445;
       }
 
-      const sigUrl = params.get('signalling') ??
-                     `ws://${window.location.hostname}:${sigPort}`;
+      // Build the tier list, attaching a fully-formed sigUrl to each entry.
+      // If the config didn't carry tiers (legacy / cached image), synthesise
+      // a single-entry ladder from the legacy fullSignallingPort /
+      // screen.signallingPort field so the page still works.
+      let tiers;
+      if (rawTiers && rawTiers.length) {
+        tiers = rawTiers.map(t => ({
+          scale:  t.scale,
+          width:  t.width,
+          height: t.height,
+          sigUrl: makeSigUrl(t.signallingPort),
+        }));
+      } else {
+        let legacyPort = cfg ? cfg.fullSignallingPort : 8443;
+        if (cfg) {
+          const screen = (cfg.screens || []).find(s => s.path === path);
+          if (screen) legacyPort = screen.signallingPort;
+        } else {
+          if (path === '/top')    legacyPort = 8444;
+          if (path === '/bottom') legacyPort = 8445;
+        }
+        tiers = [{
+          scale: 1.0, width: streamWidth, height: streamHeight,
+          sigUrl: makeSigUrl(legacyPort),
+        }];
+      }
+
+      // ?signalling=… overrides everything to a single pinned endpoint.
+      const sigOverride = params.get('signalling');
+      if (sigOverride) {
+        tiers = [{
+          scale: 1.0, width: streamWidth, height: streamHeight,
+          sigUrl: sigOverride,
+        }];
+      }
 
       if (!desktopName) {
-        desktopName = sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
+        desktopName = tiers[0].sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
       }
-      return { sigUrl, desktopName, screenLabel,
-               targetFps, targetWidth, targetHeight };
+      return { tiers, desktopName, screenLabel,
+               targetFps, streamWidth, streamHeight };
+    }
+
+    // Smallest tier whose width AND height still meet the video element's
+    // rendered size (in physical pixels — clientWidth*DPR).  Falls back to
+    // the largest tier when the viewport is bigger than every tier (the
+    // common "fullscreen on a high-DPI monitor" case).  Tiers are passed
+    // largest-first to match the descending order from /config.json.
+    function pickTier(tiers, videoEl) {
+      const dpr   = window.devicePixelRatio || 1;
+      const wantW = Math.max(1, videoEl.clientWidth)  * dpr;
+      const wantH = Math.max(1, videoEl.clientHeight) * dpr;
+      let chosen = tiers[0]; // largest, fallback when viewport exceeds source
+      for (const t of tiers) {
+        if (t.width >= wantW && t.height >= wantH) chosen = t;
+      }
+      return chosen;
     }
 
     let _metricsTimer = null;
@@ -538,69 +601,160 @@
     }
 
     (async () => {
-      const { sigUrl, desktopName, screenLabel,
-              targetFps, targetWidth, targetHeight } = await resolveStreamConfig();
-      _targetFps    = targetFps;
-      _targetWidth  = targetWidth;
-      _targetHeight = targetHeight;
+      const { tiers, desktopName, screenLabel, targetFps,
+              streamWidth, streamHeight } = await resolveStreamConfig();
+
+      _targetFps = targetFps;
       document.getElementById('m-name').textContent   = desktopName;
       document.getElementById('m-screen').textContent = screenLabel;
       document.title = screenLabel
         ? `${desktopName}${screenLabel} — Desktop Stream`
         : `${desktopName} — Desktop Stream`;
-      setStatus(`Connecting to ${sigUrl} …`);
 
       const iceServers = [];
       if (stunUrl) iceServers.push({ urls: `stun:${stunUrl}` });
       if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
 
-      const api = new GstWebRTCAPI({
-        signalingServerUrl: sigUrl,
-        // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
-        webrtcConfig: { iceServers },
-      });
+      // Connection lifecycle state.  Each call to connectToTier() tears
+      // down the prior api / session and then opens a new one.  We track
+      // an "intentional teardown" flag so the 'closed' handler doesn't
+      // flash "Stream ended" during a tier switch — the user should only
+      // see that message when the producer actually disappears.
+      let currentApi      = null;
+      let currentSession  = null;
+      let currentTier     = null;
+      let switchingTier   = false;
+      // Exposed for functional tests: assert which tier the browser picked.
+      window._activeTier  = null;
 
-      api.registerProducersListener({
-        producerAdded(producer) {
-          setStatus(`Producer found (${producer.id}) — starting stream…`);
-
-          const session = api.createConsumerSession(producer.id);
-          if (!session) {
-            setStatus('Failed to create consumer session.', true);
-            return;
+      function teardownCurrent() {
+        switchingTier = true;
+        // gstwebrtc-api's ConsumerSession exposes `.close()` for an
+        // orderly teardown (matches the `closed` event we already listen
+        // for).  Guard with a typeof check so an older bundle that lacks
+        // it doesn't crash the page — we'll fall through to nulling the
+        // refs and the next session takes over.
+        try {
+          if (currentSession && typeof currentSession.close === 'function') {
+            currentSession.close();
           }
+        } catch (_) { /* best-effort */ }
+        currentSession = null;
+        currentApi     = null;
+        video.srcObject = null;
+      }
 
-          session.element = video;
+      function connectToTier(tier) {
+        if (currentTier && tier.sigUrl === currentTier.sigUrl) return;
+        teardownCurrent();
+        currentTier = tier;
+        window._activeTier = {
+          scale: tier.scale, width: tier.width, height: tier.height,
+          sigUrl: tier.sigUrl,
+        };
+        // Update the gumball's "at-target resolution" classifier so the
+        // active tier counts as 'at target' — not the source resolution.
+        _targetWidth  = tier.width;
+        _targetHeight = tier.height;
 
-          session.addEventListener('error', (e) => {
-            setStatus(`Stream error: ${e.message ?? e}`, true);
-          });
+        setStatus(`Connecting to ${tier.sigUrl} (scale ${tier.scale}) …`);
 
-          session.addEventListener('closed', () => {
-            setStatus('Stream ended.');
+        const api = new GstWebRTCAPI({
+          signalingServerUrl: tier.sigUrl,
+          // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
+          webrtcConfig: { iceServers },
+        });
+        currentApi = api;
+
+        api.registerProducersListener({
+          producerAdded(producer) {
+            // Stale events from an api that was torn down during a fast
+            // sequence of tier switches: ignore.
+            if (api !== currentApi) return;
+            setStatus(`Producer found (${producer.id}) — starting stream…`);
+
+            const session = api.createConsumerSession(producer.id);
+            if (!session) {
+              setStatus('Failed to create consumer session.', true);
+              return;
+            }
+            currentSession = session;
+            session.element = video;
+
+            session.addEventListener('error', (e) => {
+              setStatus(`Stream error: ${e.message ?? e}`, true);
+            });
+
+            session.addEventListener('closed', () => {
+              if (switchingTier) {
+                switchingTier = false;
+                return;
+              }
+              setStatus('Stream ended.');
+              video.srcObject = null;
+              stopMetrics();
+            });
+
+            const hideBanner = () => { status.className = 'hidden'; };
+            if (!video.paused && video.videoWidth > 0) {
+              hideBanner();
+              startMetrics();
+            } else {
+              video.addEventListener('playing', hideBanner, { once: true });
+              video.addEventListener('loadeddata', hideBanner, { once: true });
+              video.addEventListener('playing', startMetrics, { once: true });
+            }
+
+            session.connect();
+          },
+
+          producerRemoved(_producer) {
+            if (api !== currentApi) return;
+            if (switchingTier) return;
+            setStatus('Producer disconnected. Waiting for stream…');
             video.srcObject = null;
             stopMetrics();
-          });
+          },
+        });
 
-          const hideBanner = () => { status.className = 'hidden'; };
-          if (!video.paused && video.videoWidth > 0) {
-            hideBanner();
-            startMetrics();
-          } else {
-            video.addEventListener('playing', hideBanner, { once: true });
-            video.addEventListener('loadeddata', hideBanner, { once: true });
-            video.addEventListener('playing', startMetrics, { once: true });
-          }
+        // teardownCurrent() set switchingTier=true; clear it now that the
+        // new api is registered, so any *subsequent* unexpected close
+        // surfaces "Stream ended" to the user.
+        switchingTier = false;
+      }
 
-          session.connect();
-        },
+      // Pin a specific tier via ?tier=<index> (functional tests), or via
+      // ?signalling=… (single-entry tier list built by resolveStreamConfig).
+      let pinnedTier = null;
+      const tierParam = params.get('tier');
+      if (tierParam != null) {
+        const idx = Number.parseInt(tierParam, 10);
+        if (Number.isFinite(idx) && idx >= 0 && idx < tiers.length) {
+          pinnedTier = tiers[idx];
+        }
+      }
+      if (tiers.length === 1) pinnedTier = tiers[0];  // signalling override
 
-        producerRemoved(_producer) {
-          setStatus('Producer disconnected. Waiting for stream…');
-          video.srcObject = null;
-          stopMetrics();
-        },
-      });
+      const chosen = pinnedTier || pickTier(tiers, video);
+      connectToTier(chosen);
+
+      // Only auto-switch when no override pinned us to a specific tier.
+      if (!pinnedTier) {
+        // Debounce ResizeObserver: window drags fire dozens of events per
+        // second; we only want to act on the size the user lands on.
+        let resizeTimer = null;
+        const onResize = () => {
+          if (resizeTimer != null) clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(() => {
+            resizeTimer = null;
+            const next = pickTier(tiers, video);
+            if (currentTier && next.sigUrl !== currentTier.sigUrl) {
+              connectToTier(next);
+            }
+          }, 250);
+        };
+        new ResizeObserver(onResize).observe(document.getElementById('video-area'));
+      }
     })();
   </script>
 </body>
