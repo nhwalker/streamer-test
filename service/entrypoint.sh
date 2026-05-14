@@ -37,14 +37,19 @@ mkdir -p /run/desktop-stream
 python3 /usr/local/bin/desktop_config.py >/dev/null
 
 # Read back the screen list so the rest of the script can spin up one
-# signalling server per screen + the full-frame server.
+# signalling server per (stream × tier) pair.  Tiers come from
+# WEBRTC_SCALE_LADDER (see desktop_config.py); the default ladder produces
+# 4 tiers per stream.  Legacy callers that don't know about tiers still
+# work because tier 0 keeps the same port as the pre-ladder design.
 mapfile -t SIG_PORTS < <(python3 -c '
 import json
 with open("/run/desktop-stream/config.json") as fh:
     cfg = json.load(fh)
-print(cfg["fullSignallingPort"])
+for t in cfg.get("fullTiers") or [{"signallingPort": cfg["fullSignallingPort"]}]:
+    print(t["signallingPort"])
 for s in cfg["screens"]:
-    print(s["signallingPort"])
+    for t in s.get("tiers") or [{"signallingPort": s["signallingPort"]}]:
+        print(t["signallingPort"])
 ')
 
 # ── Signalling servers (one per configured stream) ───────────────────────────
@@ -100,6 +105,10 @@ for s in cfg["screens"]:
     print(f"│    {s['name']:<10s}: http://{host_ip}:{web_port}{s['path']}"
           f"  (ws :{s['signallingPort']})")
 print(f"│  Signalling / : ws://{host_ip}:{cfg['fullSignallingPort']}")
+# Tier count is the same for every stream; print it once.
+tier_count = len(cfg.get("fullTiers") or [None])
+if tier_count > 1:
+    print(f"│  Tiers/stream : {tier_count} (browser auto-picks by viewport)")
 PYEOF
 echo "│  Ingest    : X11 display ${DISPLAY}                  "
 echo "│  Archive   : ${ARCHIVE_DIR} (live: ${ARCHIVE_LIVE_DIR})"

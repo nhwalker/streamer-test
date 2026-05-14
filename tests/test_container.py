@@ -93,6 +93,7 @@ class TestServiceAvailability:
         assert r.status_code == 200
         cfg = r.json()
         assert cfg["desktopName"] == "stream"
+        # Legacy port fields still present, pointed at tier 0 (scale 1.0).
         assert cfg["fullSignallingPort"] == 8443
         names = [s["name"] for s in cfg["screens"]]
         assert names == ["top", "bottom"], (
@@ -100,6 +101,18 @@ class TestServiceAvailability:
         )
         ports = [s["signallingPort"] for s in cfg["screens"]]
         assert ports == [WS_PORT_TOP, WS_PORT_BOTTOM]
+        # Ladder fields: tier 0 mirrors the legacy port; subsequent tiers
+        # shift by SIGNALLING_PORT_STRIDE (default 100).  The default
+        # ladder has 4 tiers (1.0, 0.75, 0.5, 0.25).
+        full_tiers = cfg["fullTiers"]
+        assert len(full_tiers) == 4
+        assert [t["scale"] for t in full_tiers] == [1.0, 0.75, 0.5, 0.25]
+        assert full_tiers[0]["signallingPort"] == cfg["fullSignallingPort"]
+        assert [t["signallingPort"] for t in full_tiers] == [8443, 8543, 8643, 8743]
+        for s in cfg["screens"]:
+            assert "tiers" in s
+            assert len(s["tiers"]) == 4
+            assert s["tiers"][0]["signallingPort"] == s["signallingPort"]
 
     def test_top_endpoint_returns_200(self, streaming_container):
         http_port, _ = streaming_container

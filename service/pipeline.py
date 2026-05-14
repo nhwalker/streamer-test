@@ -14,13 +14,26 @@ in-progress fragment is readable mid-write), then remuxed to MP4 with
 `+faststart` and moved into ARCHIVE_DIR when the fragment rotates.  The
 remux is `ffmpeg -c copy` — no re-encoding — and runs on a single
 background worker so the GStreamer streaming thread is never blocked.
-            tee_webrtc. -> webrtcsink (full)                  (browser, per-peer encode)
-            tee_webrtc. -> videocrop (region 0) -> webrtcsink (screen 0)
-            tee_webrtc. -> videocrop (region 1) -> webrtcsink (screen 1)
+
+The WebRTC branch is a *ladder* of webrtcsinks per stream — one tier per
+entry in WEBRTC_SCALE_LADDER.  Each browser picks the smallest tier whose
+dimensions still match its rendered video element and connects to that
+tier's signalling port; webrtcsink only builds its per-consumer encoder
+when a consumer actually subscribes, so an idle tier costs zero encoder
+CPU.  The upstream `videoscale` runs continuously regardless — software
+videoscale on a desktop-resolution source is cheap (a few ms/frame per
+tier).
+
+            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 0)
+            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 1)
+            ...                                                                          (full,  tier N-1)
+            tee_webrtc. -> queue -> crop -> videoscale -> capsfilter(WxH) -> webrtcsink  (screen 0, tier 0)
+            tee_webrtc. -> queue -> crop -> videoscale -> capsfilter(WxH) -> webrtcsink  (screen 0, tier 1)
             ...
 
-The resolution and the list of per-screen regions come from
-desktop_config.load_config(); see desktop_config.py for the env-var contract.
+The resolution, the list of per-screen regions, and the per-tier widths,
+heights and signalling ports all come from desktop_config.load_config();
+see desktop_config.py for the env-var contract.
 
 Environment variables:
   DISPLAY                X11 display                              (:0)
@@ -261,10 +274,25 @@ def main():
              else ''))
     print(f'  Archive q cap     : {ARCHIVE_QUEUE_MAX_BYTES} bytes / '
           f'{ARCHIVE_QUEUE_MAX_SEC}s (leaky=downstream)')
-    print(f'  Signalling /      : ws://127.0.0.1:{full_sig_port}')
+    full_tiers_cfg = config.get('fullTiers', [])
+    if full_tiers_cfg:
+        print('  Signalling /      :')
+        for t in full_tiers_cfg:
+            print(f'    tier scale={t["scale"]:<5} ws://127.0.0.1:{t["signallingPort"]}'
+                  f'  {t["width"]}x{t["height"]}')
+    else:
+        print(f'  Signalling /      : ws://127.0.0.1:{full_sig_port}')
     for s in screens:
-        print(f'  Signalling {s["path"]:<7s}: ws://127.0.0.1:{s["signallingPort"]}'
-              f'  region {s["width"]}x{s["height"]}+{s["x"]}+{s["y"]}')
+        path = s['path']
+        if s.get('tiers'):
+            print(f'  Signalling {path:<7s}: '
+                  f'(region {s["width"]}x{s["height"]}+{s["x"]}+{s["y"]})')
+            for t in s['tiers']:
+                print(f'    tier scale={t["scale"]:<5} ws://127.0.0.1:{t["signallingPort"]}'
+                      f'  {t["width"]}x{t["height"]}')
+        else:
+            print(f'  Signalling {path:<7s}: ws://127.0.0.1:{s["signallingPort"]}'
+                  f'  region {s["width"]}x{s["height"]}+{s["x"]}+{s["y"]}')
     print(f'  WebRTC codecs     : {WEBRTC_VIDEO_CAPS}')
     if STUN:
         print(f'  STUN              : {STUN}')
@@ -302,20 +330,74 @@ def main():
     arch_h264 = make('h264parse',    'arch_h264')
     archive   = make('splitmuxsink', 'archive')
 
-    # ── Browser WebRTC branch: fan out to full / per-screen streams
+    # ── Browser WebRTC branch: fan out to full / per-screen streams ×
+    # per-tier sub-streams.  Each (stream, tier) pair gets its own:
+    #
+    #   queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
+    #
+    # The crop is only present for screen sub-streams (the full stream
+    # serves the whole frame).  We *duplicate* the crop per tier rather
+    # than sharing one crop with a downstream tee because each tier scales
+    # to different dimensions downstream; the crop runs in source
+    # coordinates and is metadata-only on the common path, so duplication
+    # is cheap.
+    #
+    # webrtcsink already lazily creates its per-consumer encoder, so tiers
+    # with no consumer pay zero encoder CPU.  The upstream videoscale runs
+    # continuously regardless — software videoscale on a desktop-resolution
+    # source is cheap (a few ms/frame per tier), but at high tier counts on
+    # CPU-bound hosts this can add up.  A future optimisation can gate the
+    # videoscale with a valve driven by webrtcsink's consumer-added /
+    # consumer-removed signals; we leave that out for now because in 0.13.3
+    # those hooks didn't reliably keep the pipeline in PLAYING.
     q_webrtc   = make('queue',       'q_webrtc')
     tee_webrtc = make('tee',         't_webrtc')
 
-    q_full     = make('queue',       'q_full')
-    ws_full    = make('webrtcsink',  'ws_full')
+    full_tiers = config.get('fullTiers') or [{
+        # Legacy callers without tier info get a single passthrough tier.
+        'scale': 1.0, 'width': width, 'height': height,
+        'signallingPort': full_sig_port,
+    }]
 
-    # One queue + videocrop + webrtcsink per configured screen.
-    screen_branches = []
-    for i, s in enumerate(screens):
-        q   = make('queue',      f'q_{s["name"]}')
-        vc  = make('videocrop',  f'crop_{s["name"]}')
-        wsk = make('webrtcsink', f'ws_{s["name"]}')
-        screen_branches.append((s, q, vc, wsk))
+    # Flat list of all webrtcsink-bearing branches.  Each entry is a dict
+    # so the downstream config/link loops can pull whichever pieces they
+    # need without juggling positional tuples.
+    webrtc_branches = []
+
+    def _build_tier_branch(stream_label, tier_idx, tier, screen_cfg=None):
+        suffix = f'{stream_label}_t{tier_idx}'
+        q     = make('queue',       f'q_{suffix}')
+        if screen_cfg is not None:
+            vc = make('videocrop',  f'crop_{suffix}')
+            vc.set_property('left',   screen_cfg['cropLeft'])
+            vc.set_property('top',    screen_cfg['cropTop'])
+            vc.set_property('right',  screen_cfg['cropRight'])
+            vc.set_property('bottom', screen_cfg['cropBottom'])
+        else:
+            vc = None
+        sc    = make('videoscale',  f'scale_{suffix}')
+        capsf = make('capsfilter',  f'capsf_{suffix}')
+        capsf.set_property('caps', Gst.Caps.from_string(
+            f'video/x-raw,width={tier["width"]},height={tier["height"]}'))
+        wsk   = make('webrtcsink',  f'ws_{suffix}')
+        webrtc_branches.append({
+            'label': suffix,
+            'queue': q, 'crop': vc,
+            'scale': sc, 'capsf': capsf, 'sink': wsk,
+            'port':  tier['signallingPort'],
+            'tier':  tier,
+            'screen_path': screen_cfg['path'] if screen_cfg else '/',
+        })
+
+    for tier_idx, tier in enumerate(full_tiers):
+        _build_tier_branch('full', tier_idx, tier, screen_cfg=None)
+    for s in screens:
+        # desktop_config emits per-screen tiers sized to the cropped
+        # region; we trust that list end-to-end.
+        for tier_idx, tier in enumerate(s.get('tiers') or [{
+                'scale': 1.0, 'width': s['width'], 'height': s['height'],
+                'signallingPort': s['signallingPort']}]):
+            _build_tier_branch(s['name'], tier_idx, tier, screen_cfg=s)
 
     # ── Configure ingress source
     xsrc      = make('ximagesrc',   'xsrc')
@@ -480,13 +562,6 @@ def main():
     print('[service] archive: using format-location-full (PTS-based timestamps)',
           flush=True)
 
-    # ── Configure videocrop per screen: trims are pre-computed by desktop_config.
-    for s, _q, vc, _wsk in screen_branches:
-        vc.set_property('left',   s['cropLeft'])
-        vc.set_property('top',    s['cropTop'])
-        vc.set_property('right',  s['cropRight'])
-        vc.set_property('bottom', s['cropBottom'])
-
     # ── Configure browser webrtcsink instances
     #
     # The min/start/max bitrate triple expands the window REMB is allowed to
@@ -496,9 +571,9 @@ def main():
     # lossless tiers when the network has the headroom.  The encoder will not
     # *spend* the ceiling on static content — it'll just sit at low QP and low
     # bitrate, and burst into the headroom when motion appears.
-    sinks = [(ws_full, full_sig_port)]
-    sinks.extend((wsk, s['signallingPort']) for s, _q, _vc, wsk in screen_branches)
-    for sink, port in sinks:
+    for branch in webrtc_branches:
+        sink = branch['sink']
+        port = branch['port']
         sink.get_property('signaller').set_property('uri', f'ws://127.0.0.1:{port}')
         sink.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
         sink.set_property('min-bitrate',   WEBRTC_MIN_BITRATE)
@@ -527,13 +602,15 @@ def main():
     tee.link(q_webrtc)
     q_webrtc.link(tee_webrtc)
 
-    tee_webrtc.link(q_full)
-    q_full.link(ws_full)
-
-    for _s, q, vc, wsk in screen_branches:
-        tee_webrtc.link(q)
-        q.link(vc)
-        vc.link(wsk)
+    for branch in webrtc_branches:
+        tee_webrtc.link(branch['queue'])
+        prev = branch['queue']
+        if branch['crop'] is not None:
+            prev.link(branch['crop'])
+            prev = branch['crop']
+        prev.link(branch['scale'])
+        branch['scale'].link(branch['capsf'])
+        branch['capsf'].link(branch['sink'])
 
     # ── TURN: injected per-webrtcbin instance when it is created
     if TURN:
