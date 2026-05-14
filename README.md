@@ -436,12 +436,11 @@ extra pixels get thrown away on the client. The `webrtcsink` ladder
 sends each viewer the smallest pre-scaled feed that still meets their
 display size, so a 540 px viewer pulls a 540 px stream and a fullscreen
 1080 px viewer pulls the full 1080 px feed. `webrtcsink` only constructs
-its per-consumer encoder when a consumer actually subscribes, and a
-`valve` upstream of the per-tier `videoscale` is closed until that
-moment, so tiers nobody is watching cost no encoder or scaler CPU. When
-the browser resizes across a tier boundary it closes its session and
-reopens against the new tier; this is a brief (~250 ms) reconnect, not
-a permanent latency hit.
+its per-consumer encoder when a consumer actually subscribes, so a tier
+nobody is watching costs zero encoder CPU. When the browser resizes
+across a tier boundary it closes its session and reopens against the
+new tier; this is a brief (~250 ms) reconnect, not a permanent latency
+hit.
 
 \* H.264 and H.265 use NVENC hardware encoding when a GPU is available (`--gpus all`). Without a GPU, H.264 falls back to software encoding via `gstreamer1-plugins-ugly` (x264), which is included in the runtime stage via RPM Fusion Free. H.265 WebRTC is supported in Chrome/Edge but not Firefox.
 

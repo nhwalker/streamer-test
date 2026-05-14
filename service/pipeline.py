@@ -20,14 +20,15 @@ entry in WEBRTC_SCALE_LADDER.  Each browser picks the smallest tier whose
 dimensions still match its rendered video element and connects to that
 tier's signalling port; webrtcsink only builds its per-consumer encoder
 when a consumer actually subscribes, so an idle tier costs zero encoder
-CPU.  A `valve` element gates each tier's upstream `videoscale` work, so
-the scale-down only runs while at least one consumer is connected.
+CPU.  The upstream `videoscale` runs continuously regardless — software
+videoscale on a desktop-resolution source is cheap (a few ms/frame per
+tier).
 
-            tee_webrtc. -> queue -> valve -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 0)
-            tee_webrtc. -> queue -> valve -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 1)
-            ...                                                                                  (full,  tier N-1)
-            tee_webrtc. -> queue -> crop -> valve -> videoscale -> capsfilter(WxH) -> webrtcsink (screen 0, tier 0)
-            tee_webrtc. -> queue -> crop -> valve -> videoscale -> capsfilter(WxH) -> webrtcsink (screen 0, tier 1)
+            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 0)
+            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 1)
+            ...                                                                          (full,  tier N-1)
+            tee_webrtc. -> queue -> crop -> videoscale -> capsfilter(WxH) -> webrtcsink  (screen 0, tier 0)
+            tee_webrtc. -> queue -> crop -> videoscale -> capsfilter(WxH) -> webrtcsink  (screen 0, tier 1)
             ...
 
 The resolution, the list of per-screen regions, and the per-tier widths,
@@ -332,15 +333,23 @@ def main():
     # ── Browser WebRTC branch: fan out to full / per-screen streams ×
     # per-tier sub-streams.  Each (stream, tier) pair gets its own:
     #
-    #   queue → [videocrop] → valve → videoscale → capsfilter(W,H) → webrtcsink
+    #   queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
     #
     # The crop is only present for screen sub-streams (the full stream
     # serves the whole frame).  We *duplicate* the crop per tier rather
-    # than sharing one crop with a downstream tee because a shared crop
-    # would sit upstream of every tier's valve, so it would keep running
-    # even when no consumer was watching that screen at any tier — the
-    # valve only gates work *below* it.  videocrop is metadata-only on the
-    # common path, so duplication is cheap.
+    # than sharing one crop with a downstream tee because each tier scales
+    # to different dimensions downstream; the crop runs in source
+    # coordinates and is metadata-only on the common path, so duplication
+    # is cheap.
+    #
+    # webrtcsink already lazily creates its per-consumer encoder, so tiers
+    # with no consumer pay zero encoder CPU.  The upstream videoscale runs
+    # continuously regardless — software videoscale on a desktop-resolution
+    # source is cheap (a few ms/frame per tier), but at high tier counts on
+    # CPU-bound hosts this can add up.  A future optimisation can gate the
+    # videoscale with a valve driven by webrtcsink's consumer-added /
+    # consumer-removed signals; we leave that out for now because in 0.13.3
+    # those hooks didn't reliably keep the pipeline in PLAYING.
     q_webrtc   = make('queue',       'q_webrtc')
     tee_webrtc = make('tee',         't_webrtc')
 
@@ -366,12 +375,6 @@ def main():
             vc.set_property('bottom', screen_cfg['cropBottom'])
         else:
             vc = None
-        # Valve starts closed (drop=true).  We open it when webrtcsink
-        # reports a consumer joined, and close it again when the last one
-        # leaves.  This saves the per-pixel videoscale CPU on tiers nobody
-        # is watching while keeping the pipeline in PLAYING state.
-        valve = make('valve',       f'valve_{suffix}')
-        valve.set_property('drop', True)
         sc    = make('videoscale',  f'scale_{suffix}')
         capsf = make('capsfilter',  f'capsf_{suffix}')
         capsf.set_property('caps', Gst.Caps.from_string(
@@ -379,7 +382,7 @@ def main():
         wsk   = make('webrtcsink',  f'ws_{suffix}')
         webrtc_branches.append({
             'label': suffix,
-            'queue': q, 'crop': vc, 'valve': valve,
+            'queue': q, 'crop': vc,
             'scale': sc, 'capsf': capsf, 'sink': wsk,
             'port':  tier['signallingPort'],
             'tier':  tier,
@@ -568,18 +571,9 @@ def main():
     # lossless tiers when the network has the headroom.  The encoder will not
     # *spend* the ceiling on static content — it'll just sit at low QP and low
     # bitrate, and burst into the headroom when motion appears.
-    #
-    # We also hook each sink's consumer-added/consumer-removed signals to
-    # drive the tier's upstream valve: when the per-tier consumer count
-    # transitions 0→1 we open the valve, and on 1→0 we close it again.
-    # This keeps the per-tier videoscale idle when nobody is watching that
-    # tier.
     for branch in webrtc_branches:
-        sink  = branch['sink']
-        port  = branch['port']
-        valve = branch['valve']
-        label = branch['label']
-
+        sink = branch['sink']
+        port = branch['port']
         sink.get_property('signaller').set_property('uri', f'ws://127.0.0.1:{port}')
         sink.set_property('video-caps', Gst.Caps.from_string(WEBRTC_VIDEO_CAPS))
         sink.set_property('min-bitrate',   WEBRTC_MIN_BITRATE)
@@ -588,29 +582,6 @@ def main():
         sink.connect('encoder-setup', _on_encoder_setup)
         if STUN:
             sink.set_property('stun-server', STUN)
-
-        # Closure over the per-branch valve + a small counter dict that
-        # both handlers mutate.  Using a dict (instead of `nonlocal`) keeps
-        # the handlers signature-flexible against future webrtcsink signal
-        # signature drift — we accept *args and ignore everything past the
-        # sink itself.
-        state = {'count': 0, 'valve': valve, 'label': label}
-
-        def _on_consumer_added(_sink, *_args, _s=state):
-            _s['count'] += 1
-            _s['valve'].set_property('drop', False)
-            print(f'[service] {_s["label"]}: consumer joined '
-                  f'(active={_s["count"]})', flush=True)
-
-        def _on_consumer_removed(_sink, *_args, _s=state):
-            _s['count'] = max(0, _s['count'] - 1)
-            if _s['count'] == 0:
-                _s['valve'].set_property('drop', True)
-            print(f'[service] {_s["label"]}: consumer left '
-                  f'(active={_s["count"]})', flush=True)
-
-        sink.connect('consumer-added',   _on_consumer_added)
-        sink.connect('consumer-removed', _on_consumer_removed)
 
     # ── Static links: vconvert -> tee -> archive + webrtc branches
     vconvert.link(tee)  # host mode: xsrc→vrate→vscale→vconvert already linked above
@@ -637,8 +608,7 @@ def main():
         if branch['crop'] is not None:
             prev.link(branch['crop'])
             prev = branch['crop']
-        prev.link(branch['valve'])
-        branch['valve'].link(branch['scale'])
+        prev.link(branch['scale'])
         branch['scale'].link(branch['capsf'])
         branch['capsf'].link(branch['sink'])
 

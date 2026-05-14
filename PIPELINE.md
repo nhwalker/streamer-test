@@ -21,9 +21,9 @@ that serves the archive download and video-assembly endpoints.
 │                                                       │    rotation, faststart)│
 │                                                       └─ q_webrtc → tee_webrtc │
 │                                                                  ├─ × N tiers of  full-stream branches  │
-│                                                                  │   (queue → valve → videoscale → capsfilter → webrtcsink) │
+│                                                                  │   (queue → videoscale → capsfilter → webrtcsink) │
 │                                                                  └─ × N tiers of  per-screen   branches │
-│                                                                      (queue → videocrop → valve → videoscale → capsfilter → webrtcsink) │
+│                                                                      (queue → videocrop → videoscale → capsfilter → webrtcsink) │
 │                                                                          │
 │  gst-webrtc-signalling-server: one per (stream, tier) pair               │
 │      default ports: 8443/8543/8643/8743 (full × 4 tiers)                 │
@@ -62,7 +62,7 @@ sequenceDiagram
     Browser->>SvcSig: SDP Answer (selects codec)
     SvcSig-->>Browser: ICE candidates
     Browser->>SvcSig: ICE candidates
-    note over SvcPipe,Browser: webrtcsink fires consumer-added → its tier's valve opens
+    note over SvcPipe,Browser: webrtcsink lazily constructs its per-consumer encoder
     SvcPipe-->>Browser: Encoded video SRTP/RTP stream (UDP)
     Browser->>Browser: RTCPeerConnection decodes → <video> element
     Browser->>SvcSig: RTCP REMB (bandwidth estimate)
@@ -72,7 +72,6 @@ sequenceDiagram
     Browser->>Browser: ResizeObserver fires (debounced 250 ms)
     Browser->>Browser: pickTier() returns a different tier
     Browser->>SvcSig: close old session, open new one on new tier's port
-    SvcPipe-->>SvcPipe: consumer-removed on old tier → valve closes
     SvcPipe-->>Browser: New session on the new tier
 ```
 
@@ -95,8 +94,8 @@ ximagesrc display-name=:0 use-damage=false
       t. ! queue ! encoder ! h264parse ! splitmuxsink (archive)
       t. ! queue ! tee name=t_webrtc
           (per WEBRTC_SCALE_LADDER tier, per stream:)
-          t_webrtc. ! queue !            valve ! videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
-          t_webrtc. ! queue ! videocrop ! valve ! videoscale ! capsfilter(W,H) ! webrtcsink  (screen, tier i)
+          t_webrtc. ! queue !            videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
+          t_webrtc. ! queue ! videocrop ! videoscale ! capsfilter(W,H) ! webrtcsink  (screen, tier i)
 ```
 
 ### `ximagesrc`
@@ -436,14 +435,13 @@ match the size it's actually rendering the `<video>` element at.
 Every (stream, tier) pair shares the same shape:
 
 ```
-tee_webrtc → queue → [videocrop] → valve → videoscale → capsfilter(W,H) → webrtcsink
+tee_webrtc → queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
 ```
 
 | Element | Property | Value | Purpose |
 |---|---|---|---|
 | `q_<stream>_t<i>` | — | — | Isolate this branch from sibling branches |
-| `crop_<screen>_t<i>` (screens only) | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region; *duplicated per tier* so the upstream valve gates per-tier work cleanly |
-| `valve_<stream>_t<i>` | `drop` | `true` until first consumer joins | Stop the per-pixel `videoscale` work below when no consumer is watching this tier |
+| `crop_<screen>_t<i>` (screens only) | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region; *duplicated per tier* so each tier's downstream scale runs on the same crop result |
 | `scale_<stream>_t<i>` | — | — | Software downscale to the tier's dimensions |
 | `capsf_<stream>_t<i>` | `caps` | `video/x-raw,width=W,height=H` | Pin output dimensions (computed from the source size × tier scale, rounded to even pixels for YUV 4:2:0) |
 | `ws_<stream>_t<i>` | `signaller.uri` | `ws://127.0.0.1:PORT` | Tier-specific signalling endpoint |
@@ -456,17 +454,17 @@ scale the cropped output. Both VP9 and H.264 are offered because VP9
 delivers better quality at lower bitrates while H.264 has broader hardware
 decode support; the browser picks.
 
-#### Valve gating
+#### Per-tier CPU cost
 
-Each `webrtcsink` emits `consumer-added` / `consumer-removed` signals
-when a browser joins or leaves. `pipeline.py` keeps a per-branch consumer
-counter and flips the tier's `valve.drop` between `true` (count == 0)
-and `false` (count > 0). This stops the upstream `videoscale` from
-spending CPU on tiers that nobody is watching — the queue ahead of the
-valve still receives buffers from `tee_webrtc`, but the valve drops them
-so the scale-down never runs. `webrtcsink` itself lazily constructs its
-per-consumer encoder, so the encoder cost is already zero when no one is
-subscribed; the valve covers the upstream pixel work.
+`webrtcsink` lazily constructs its per-consumer encoder, so a tier with
+no consumers pays zero encoder CPU. The upstream `videoscale` runs
+continuously regardless — software videoscale of a desktop-resolution
+source is cheap (~a few ms/frame per tier), but at high tier counts on
+CPU-bound hosts it adds up. A future optimisation can gate the
+`videoscale` with a `valve` driven by webrtcsink's `consumer-added` /
+`consumer-removed` signals; this is intentionally not done today because
+gating with `valve.drop=true` before the first consumer prevents the
+pipeline from reaching PLAYING in `gst-plugins-rs` 0.13.3.
 
 #### Port allocation
 
