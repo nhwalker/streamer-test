@@ -55,6 +55,12 @@ Environment variables:
                          100000 = 100 Mbps.                          (100000)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps; used only by
                          ARCHIVE_QUALITY=legacy.                       (6000)
+  ARCHIVE_GOP_SIZE       maximum keyframe interval (in frames) for the
+                         archive H.264 encoder.  Smaller values bound the
+                         seek/recovery interval at the cost of compression
+                         efficiency; larger values trade interactive
+                         seeking for smaller files.  Applied as `gop-size`
+                         on nvh264enc and `key-int-max` on x264enc.    (30)
   ARCHIVE_QUEUE_MAX_BYTES bytes of raw video the q_arch queue may buffer
                          before dropping oldest frames.  At 1080p30 YUV420
                          (~93 MB/s) the default absorbs ~5.5s of encoder
@@ -68,6 +74,24 @@ Environment variables:
                          exceeds this many bytes; 0 = unlimited          (0)
   ARCHIVE_MAX_AGE_DAYS   delete segments older than this many days;
                          0 = unlimited                                    (0)
+
+  WEBRTC_MIN_BITRATE     bps floor REMB may drive the per-peer encoder
+                         to.                                        (500000)
+  WEBRTC_START_BITRATE   bps the per-peer encoder starts at before REMB
+                         converges.                               (10000000)
+  WEBRTC_MAX_BITRATE     bps ceiling REMB may drive the per-peer encoder
+                         to.                                      (80000000)
+  WEBRTC_KEY_INT_MAX     max keyframe interval in frames for the per-peer
+                         encoder.  Smaller values shorten startup and
+                         speed up recovery from packet loss at the cost
+                         of bandwidth.  0 = leave encoder default.    (0)
+  WEBRTC_BFRAMES         number of B-frames the per-peer encoder may
+                         produce.  0 = lowest latency (no reordering).
+                         -1 = leave encoder default.                 (-1)
+  WEBRTC_TUNE_LATENCY    'low-latency' to force zerolatency / low-latency
+                         preset / no lookahead on the per-peer encoder
+                         (interactive feel over per-bit quality), or
+                         'auto' to leave webrtcsink's defaults.    (auto)
 
   GST_WEBRTC_STUN_SERVER optional STUN URI                        ("")
   GST_WEBRTC_TURN_SERVER optional TURN URI                        ("")
@@ -103,6 +127,7 @@ ARCHIVE_QUALITY         = os.environ.get('ARCHIVE_QUALITY', 'visually-lossless')
 ARCHIVE_QP              = int(os.environ.get('ARCHIVE_QP', '18'))
 ARCHIVE_BITRATE_CAP     = int(os.environ.get('ARCHIVE_BITRATE_CAP', '100000'))   # kbps
 ARCHIVE_BITRATE         = int(os.environ.get('ARCHIVE_BITRATE', '6000'))         # kbps, legacy mode
+ARCHIVE_GOP_SIZE        = int(os.environ.get('ARCHIVE_GOP_SIZE', '30'))           # frames between keyframes
 ARCHIVE_QUEUE_MAX_BYTES = int(os.environ.get('ARCHIVE_QUEUE_MAX_BYTES', str(512 * 1024 * 1024)))
 ARCHIVE_QUEUE_MAX_SEC   = int(os.environ.get('ARCHIVE_QUEUE_MAX_SEC',   '5'))
 ARCHIVE_MAX_BYTES       = int(os.environ.get('ARCHIVE_MAX_BYTES', '0'))
@@ -120,6 +145,29 @@ TURN                  = os.environ.get('GST_WEBRTC_TURN_SERVER', '')
 WEBRTC_MIN_BITRATE   = int(os.environ.get('WEBRTC_MIN_BITRATE',   '500000'))    #   0.5 Mbps
 WEBRTC_START_BITRATE = int(os.environ.get('WEBRTC_START_BITRATE', '10000000'))  #  10   Mbps
 WEBRTC_MAX_BITRATE   = int(os.environ.get('WEBRTC_MAX_BITRATE',   '80000000'))  #  80   Mbps
+
+# Per-peer encoder tuning knobs.  All are opt-in: when left at their default
+# sentinels we do not touch the encoder property, preserving webrtcsink's
+# defaults.  Applied via the encoder-setup signal in _on_encoder_setup.
+#
+#   WEBRTC_KEY_INT_MAX       max keyframe interval in frames.  Smaller values
+#                            speed up recovery from packet loss and shorten
+#                            stream startup at the cost of bandwidth (each
+#                            keyframe is large).  0 = leave encoder default.
+#   WEBRTC_BFRAMES           number of B-frames the per-peer encoder may
+#                            produce.  0 = lowest latency (no reordering);
+#                            higher values improve compression at the cost
+#                            of frame-reorder delay.  -1 = leave default.
+#   WEBRTC_TUNE_LATENCY      'low-latency'  force tune=zerolatency / low-
+#                                           latency-hq preset / no lookahead
+#                                           on the per-peer encoder.  Use
+#                                           when interactive feel matters
+#                                           more than per-bit quality.
+#                            'auto' (default) leave webrtcsink's preset/tune
+#                                           alone and let it pick.
+WEBRTC_KEY_INT_MAX      = int(os.environ.get('WEBRTC_KEY_INT_MAX', '0'))
+WEBRTC_BFRAMES          = int(os.environ.get('WEBRTC_BFRAMES',     '-1'))
+WEBRTC_TUNE_LATENCY     = os.environ.get('WEBRTC_TUNE_LATENCY', 'auto').strip().lower()
 
 WEBRTC_VIDEO_CAPS     = 'video/x-vp9;video/x-h264'
 
@@ -139,18 +187,26 @@ def _set_if_present(element, name, value):
 
 
 def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
-    """Allow the per-peer encoder to reach lossless / near-lossless quality.
+    """Configure the per-peer encoder for the requested quality / latency mix.
 
     `webrtcsink` instantiates a fresh encoder per consumer and emits this
-    signal so we can override its defaults.  All we do here is widen the QP
-    floor down to 0 — without that, x264enc's default `qp-min=10` mathematically
-    forbids true lossless output even when REMB tells the encoder it has the
-    bandwidth to spend.  Latency-affecting properties (preset, tune, lookahead)
-    are deliberately left at webrtcsink's defaults so this stays a quality
-    change, not a latency change.
+    signal so we can override its defaults.  We always widen the QP floor
+    down to 0 — without that, x264enc's default `qp-min=10` mathematically
+    forbids true lossless output even when REMB tells the encoder it has
+    the bandwidth to spend.
+
+    The remaining knobs (`WEBRTC_KEY_INT_MAX`, `WEBRTC_BFRAMES`,
+    `WEBRTC_TUNE_LATENCY`) are opt-in latency / quality controls.  When
+    left at their defaults we don't touch the corresponding properties,
+    keeping webrtcsink's defaults in place.  `_set_if_present` silently
+    skips properties the encoder build doesn't expose, so we list every
+    plausible spelling rather than branching per encoder version.
     """
     factory = encoder.get_factory()
     name    = factory.get_name() if factory else '<unknown>'
+
+    # ── Quality floor: always widen QP so the encoder *can* spend bandwidth
+    #    when REMB grants it.
     if name in ('x264enc', 'nvh264enc'):
         # H.264 QP scale is 0–51.
         _set_if_present(encoder, 'qp-min', 0)
@@ -166,8 +222,48 @@ def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
         _set_if_present(encoder, 'max-quantizer', 255)
         _set_if_present(encoder, 'min-qp', 0)
         _set_if_present(encoder, 'max-qp', 255)
-    print(f'[service] encoder-setup: tuned {name} for lossless QP floor',
-          flush=True)
+
+    # ── Optional: force a fixed keyframe interval.
+    if WEBRTC_KEY_INT_MAX > 0:
+        # x264enc spells it `key-int-max`; nvh264enc / NVENC variants spell
+        # it `gop-size`; libvpx / AV1 builds spell it `keyframe-max-dist`
+        # (and a few use `kf-max-dist`).  Probe all of them.
+        _set_if_present(encoder, 'key-int-max',       WEBRTC_KEY_INT_MAX)
+        _set_if_present(encoder, 'gop-size',          WEBRTC_KEY_INT_MAX)
+        _set_if_present(encoder, 'keyframe-max-dist', WEBRTC_KEY_INT_MAX)
+        _set_if_present(encoder, 'kf-max-dist',       WEBRTC_KEY_INT_MAX)
+
+    # ── Optional: control B-frame usage (frame-reorder latency).
+    if WEBRTC_BFRAMES >= 0:
+        _set_if_present(encoder, 'b-frames', WEBRTC_BFRAMES)
+        _set_if_present(encoder, 'bframes',  WEBRTC_BFRAMES)
+
+    # ── Optional: switch the encoder to its lowest-latency tuning profile.
+    if WEBRTC_TUNE_LATENCY == 'low-latency':
+        if name == 'x264enc':
+            _set_if_present(encoder, 'tune',         0x4)  # zerolatency
+            _set_if_present(encoder, 'speed-preset', 1)    # ultrafast
+        elif name == 'nvh264enc':
+            _set_if_present(encoder, 'preset',       'low-latency-hq')
+            _set_if_present(encoder, 'rc-lookahead', 0)
+            _set_if_present(encoder, 'zerolatency',  True)
+        elif name in ('vp8enc', 'vp9enc'):
+            # libvpx zero-latency: realtime deadline + no frame lookahead.
+            _set_if_present(encoder, 'deadline',     1)    # realtime
+            _set_if_present(encoder, 'lag-in-frames', 0)
+            _set_if_present(encoder, 'cpu-used',     8)    # fastest profile
+        elif name in ('av1enc', 'rav1enc', 'svtav1enc', 'aomenc'):
+            _set_if_present(encoder, 'lag-in-frames', 0)
+            _set_if_present(encoder, 'low-latency',  True)
+            _set_if_present(encoder, 'preset',       11)   # SVT-AV1 fastest
+
+    print(
+        f'[service] encoder-setup: tuned {name} '
+        f'(qp-floor=0, key-int-max={WEBRTC_KEY_INT_MAX or "default"}, '
+        f'bframes={WEBRTC_BFRAMES if WEBRTC_BFRAMES >= 0 else "default"}, '
+        f'tune={WEBRTC_TUNE_LATENCY})',
+        flush=True,
+    )
     # Returning False tells webrtcsink we did not replace the encoder, only
     # adjusted its properties — webrtcsink keeps managing rate control.
     return False
@@ -209,6 +305,7 @@ def build_archive_encoder():
     plan = archive_encoder_plan(
         quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP,
         bitrate_cap=ARCHIVE_BITRATE_CAP, bitrate_legacy=ARCHIVE_BITRATE,
+        gop_size=ARCHIVE_GOP_SIZE,
     )
     for factory_name, props in plan:
         if not Gst.ElementFactory.find(factory_name):
@@ -259,8 +356,15 @@ def main():
           + (f' (QP={ARCHIVE_QP})' if ARCHIVE_QUALITY == 'visually-lossless'
              else f' (legacy bitrate={ARCHIVE_BITRATE}kbps)' if ARCHIVE_QUALITY == 'legacy'
              else ''))
+    print(f'  Archive GOP size  : {ARCHIVE_GOP_SIZE} frames')
     print(f'  Archive q cap     : {ARCHIVE_QUEUE_MAX_BYTES} bytes / '
           f'{ARCHIVE_QUEUE_MAX_SEC}s (leaky=downstream)')
+    print(f'  WebRTC bitrate    : min={WEBRTC_MIN_BITRATE} '
+          f'start={WEBRTC_START_BITRATE} max={WEBRTC_MAX_BITRATE}')
+    print(f'  WebRTC tune       : key-int-max='
+          f'{WEBRTC_KEY_INT_MAX or "default"} '
+          f'bframes={WEBRTC_BFRAMES if WEBRTC_BFRAMES >= 0 else "default"} '
+          f'latency={WEBRTC_TUNE_LATENCY}')
     print(f'  Signalling /      : ws://127.0.0.1:{full_sig_port}')
     for s in screens:
         print(f'  Signalling {s["path"]:<7s}: ws://127.0.0.1:{s["signallingPort"]}'

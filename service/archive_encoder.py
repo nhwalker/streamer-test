@@ -24,13 +24,18 @@ VALID_ARCHIVE_QUALITIES = ('visually-lossless', 'lossless', 'legacy')
 
 
 def archive_encoder_plan(quality='visually-lossless', qp=18,
-                         bitrate_cap=100000, bitrate_legacy=6000):
+                         bitrate_cap=100000, bitrate_legacy=6000,
+                         gop_size=30):
     """Return ordered [(factory_name, properties_dict), ...] preference list.
 
     The first entry whose factory exists at runtime wins.  Unknown properties
     on a particular encoder build are skipped at apply time, so we list every
     plausible property name (for example both `qp-const` and `qp-const-i/p/b`
     on nvh264enc) and let the runtime probe sort it out.
+
+    `gop_size` controls the maximum keyframe interval in frames — applied as
+    `gop-size` on nvh264enc and `key-int-max` on x264enc.  Smaller values
+    bound the seek/recovery interval at the cost of compression efficiency.
 
     Latency tunings (`tune=zerolatency`, `preset=low-latency-hq`) are
     deliberately absent from the new modes — viewers see the screen via the
@@ -49,13 +54,13 @@ def archive_encoder_plan(quality='visually-lossless', qp=18,
                 'rc-mode':     'vbr-hq',
                 'bitrate':     bitrate_legacy,
                 'max-bitrate': bitrate_legacy,
-                'gop-size':    30,
+                'gop-size':    gop_size,
             }),
             ('x264enc', {
                 'tune':         0x4,    # zerolatency
                 'speed-preset': 1,      # ultrafast
                 'bitrate':      bitrate_legacy,
-                'key-int-max':  30,
+                'key-int-max':  gop_size,
             }),
         ]
 
@@ -75,7 +80,7 @@ def archive_encoder_plan(quality='visually-lossless', qp=18,
                 'qp-const-i':  0,
                 'qp-const-p':  0,
                 'qp-const-b':  0,
-                'gop-size':    30,
+                'gop-size':    gop_size,
             }),
             ('x264enc', {
                 'tune':         0x4,    # zerolatency (match legacy CPU profile)
@@ -84,7 +89,7 @@ def archive_encoder_plan(quality='visually-lossless', qp=18,
                 'quantizer':    0,
                 'qp-min':       0,      # required for true QP=0 lossless
                 'qp-max':       0,
-                'key-int-max':  30,
+                'key-int-max':  gop_size,
             }),
         ]
 
@@ -102,7 +107,7 @@ def archive_encoder_plan(quality='visually-lossless', qp=18,
             'qp-const-i':  qp,
             'qp-const-p':  qp,
             'qp-const-b':  qp,
-            'gop-size':    30,
+            'gop-size':    gop_size,
             'max-bitrate': bitrate_cap,
         }),
         ('x264enc', {
@@ -110,6 +115,6 @@ def archive_encoder_plan(quality='visually-lossless', qp=18,
             'speed-preset': 1,          # ultrafast (match legacy CPU profile)
             'pass':         4,          # 4 = quant (constant quantizer at QP)
             'quantizer':    qp,
-            'key-int-max':  30,
+            'key-int-max':  gop_size,
         }),
     ]
