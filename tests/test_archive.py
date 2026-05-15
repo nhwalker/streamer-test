@@ -38,19 +38,17 @@ class TestArchive:
         The live (in-progress) segment starts with `ftyp` at offset 4.
 
         mp4mux in fragmented-streamable mode writes `ftyp + moov(empty) +
-        moof+mdat ...` from the first buffer onward, so the file is
-        readable as soon as the first fragment is flushed — no need to
-        wait for the segment boundary to rotate.  This is what lets
-        /archive include the active segment mid-recording without any
-        remux step.
+        moof+mdat ...` once the first encoded buffer reaches the muxer.
+        The header itself is small (~600 bytes), but on a CI host where
+        15+ webrtcsink encoders are spinning up in parallel the archive
+        encoder's first buffer can take 10–15 s to land on the muxer's
+        sink pad.  The deadline here is generous on purpose — it's
+        bounded by encoder startup time, not by mp4mux: once the first
+        buffer arrives, the ftyp+moov pair is on disk in milliseconds.
         """
         first = first_segment
 
-        # Allow up to 10 s for the ftyp+moov prelude to land on disk.
-        # mp4mux flushes it within milliseconds of the first buffer
-        # arriving, well before the first keyframe propagates through
-        # the rest of the pipeline.
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 30.0
         header = b""
         while time.monotonic() < deadline:
             try:
@@ -76,11 +74,17 @@ class TestArchive:
         The first segment grows past the ftyp+moov prelude size.
         A fresh mp4mux file that never got any real frame data is
         under ~1 KB (just ftyp + empty moov boxes).  Real streamed
-        content hits tens of KB within a second or two at 1280x720.
+        content hits tens of KB once the first fragment's worth of
+        frames has been muxed.
+
+        The 30 s deadline matches the magic-bytes test — the bottleneck
+        is encoder startup under CI contention, not muxer fragment
+        cadence.  Once the first fragment lands, subsequent ones come
+        at ~30 frames/s.
         """
         first = first_segment
 
-        deadline = time.monotonic() + 15.0
+        deadline = time.monotonic() + 30.0
         size = 0
         while time.monotonic() < deadline:
             size = os.path.getsize(first)
@@ -89,7 +93,7 @@ class TestArchive:
             time.sleep(0.5)
 
         assert size > 10_000, (
-            f"Archive segment {first} only {size} bytes after 15 s — "
+            f"Archive segment {first} only {size} bytes after 30 s — "
             "looks like no real video frames were written."
         )
 
