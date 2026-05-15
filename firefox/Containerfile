@@ -1,0 +1,148 @@
+# ─── Firefox WebRTC client (RHEL 9 + NVIDIA NVDEC via VAAPI) ─────────────────
+# Designed to be launched under the NVIDIA Container Toolkit:
+#   podman run --rm --device nvidia.com/gpu=all \
+#              -e NVIDIA_DRIVER_CAPABILITIES=compute,video,graphics,utility \
+#              firefox-webrtc:latest
+#
+# What's wired up:
+#   • Firefox ESR (from Rocky 9 AppStream)
+#   • libva + nvidia-vaapi-driver  → routes VAAPI calls to NVDEC (HW H264 decode)
+#   • ffmpeg-libs                  → Firefox's RDD decoder for <video> & WebRTC H264
+#   • mesa libEGL/libGL stubs      → required by Firefox's GPU process; the real
+#                                    NVIDIA libs are bind-mounted by the toolkit
+#   • Xvfb + dbus-x11 + pulseaudio → minimal session so the browser actually runs
+#   • firefox.cfg autoconfig       → forces EGL + dmabuf + HW H264 prefs at boot
+#
+# OpenH264 GMP plugin (used by WebRTC H264 encode side) is auto-downloaded by
+# Firefox from Cisco's CDN on first launch; no system package on EL9.
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+# ── Repos: Rocky 9 supplement + EPEL 9 + RPM Fusion (free + nonfree) ─────────
+# Rocky 9 is needed for `firefox` and the X/audio stack (UBI9 alone doesn't
+# carry these). RPM Fusion nonfree provides `nvidia-vaapi-driver`; free
+# provides full `ffmpeg-libs` with H264.
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
+    && printf '%s\n' \
+        '[rocky9-baseos]' \
+        'name=Rocky Linux 9 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
+        'priority=100' \
+        '' \
+        '[rocky9-appstream]' \
+        'name=Rocky Linux 9 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
+        'priority=100' \
+        '' \
+        '[rocky9-crb]' \
+        'name=Rocky Linux 9 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky9-supplement.repo \
+    && dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm \
+        https://mirrors.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-9.noarch.rpm \
+    && dnf clean all
+
+# ── Runtime packages ─────────────────────────────────────────────────────────
+# `nvidia-vaapi-driver` installs to /usr/lib64/dri/nvidia_drv_video.so and is
+# picked up via LIBVA_DRIVER_NAME=nvidia. It dlopen's libcuda.so.1 / libnvcuvid.so.1
+# which are NOT in this image — they come from the host via the NVIDIA Container
+# Toolkit (hence the `compute,video,graphics` driver capabilities at runtime).
+#
+# `ffmpeg-libs` is what Firefox's RDD process (`media.rdd-ffmpeg.enabled`) loads
+# for H264 decode; without it Firefox falls back to OpenH264 GMP (software).
+RUN dnf install -y \
+        --setopt=install_weak_deps=False \
+        --setopt=tsflags=nodocs \
+        firefox \
+        libva \
+        libva-utils \
+        nvidia-vaapi-driver \
+        ffmpeg-libs \
+        mesa-libGL \
+        mesa-libEGL \
+        mesa-dri-drivers \
+        mesa-vulkan-drivers \
+        libglvnd-glx \
+        libglvnd-egl \
+        libdrm \
+        xorg-x11-server-Xvfb \
+        xorg-x11-xauth \
+        xorg-x11-utils \
+        dbus-x11 \
+        pulseaudio \
+        pulseaudio-utils \
+        alsa-plugins-pulseaudio \
+        liberation-fonts \
+        dejavu-sans-fonts \
+        procps-ng \
+        which \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* \
+              /usr/share/doc /usr/share/man /usr/share/info
+
+# ── glvnd / EGL ICD wiring ───────────────────────────────────────────────────
+# The NVIDIA Container Toolkit mounts /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+# from the host. We don't ship it ourselves. Forcing the loader name here is
+# belt-and-braces in case __GLX_VENDOR_LIBRARY_NAME isn't inherited.
+ENV __GLX_VENDOR_LIBRARY_NAME=nvidia \
+    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+# ── Firefox global autoconfig (HW accel prefs locked at startup) ─────────────
+# Firefox loads /usr/lib64/firefox/defaults/pref/autoconfig.js BEFORE the user
+# profile, which in turn points to /usr/lib64/firefox/firefox.cfg. That's the
+# only way to ship "system defaults" that survive a fresh -p profile.
+COPY autoconfig.js  /usr/lib64/firefox/defaults/pref/autoconfig.js
+COPY firefox.cfg    /usr/lib64/firefox/firefox.cfg
+COPY policies.json  /usr/lib64/firefox/distribution/policies.json
+
+# ── Environment defaults for HW-accelerated WebRTC ───────────────────────────
+# LIBVA_DRIVER_NAME=nvidia    → tells libva to load nvidia_drv_video.so
+# NVD_BACKEND=direct          → nvidia-vaapi-driver: skip EGL surface, use direct CUDA
+# MOZ_X11_EGL=1               → Firefox uses EGL (required for VAAPI dmabuf import)
+# MOZ_DISABLE_RDD_SANDBOX=1   → RDD sandbox blocks /dev/nvidia* opens; disable it
+# MOZ_DISABLE_GMP_SANDBOX=1   → Cisco OpenH264 GMP needs network on first run
+# MOZ_ENABLE_WAYLAND=0        → stick to X11 (Xvfb); set =1 if you BYO a wayland compositor
+# NVIDIA_DRIVER_CAPABILITIES  → consumed by nvidia-container-toolkit at run time;
+#                               must include `video` (NVDEC) + `compute` (CUDA) +
+#                               `graphics` (EGL). `display` only matters if you
+#                               run a real Xorg with the nvidia GLX module.
+ENV LIBVA_DRIVER_NAME=nvidia \
+    NVD_BACKEND=direct \
+    MOZ_X11_EGL=1 \
+    MOZ_DISABLE_RDD_SANDBOX=1 \
+    MOZ_DISABLE_GMP_SANDBOX=1 \
+    MOZ_ENABLE_WAYLAND=0 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,graphics,utility \
+    DISPLAY=:99 \
+    XVFB_GEOMETRY=1920x1080x24 \
+    HOME=/home/firefox
+
+# ── Non-root user (Firefox refuses to run as root on most builds) ────────────
+RUN useradd -m -u 1000 -s /bin/bash firefox \
+    && mkdir -p /home/firefox/.mozilla \
+    && chown -R firefox:firefox /home/firefox
+
+# ── Entrypoint: Xvfb + dbus + pulseaudio, then exec firefox ──────────────────
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+USER firefox
+WORKDIR /home/firefox
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["firefox", "--no-remote", "--new-instance"]

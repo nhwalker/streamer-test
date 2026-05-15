@@ -1,0 +1,18 @@
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisableProfileImport": true,
+    "DisableSystemAddonUpdate": true,
+    "DontCheckDefaultBrowser": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "PasswordManagerEnabled": false,
+    "ExtensionUpdate": false,
+    "Preferences": {
+      "media.peerconnection.ice.no_host": false,
+      "media.peerconnection.ice.default_address_only": false
+    }
+  }
+}
