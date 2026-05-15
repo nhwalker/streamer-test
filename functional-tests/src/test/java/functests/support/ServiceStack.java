@@ -256,8 +256,9 @@ public final class ServiceStack {
 
     /**
      * Blocks until a completed {@code *_to_*.mp4} segment appears in the archive
-     * directory.  Completed segments are produced by the pipeline's
-     * matroska→MP4 remux step on the first fragment rotation.
+     * directory.  Completed segments are produced by the pipeline's rename/move
+     * step on the first fragment rotation — the live container is already a
+     * fragmented MP4, so no remux is involved.
      * Polls every 1 s; throws {@link AssertionError} after 90 s.
      */
     public void awaitFirstSegment() throws InterruptedException, IOException {

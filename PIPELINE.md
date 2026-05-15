@@ -15,11 +15,11 @@ that serves the archive download and video-assembly endpoints.
 │                                                                          │
 │  GPU path (preferred, taken when libgstnvcodec.so loads):                │
 │  ximagesrc → videorate → cudaupload → cudaconvertscale → tee             │
-│                                                       ├─ q_arch → nvh264enc │
+│                                                       ├─ q_arch → nvcudah264enc / nvh264enc │
 │                                                       │          → h264parse │
-│                                                       │          → splitmuxsink │
-│                                                       │   (live .mkv → .mp4 on │
-│                                                       │    rotation, faststart)│
+│                                                       │          → splitmuxsink (mp4mux, fragmented) │
+│                                                       │   (live .mp4 renamed → .mp4 on rotation, │
+│                                                       │    no remux — fragmented MP4 throughout) │
 │                                                       └─ q_webrtc → tee_webrtc │
 │                                                                  ├─ × N tiers of  full-stream branches  │
 │                                                                  │   (queue → cudascale → capsfilter(CUDA) → webrtcsink) │
@@ -97,8 +97,12 @@ ximagesrc display-name=:0 use-damage=false
   ! cudaconvertscale
   ! video/x-raw(memory:CUDAMemory),format=NV12,width=1920,height=1080
   ! tee name=t
-      t. ! queue ! nvh264enc ! h264parse ! splitmuxsink (archive)
-         (if x264enc fallback was selected, prepend ! cudadownload before the encoder)
+      t. ! queue ! nvcudah264enc ! h264parse ! video/x-h264,stream-format=avc,alignment=au
+              ! splitmuxsink muxer-factory=mp4mux
+                             muxer-properties="properties,fragment-duration=(uint)1000"
+                             max-size-time=600000000000
+         (nvcudah264enc is preferred; falls back to nvh264enc, then to x264enc.
+          if x264enc fallback is selected, prepend ! cudadownload before the encoder)
       t. ! queue ! tee name=t_webrtc
           (per WEBRTC_SCALE_LADDER tier, per stream:)
           t_webrtc. ! queue ! cudascale ! capsfilter(W,H,CUDA) ! webrtcsink   (full,  tier i)
@@ -117,7 +121,10 @@ ximagesrc display-name=:0 use-damage=false
   ! video/x-raw,width=1920,height=1080
   ! videoconvert
   ! tee name=t
-      t. ! queue ! encoder ! h264parse ! splitmuxsink (archive)
+      t. ! queue ! encoder ! h264parse ! video/x-h264,stream-format=avc,alignment=au
+              ! splitmuxsink muxer-factory=mp4mux
+                             muxer-properties="properties,fragment-duration=(uint)1000"
+                             max-size-time=600000000000
       t. ! queue ! tee name=t_webrtc
           t_webrtc. ! queue !            videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
           t_webrtc. ! queue ! videocrop ! videoscale ! capsfilter(W,H) ! webrtcsink  (screen, tier i)
@@ -218,11 +225,26 @@ Setting `ARCHIVE_QUEUE_MAX_BYTES=0` and `ARCHIVE_QUEUE_MAX_SEC=0` reverts to
 the legacy unbounded behaviour: zero archive frame loss, but the queue can
 grow without limit if the encoder cannot keep up.
 
-#### `nvh264enc` or `x264enc` (name: `arch_enc`)
+#### `nvcudah264enc` / `nvh264enc` / `x264enc` (name: `arch_enc`)
 
-Re-encodes the raw decoded video to H.264 for the archive.  The encoder is
-selected at runtime (`build_archive_encoder()`) based on `ARCHIVE_QUALITY`,
-which has three modes:
+Re-encodes the raw decoded video to H.264 for the archive.  The encoder
+factory is selected at runtime (`build_archive_encoder()`) by walking a
+preference list and picking the first factory that is registered:
+
+1. **`nvcudah264enc`** — CUDA-context-aware NVENC.  Shares the gst-cuda
+   buffer pool with upstream `cudaupload`/`cudaconvertscale`, so the
+   handoff into the encoder reuses the same CUDA context without an
+   internal rebind.  Present on gst-plugins-bad ≥ 1.22.
+2. **`nvh264enc`** — original NVENC element.  Still consumes CUDAMemory
+   natively but predates the unified CUDA memory model.
+3. **`x264enc`** — software fallback.  Used when no NVENC element is
+   registered (typically a CPU-only host).
+
+Both NVENC variants share the same property API and receive the same
+configuration dict; the table rows below labelled `nvh264enc` apply to
+`nvcudah264enc` as well.
+
+`ARCHIVE_QUALITY` selects between three modes:
 
 **`ARCHIVE_QUALITY=visually-lossless`** *(default)* — constant-quantizer
 encoding at `ARCHIVE_QP` (default 18).  Indistinguishable from the source
@@ -232,9 +254,9 @@ on screen content; ~2-4× the file size of `legacy` mode.
 |---|---|---|---|
 | `nvh264enc` | `rc-mode` | `constqp` | Quality-targeted (not bitrate-targeted) |
 | `nvh264enc` | `qp-const{,-i,-p,-b}` | `ARCHIVE_QP` | All QP knobs at the configured value (build-version compat) |
-| `nvh264enc` | `preset` | `low-latency-hq` | Same as legacy mode — see note below |
-| `nvh264enc` | `gop-size` | `30` | Same as legacy mode |
-| `nvh264enc` | `max-bitrate` | `ARCHIVE_BITRATE_CAP` kbps (default 100 000) | Ceiling so a chaotic frame can't blow up segment size |
+| `nvh264enc` | `preset` | `hq` | High-quality preset — archive has no latency requirement |
+| `nvh264enc` | `bframes` | `2` | B-frames improve compression on screen content |
+| `nvh264enc` | `gop-size` | `30` | Keyframe interval (one IDR per second at 30 fps) |
 | `x264enc`   | `pass` | `4` (quant) | Constant quantizer at `ARCHIVE_QP` |
 | `x264enc`   | `quantizer` | `ARCHIVE_QP` | Constant QP value |
 | `x264enc`   | `tune` | `0x4` (zerolatency) | Same as legacy mode — see note below |
@@ -248,7 +270,8 @@ large (50–200 Mbps during heavy motion); set `ARCHIVE_MAX_BYTES`.
 |---|---|---|
 | `nvh264enc` | `rc-mode` | `constqp` |
 | `nvh264enc` | `qp-const{,-i,-p,-b}` | `0` |
-| `nvh264enc` | `preset` | `low-latency-hq` |
+| `nvh264enc` | `preset` | `hq` |
+| `nvh264enc` | `bframes` | `2` |
 | `nvh264enc` | `gop-size` | `30` |
 | `x264enc`   | `pass` | `4` (quant — true CQP) |
 | `x264enc`   | `quantizer` | `0` |
@@ -257,17 +280,27 @@ large (50–200 Mbps during heavy motion); set `ARCHIVE_MAX_BYTES`.
 | `x264enc`   | `speed-preset` | `1` (ultrafast) |
 | `x264enc`   | `key-int-max` | `30` |
 
-**Why the new modes keep `tune=zerolatency`, `speed-preset=ultrafast`, and
-`preset=low-latency-hq`:** an earlier draft dropped these settings on the
-grounds that the archive isn't latency-sensitive, and pushed `x264enc` to
-`speed-preset=faster` / `pass=qual` (CRF) and `nvh264enc` to
-`preset=high-quality`.  CI surfaced a hang — the archive encoder never
-produced its first buffer, so the pipeline got stuck in PAUSED and
-`splitmuxsink` never opened a segment.  Reverting the latency tunings to
-exactly match `legacy` mode keeps the encoder on the same negotiation
-path, and switching only `rc-mode` / `pass` / `quantizer` is enough to
-move from bitrate-targeted to quality-targeted output.  We can revisit
-the slower presets in a follow-up once the interaction is understood.
+**Why `x264enc` keeps the legacy latency tunings while NVENC takes the
+slower preset:** an earlier draft dropped `tune=zerolatency` /
+`speed-preset=ultrafast` from `x264enc` (pushing it to
+`speed-preset=faster` / `pass=qual` / `qp-min=0`) at the same time as
+swapping `nvh264enc` to `preset=high-quality`.  CI surfaced a hang — the
+archive encoder never produced its first buffer, so the pipeline got
+stuck in PAUSED and `splitmuxsink` never opened a segment.  Bisecting in
+the test docs narrows the cause to the `x264enc` change (suspected
+`qp-min=0` + `pass=qual` interaction); the NVENC path was never
+implicated.  So `x264enc` stays on the legacy negotiation path while
+`nvcudah264enc`/`nvh264enc` are free to use `preset=hq` + `bframes=2`
+for better compression at the same QP.
+
+**Why there is no bitrate cap on CQP modes:** NVENC's `max-bitrate`
+property is only honored under `rc-mode=vbr*`/`cbr*`.  Under `constqp`
+the encoder emits whatever bitrate the configured QP dictates; setting
+`max-bitrate` is a silent no-op.  Earlier docs advertised an
+`ARCHIVE_BITRATE_CAP` knob; it never actually capped anything, so it has
+been removed.  Operators who need a hard ceiling on archive size should
+combine `ARCHIVE_MAX_BYTES` with `ARCHIVE_MAX_AGE_DAYS`, or switch to
+`ARCHIVE_QUALITY=legacy` (VBR with `ARCHIVE_BITRATE`).
 
 **`ARCHIVE_QUALITY=legacy`** — byte-for-byte compatible with the
 configuration shipped before the archive quality work.  `ARCHIVE_BITRATE`
@@ -289,12 +322,6 @@ instances and the network — its quality is fixed at the configured QP rather
 than reactive to viewer bandwidth.  This means the archived recording always
 carries the configured quality, even when individual viewers are throttled.
 
-The `visually-lossless` and `lossless` modes deliberately drop the
-`tune=zerolatency` / `preset=low-latency-hq` settings: viewers see the
-screen via the WebRTC branch, so the archive encoder has no latency
-requirement and is free to use larger lookahead and B-frames for better
-compression.
-
 #### `h264parse` (name: `arch_h264`)
 
 | Property | Value | Purpose |
@@ -306,80 +333,96 @@ PPS (Picture Parameter Set) NAL units. With `config-interval=-1` the SPS/PPS
 are repeated before every IDR (keyframe). This is critical for archive
 segmentation: each segment must be independently decodable from its first
 frame. Without inline SPS/PPS, a segment starting on a non-IDR frame would be
-undecodable without seeking back to the previous segment.  The same property
-is also what allows the post-rotation MP4 remux to be a pure `-c copy`
-operation — the bitstream already carries the codec parameters in-band, so
-the new MP4 muxer can synthesize the `avcC` box without re-encoding.
+undecodable without seeking back to the previous segment.
+
+`h264parse` is also where the byte-stream → AVCC (length-prefixed)
+conversion happens — the caps filter on its src pad pins
+`stream-format=avc, alignment=au`, which is what `mp4mux` (downstream)
+requires.  Without that explicit caps filter, some GStreamer versions
+negotiate Annex-B byte-stream into the muxer and produce broken `avcC`
+boxes.
 
 #### `splitmuxsink` (name: `archive`)
 
 | Property | Value | Purpose |
 |---|---|---|
-| `muxer-factory` | `matroskamux` | Live container; readable mid-write |
-| `location` | `${ARCHIVE_LIVE_DIR}/{prefix}-%05d.mkv` | Output path for the in-progress segment |
+| `muxer-factory` | `mp4mux` | Per-segment muxer |
+| `muxer-properties` | `fragment-duration=(uint)1000` | Fragmented MP4 output |
+| `location` | `${ARCHIVE_LIVE_DIR}/{prefix}-%05d.mp4` | Output path for the in-progress segment |
 | `max-size-time` | `ARCHIVE_SEGMENT_SEC × Gst.SECOND` | Rotate to a new file every N seconds |
 
-Muxes the H.264 stream into rotating Matroska fragments. `splitmuxsink` opens
-a new file automatically when the current segment reaches the
-`max-size-time` limit, ensuring no single file grows unboundedly.
+Muxes the H.264 stream into rotating **fragmented MP4** files.
+`splitmuxsink` opens a new file automatically when the current segment
+reaches the `max-size-time` limit, so no single file grows unboundedly.
 
-**Why MKV here, MP4 elsewhere?**  Matroska handles non-monotonic timestamps
-and open-ended streams gracefully, and does not require a final `moov` atom
-to be readable — meaning the in-progress fragment can be opened and read
-mid-write.  This is what lets `/archive` include the active segment in
-responses while a recording is still ongoing.  Web players, however, want
-MP4 (universal browser support) with the `moov` atom at the front of the
-file (faststart, so playback can begin before the full file has been
-received).  We get both by keeping MKV as the live container and remuxing
-to MP4 on rotation.
+**Why fragmented MP4 as the live container?**  Two reasons.  First, the
+on-disk structure is `ftyp + (moof + mdat)*` — each `mdat` box is a
+self-describing run of AVCC H.264 NAL units, so the web server can
+recover the H.264 stream from the in-progress file by walking the
+top-level boxes (no moov needed; see
+[Active-segment remux](#active-segment-remux) below).  Second, when
+`splitmuxsink` rotates the file, mp4mux writes the `moov` at EOS in a
+single pass — no `+faststart` rewrite, no separate ffmpeg invocation,
+no temporary file.  The rotation is then a pure rename/move from
+`ARCHIVE_LIVE_DIR` into `ARCHIVE_DIR` under the timestamped name.
 
-#### Post-rotation: MKV → MP4 finalize
+Concretely on mp4mux:
+
+- **`fragment-duration=1000`** (ms) — each fragment is ~1 s of media,
+  which aligns with the 30-frame GOP from the encoder so every fragment
+  starts on a keyframe.  This keeps each `mdat` box bounded in size
+  (one GOP) and gives the active-segment remux a clean unit of work.
+
+**Why not also force `moov` to the front of the live file?**  In an
+ideal world, mp4mux's `fragment-mode=first-moov` would put a track-defs
+moov at the start of the in-progress file and make it directly
+parseable by ffmpeg/browsers.  In practice (this build, GStreamer
+1.22), it doesn't deliver a parseable in-progress file — the
+integration tests still report "moov atom not found" against the
+active fragment.  The hybrid path (web server walks `mdat` boxes and
+remuxes the active segment on demand) sidesteps the problem entirely
+without paying the rollover-time ffmpeg cost.
+
+The combination keeps the live recording on the "happy path" the moment
+splitmuxsink closes a file: it's already a complete, faststart-style,
+web-playable MP4.  No remux, no `+faststart` 2-pass, no ffmpeg in the
+rotation loop.
+
+#### Post-rotation: rename and move
 
 When `splitmuxsink` rotates a fragment, `pipeline.py` enqueues the
-just-completed `.mkv` for remux on a single background daemon thread.
-ffmpeg writes the new MP4 alongside the source in `ARCHIVE_LIVE_DIR`
-under a `.part` suffix, then the finished file is published into
-`ARCHIVE_DIR` via an atomic rename:
+just-completed sequential `.mp4` for renaming on a single background
+daemon thread.  The worker shuttles the file into `ARCHIVE_DIR` under
+its timestamp-based name, via a `.part` suffix in `ARCHIVE_DIR` so the
+`*.mp4` glob never matches a partially-copied file:
 
 ```
-# 1. ffmpeg writes the new MP4 next to the source, in ARCHIVE_LIVE_DIR
-ffmpeg -y -nostdin -hide_banner -loglevel error \
-       -fflags +genpts -i ${LIVE}/${prefix}-NNNNN.mkv \
-       -c copy -map 0:v:0 -movflags +faststart \
-       ${LIVE}/${prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mp4.part
+# 1. Move from live_dir/sequential-name into archive_dir/timestamp-name.part.
+#    Same-fs: this is an atomic os.rename.  Cross-fs: shutil.move performs
+#    a single read+write copy and removes the source on success.
+shutil.move(${LIVE}/${prefix}-NNNNN.mp4, ${ARCHIVE}/${name}.mp4.part)
 
-# 2. Move into ARCHIVE_DIR under .part; cross-fs copies land there, not
-#    under the final name.  Then atomic rename to the final name.
-shutil.move(    ${LIVE}/${name}.mp4.part,    ${ARCHIVE}/${name}.mp4.part )
-os.rename(      ${ARCHIVE}/${name}.mp4.part, ${ARCHIVE}/${name}.mp4     )
-
-# 3. Source MKV deleted only after publication succeeds.
-os.unlink(${LIVE}/${prefix}-NNNNN.mkv)
+# 2. Atomic rename to the final name.  /archive's *.mp4 glob can now see it.
+os.rename(${ARCHIVE}/${name}.mp4.part, ${ARCHIVE}/${name}.mp4)
 ```
 
 Key properties:
 
-- **`-c copy`** — the H.264 packets are remuxed verbatim.  No re-encoding,
-  no quality loss, near-instant compared to a transcode.
-- **`-movflags +faststart`** — ffmpeg does a 2-pass write to place the
-  `moov` atom at the front of the MP4, allowing web players to start
-  decoding from the first received bytes.  The 2-pass intermediate
-  states stay confined to `ARCHIVE_LIVE_DIR` because the work file is
-  written there.
-- **Atomic publication** — `ARCHIVE_DIR`'s `*.mp4` glob never matches a
-  partially-written file.  ffmpeg's output is hidden under `.part` in
-  `ARCHIVE_LIVE_DIR`; the cross-filesystem copy lands under `.part` in
-  `ARCHIVE_DIR`; only the final `os.rename` makes the new segment
-  visible to readers.
+- **No re-encoding, no remux** — the live file is already a complete
+  fragmented MP4; rollover just relocates it.  Net I/O floor is one
+  read+write across filesystems, or zero data movement when LIVE and
+  ARCHIVE are on the same filesystem.
+- **Atomic publication** — `ARCHIVE_DIR`'s `*.mp4` glob never matches
+  a partial cross-fs copy.  shutil.move writes the bytes under `.part`;
+  only the final `os.rename` makes the new segment visible to readers.
 - **Background worker** — the `format-location-full` callback returns
-  immediately; the remux runs off the GStreamer streaming thread so it
-  cannot back up the pipeline queues.
-- **Fallback** — if ffmpeg ever fails (corrupt fragment, missing tool),
-  the pipeline cleans up the partial `.mp4.part` and moves the original
-  `.mkv` into `ARCHIVE_DIR` (also via a `.part`-then-rename publication)
-  so a recording is never lost.  The fallback `.mkv` is not picked up by
-  `/archive` (which globs `*.mp4`); it sits on disk until an admin
-  recovers it.
+  immediately; the cross-fs copy (when applicable) runs off the
+  GStreamer streaming thread so slow bulk storage can never stall the
+  pipeline.
+- **Recovery on failure** — if the move ever fails (disk full,
+  permission), the sequential `.mp4` stays in `ARCHIVE_LIVE_DIR` under
+  its original name.  `/archive` won't include it under the renamed
+  glob, but the operator can recover it manually.
 
 Keeping the live write path on its own filesystem (e.g. tmpfs or a fast
 local disk) and the completed archive on a slower bulk volume is
@@ -391,9 +434,9 @@ both handled correctly.
 ### Segment Naming and Timestamping
 
 Segments are written into `ARCHIVE_LIVE_DIR` with sequential numeric names
-(`{prefix}-00000.mkv`, `{prefix}-00001.mkv`, …).  When a segment is
-completed it is remuxed (no re-encode) to a faststart MP4 in `ARCHIVE_DIR`
-under its final timestamp-based name:
+(`{prefix}-00000.mp4`, `{prefix}-00001.mp4`, …) as fragmented MP4.  When
+a segment is completed it is renamed/moved (no re-encode, no remux) into
+`ARCHIVE_DIR` under its final timestamp-based name:
 
 ```
 {prefix}_YYYYMMDD-HHMMSS.SSS_to_YYYYMMDD-HHMMSS.SSS.mp4
@@ -406,7 +449,7 @@ new fragment.  The callback (`_on_format_location_full`) stamps the boundary
 with `time.time_ns()`.  This value simultaneously becomes the **end**
 timestamp of the just-completed fragment and the **start** timestamp of the
 new one — both reads happen in the same callback call, so adjacent segments
-abut exactly.  The old fragment is enqueued for finalize (MKV → MP4 remux
+abut exactly.  The old fragment is enqueued for finalize (rename/move
 on a background worker), with the new name computed by
 `archive_times.renamed_segment_path(..., ext='.mp4')`.
 
@@ -631,25 +674,37 @@ window.  Requests longer than 12 hours are rejected with 400.
 
 **Implementation** (`stage_segments()` → `transcode_to_video()`):
 
-1. **Staging** (`stage_segments()`): overlapping segments are normalized into
-   a temp directory as faststart `.mp4` so downstream code only ever sees
-   one container format.
+1. **Staging** (`stage_segments()`): overlapping segments are copied into
+   a temp directory as `.mp4` so downstream code only ever sees one
+   container format.
 
-   - **Completed segments** (timestamp names, already `.mp4` after the
-     pipeline's MKV → MP4 finalize): copied as-is.
-   - **Active segment** (sequential numeric `.mkv` — the fragment
-     currently being written by `splitmuxsink`): its start time is taken
-     from the end timestamp of the last completed segment (the same
-     boundary `pipeline.py` will record when it finalises the file).  The
-     file is opened by file descriptor before ffmpeg starts; ffmpeg reads
-     via `/proc/self/fd/<n>`, so a rotation by the pipeline after that
-     point does not interrupt the read because the fd holds the inode
-     reference.  If the rotation fires before the `os.open()` call, the
-     now-completed `.mp4` is found in `ARCHIVE_DIR` via a fresh directory
-     scan.  The active fragment is remuxed (`-c copy -movflags
-     +faststart` — no re-encode) into a faststart `.mp4` named with the
-     same `{prefix}_..._to_..._mp4` convention so the assembly step can
-     treat it identically to a completed segment.
+   - **Completed segments** (timestamp names, renamed `.mp4` after the
+     pipeline's rotation rename): copied as-is — the file is already a
+     valid mp4 (mp4mux wrote `moov` at EOS during rotation).
+   - <a name="active-segment-remux"></a>**Active segment** (sequential
+     numeric `.mp4` — the fragment currently being written by
+     `splitmuxsink`): needs a small remux on the way to the stage dir.
+     mp4mux's in-progress file is fragmented MP4 with no `moov` at the
+     front (the `moov` lands only at EOS), so a byte-for-byte copy
+     wouldn't be playable.  Instead, `_copy_active_to_stage` walks the
+     in-progress file's top-level boxes, pulls AVCC H.264 NAL units out
+     of every `mdat` box, converts them to Annex-B byte stream, and
+     pipes the result through `ffmpeg -f h264 -c copy -movflags
+     +faststart` to produce a faststart mp4 at the stage path.  The
+     remux is cheap — `-c copy` does no re-encoding, h264parse with
+     `config-interval=-1` keeps SPS/PPS inline before every keyframe
+     (so ffmpeg can synthesise the `avcC` box from the bitstream), and
+     ffmpeg only sees one in-flight segment at a time so memory tops
+     out around one GOP (~1 MB at our bitrate).
+
+     The active segment's start time is taken from the end timestamp
+     of the last completed segment (the same boundary `pipeline.py`
+     used when it renamed that file).  The in-progress file is opened
+     by file descriptor before the box walk begins; reads go through
+     that fd, so a rotation by the pipeline after that point does not
+     interrupt us (the fd pins the inode).  If the rotation fires
+     before `os.open()`, the now-completed `.mp4` is found in
+     `ARCHIVE_DIR` via a fresh directory scan.
 
 2. **Assembly** (`video_transcode.py`, `transcode_to_video()`): builds and runs
    an ffmpeg `filter_complex`:
@@ -684,11 +739,10 @@ window.  Requests longer than 12 hours are rejected with 400.
 | `STREAM_FRAMERATE` | `30` | Target frames per second |
 | `DESKTOP_SPLITS` | _(empty)_ | `WxH+X+Y;WxH+X+Y;…` regions.  Unset triggers `xrandr --listmonitors` auto-detection |
 | `ARCHIVE_DIR` | `/archive` | Directory for completed (timestamp-named) faststart `.mp4` segments |
-| `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress `.mkv` segment is written into; each segment is remuxed to `.mp4` (`-c copy -movflags +faststart`) and moved into `ARCHIVE_DIR` when it rotates |
+| `ARCHIVE_LIVE_DIR` | `/archive-live` | Directory the in-progress fragmented-`.mp4` segment is written into; each segment is renamed/moved into `ARCHIVE_DIR` when it rotates (no re-encode, no remux) |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
 | `ARCHIVE_QUALITY` | `visually-lossless` | Encoder quality mode: `visually-lossless` (CRF/CQP at `ARCHIVE_QP`), `lossless` (true QP=0), or `legacy` (fixed-bitrate VBR using `ARCHIVE_BITRATE`) |
 | `ARCHIVE_QP` | `18` | QP for `visually-lossless` mode (0–51, lower is better; 18 is the conventional visually-lossless threshold for H.264).  Ignored in other modes |
-| `ARCHIVE_BITRATE_CAP` | `100000` | kbps ceiling on instantaneous bitrate in CQP modes — caps a chaotic frame from blowing up segment size |
 | `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps; consulted only when `ARCHIVE_QUALITY=legacy` |
 | `ARCHIVE_QUEUE_MAX_BYTES` | `536870912` (512 MB) | Bytes of raw video the `q_arch` queue may buffer before dropping the oldest frame.  Set to `0` to disable the byte gate |
 | `ARCHIVE_QUEUE_MAX_SEC` | `5` | Seconds of running-time the `q_arch` queue may buffer before dropping the oldest frame.  Set to `0` to disable the time gate |

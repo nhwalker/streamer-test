@@ -16,9 +16,12 @@ GET /archive?start=<timestamp>&end=<timestamp>
 GET /archive?last=<duration>
   Returns a zip of the .mp4 segments whose recorded time overlaps the requested
   window.  The active (currently-writing) segment is included when the window
-  extends past the last completed segment; it is still being written as
-  Matroska, so it is remuxed on the fly into a faststart .mp4 with `ffmpeg
-  -c copy` (no re-encoding) before being added to the zip.
+  extends past the last completed segment.  Completed segments are copied
+  byte-for-byte (they're already valid mp4 after splitmuxsink rotated them).
+  The active segment requires a small remux: mp4mux's in-progress file has
+  no parseable moov at the front, so we walk its top-level `mdat` boxes,
+  extract the AVCC H.264 NAL units, convert them to Annex-B byte stream,
+  and pipe to `ffmpeg -c copy -movflags +faststart` for a faststart mp4.
 
 GET /video?start=<timestamp>&end=<timestamp>
 GET /video?last=<duration>
@@ -43,9 +46,9 @@ Environment variables:
   WEB_PORT             HTTP listening port              (8080)
   WEB_DIR              Static file root                 (/var/www/html)
   ARCHIVE_DIR          Directory of completed .mp4      (/archive)
-                       segments (timestamp-named, faststart)
-  ARCHIVE_LIVE_DIR     Directory the in-progress .mkv   (/archive-live)
-                       segment is being written into
+                       segments (timestamp-named, fragmented MP4)
+  ARCHIVE_LIVE_DIR     Directory the in-progress .mp4   (/archive-live)
+                       fragmented-MP4 segment is being written into
   ARCHIVE_SEGMENT_SEC  Nominal segment duration         (600)
   VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
   VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
@@ -61,6 +64,8 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
+
+STREAM_FRAMERATE = int(os.environ.get('STREAM_FRAMERATE', '30'))
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 from archive_times import parse_segment_times, renamed_segment_path
@@ -111,54 +116,190 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
-def _remux_active_to_mp4(src_fd, dst):
-    """Remux a live Matroska fragment (read from an open fd) to faststart MP4.
+def _iter_active_mdats(src_fd):
+    """Yield the body bytes of each `mdat` box in an in-progress mp4 file.
 
-    Reading via /proc/self/fd/<n> rather than the path means our open file
-    descriptor pins the inode: even if pipeline.py moves the .mkv away from
-    live_dir mid-read, ffmpeg keeps reading the same bytes we opened.  The
-    `+faststart` flag rewrites the moov atom to the front of the output so
-    web players can begin decoding from the first received bytes.
-    `-c copy` means no re-encoding — the H.264 packets are remuxed verbatim.
-    `-err_detect ignore_err` tolerates a fragment whose tail is a partially
-    written cluster (the live file may still be being flushed at open time).
+    mp4mux writes fragmented MP4 as `ftyp + (moof + mdat)*`, with the
+    moov atom landing only at EOS — so an in-progress file has no
+    parseable moov, and standard demuxers reject it.  But the actual
+    H.264 NAL units sit in the `mdat` boxes verbatim (AVCC-formatted,
+    length-prefixed), and we can walk the top-level box structure
+    without consulting moov: each box header is 4 bytes of big-endian
+    size + 4 bytes of ASCII type, followed by `size - 8` bytes of body.
+
+    Stops cleanly at EOF — the trailing box of an in-progress file may
+    be truncated mid-write, and we just yield what we can read.
+
+    The caller owns src_fd; we do not close it.
     """
+    offset = 0
+    while True:
+        os.lseek(src_fd, offset, os.SEEK_SET)
+        header = os.read(src_fd, 8)
+        if len(header) < 8:
+            return
+        size = int.from_bytes(header[:4], 'big')
+        box_type = header[4:8]
+
+        if size == 1:
+            # 64-bit extended size follows the 8-byte header.
+            ext = os.read(src_fd, 8)
+            if len(ext) < 8:
+                return
+            size = int.from_bytes(ext, 'big')
+            body_offset = offset + 16
+        elif size == 0:
+            # "Size 0" means the box extends to EOF — only legal for the
+            # final box, and only useful if we know the file size.
+            body_offset = offset + 8
+            try:
+                size = os.fstat(src_fd).st_size - offset
+            except OSError:
+                return
+        else:
+            body_offset = offset + 8
+
+        body_size = size - (body_offset - offset)
+
+        # Sanity-bound the advance step.  `body_size < 0` means a box
+        # header smaller than 8 bytes, which is malformed — bail.  But
+        # `body_size == 0` is perfectly legal (an empty-body box like
+        # `free` for padding); we must advance past it, NOT return,
+        # otherwise any zero-body box before the first mdat would
+        # silently swallow the rest of the file.
+        if body_size < 0 or size < 8:
+            return
+
+        if box_type == b'mdat' and body_size > 0:
+            os.lseek(src_fd, body_offset, os.SEEK_SET)
+            remaining = body_size
+            chunks = []
+            while remaining > 0:
+                chunk = os.read(src_fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if chunks:
+                yield b''.join(chunks)
+
+        offset += size
+
+
+def _avcc_to_annex_b(avcc):
+    """Convert AVCC-formatted H.264 (length-prefixed NAL units) to Annex-B.
+
+    AVCC:    [4-byte big-endian length][NAL bytes]...
+    Annex-B: [0x00 0x00 0x00 0x01][NAL bytes]...
+
+    Annex-B is what `ffmpeg -f h264` expects.  Truncated trailing NALs
+    are dropped silently (the in-progress mdat may end mid-NAL).
+    """
+    out = bytearray()
+    i = 0
+    n = len(avcc)
+    while i + 4 <= n:
+        nal_length = int.from_bytes(avcc[i:i + 4], 'big')
+        i += 4
+        if nal_length == 0 or i + nal_length > n:
+            break
+        out.extend(b'\x00\x00\x00\x01')
+        out.extend(avcc[i:i + nal_length])
+        i += nal_length
+    return bytes(out)
+
+
+def _copy_active_to_stage(src_fd, dst):
+    """Build a faststart `.mp4` at dst from the in-progress mp4mux file.
+
+    The live container is fragmented MP4 — mp4mux writes the moov atom
+    only at EOS, so the in-progress file isn't directly parseable by
+    `ffmpeg`/`ffprobe`/browsers (they report "moov atom not found").
+    But the actual H.264 stream sits in the `mdat` boxes as AVCC NAL
+    units, and we know how to find them without consulting moov.
+
+    Approach:
+      1. Walk the top-level boxes of the in-progress file (see
+         `_iter_active_mdats`).
+      2. For each mdat, convert AVCC NAL units to Annex-B byte stream
+         and concatenate into a single buffer.
+      3. Hand that buffer to `ffmpeg -f h264 -c copy
+         -movflags +faststart` via stdin.  ffmpeg builds a proper mp4
+         (with moov at the front) from the bitstream — h264parse with
+         `config-interval=-1` in pipeline.py guarantees SPS/PPS are
+         inline before each keyframe, so ffmpeg can synthesize the
+         track header from the bitstream itself.
+
+    The remux is `-c copy` (no re-encode), so it costs roughly one
+    pass of CPU over the H.264 bytes plus the disk write for `dst`.
+    Memory peaks at the full Annex-B buffer — that's the whole H.264
+    elementary stream of the active fragment, typically a few MB
+    (10-60 s of recording at the bitrates we run).  Buffering rather
+    than streaming via `proc.stdin.write()` avoids the classic
+    stderr-pipe-fills-up deadlock that subprocess pipelines fall into
+    when one side reads input only after producing all output.
+
+    Reading via the supplied fd rather than the path means our
+    descriptor pins the inode: even if pipeline.py renames the file
+    away from live_dir mid-read, we keep reading the same bytes we
+    opened.  The caller owns src_fd; we do not close it.
+
+    Raises OSError on remux failure (caller decides whether to retain
+    or discard the partial dst).
+    """
+    annex_b = b''.join(
+        _avcc_to_annex_b(mdat_body)
+        for mdat_body in _iter_active_mdats(src_fd)
+    )
+    if not annex_b:
+        raise OSError('no H.264 data found in active mp4 file')
+
     cmd = [
         'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
-        '-fflags', '+genpts', '-err_detect', 'ignore_err',
-        '-i', f'/proc/self/fd/{src_fd}',
-        '-c', 'copy', '-map', '0:v:0',
-        '-movflags', '+faststart',
+        '-framerate', str(STREAM_FRAMERATE),
+        '-f', 'h264', '-i', 'pipe:0',
+        '-c', 'copy', '-movflags', '+faststart',
         dst,
     ]
-    return subprocess.run(cmd, capture_output=True, pass_fds=(src_fd,))
+    result = subprocess.run(
+        cmd, input=annex_b, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        try:
+            os.unlink(dst)
+        except FileNotFoundError:
+            pass
+        tail = result.stderr.decode('utf-8', errors='replace')[-500:]
+        raise OSError(
+            f'active-segment remux failed (exit {result.returncode}, '
+            f'{len(annex_b)} bytes piped): {tail}'
+        )
 
 
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,
-                   _remux=_remux_active_to_mp4):
+                   _copy=_copy_active_to_stage):
     """Copy overlapping segments into a TemporaryDirectory and return it.
 
     archive_dir   directory of completed .mp4 segments — files with
-                  timestamps embedded in their filenames (finalized by
-                  pipeline.py when splitmuxsink rotates a fragment, after
-                  remux from .mkv to faststart .mp4).
-    live_dir      directory the pipeline writes the in-progress .mkv
-                  segment into.  Pipeline remuxes each fragment from
-                  live_dir into archive_dir on rotation.
+                  timestamps embedded in their filenames (renamed/moved
+                  by pipeline.py when splitmuxsink rotates a fragment).
+    live_dir      directory the pipeline writes the in-progress
+                  fragmented-MP4 segment into.  On rotation, pipeline.py
+                  renames/moves each fragment from live_dir into
+                  archive_dir.
 
     Completed segments have their recording timestamps embedded in their
     filenames; those timestamps are used directly.
 
-    The current active segment (the highest-named unnamed file in live_dir)
-    is included when its estimated time range overlaps the request window.
-    Its start time is the end of the last completed segment; its end time
-    is now().  If no completed segments exist before it, the active
-    segment is excluded (no reliable start time can be determined).
-    Because the live segment is still Matroska, it is remuxed on the fly
-    into a faststart .mp4 (no re-encoding) before being staged.
+    The current active segment (the highest-named sequential file in
+    live_dir) is included when its estimated time range overlaps the
+    request window.  Its start time is the end of the last completed
+    segment; its end time is now().  If no completed segments exist
+    before it, the active segment is excluded (no reliable start time
+    can be determined).  The live segment is already a fragmented MP4
+    on disk, so we stream the bytes through to the stage dir — no remux.
 
-    `_remux` is a seam for unit tests — pass a stub to avoid invoking
-    ffmpeg.  Production callers omit it.
+    `_copy` is a seam for unit tests; production callers omit it.
 
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
@@ -181,21 +322,24 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
             except FileNotFoundError:
                 pass  # purge deleted it between glob and copy; skip it
 
-    # The active (currently-writing) segment is the highest-named .mkv in
-    # live_dir.  Its start time equals the end of the last completed
-    # segment — the same boundary pipeline.py will use when it finalizes
-    # the file.  Without a completed predecessor we have no reliable start
-    # time, so any other unnamed files (orphans from crashed runs) are
-    # dropped.
+    # The active (currently-writing) segment is the highest-named
+    # sequential .mp4 in live_dir.  Its start time equals the end of the
+    # last completed segment — the same boundary pipeline.py will use
+    # when it finalizes the file.  Without a completed predecessor we
+    # have no reliable start time, so any other sequential files (orphans
+    # from crashed runs) are dropped.
     #
-    # Race with segment rollover (pipeline.py finalizing into archive_dir):
-    #   - If we os.open() the file before the rotation fires, the fd holds
-    #     a reference to the inode; ffmpeg reads it via /proc/self/fd/N
-    #     and the remux completes even if the name changes underneath us.
+    # Race with segment rollover (pipeline.py renaming into archive_dir):
+    #   - If we os.open() the file before the rotation fires, the fd
+    #     holds a reference to the inode; we read it and write the bytes
+    #     into the stage dir even if the name changes underneath us.
     #   - If the rotation fires before os.open(), we get FileNotFoundError.
-    #     The file now exists as a faststart .mp4 in archive_dir, so we
-    #     re-glob there to find and copy it as a completed segment.
-    live_files = glob.glob(os.path.join(live_dir, '*.mkv'))
+    #     The file now exists under its timestamped name in archive_dir,
+    #     so we re-glob there to find and copy it as a completed segment.
+    live_files = [
+        p for p in glob.glob(os.path.join(live_dir, '*.mp4'))
+        if parse_segment_times(os.path.basename(p)) is None
+    ]
     if live_files and renamed:
         active    = max(live_files)
         seg_start = renamed[-1][2]
@@ -218,11 +362,11 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
 
             if fd is not None:
                 try:
-                    result = _remux(fd, dst)
-                    if result.returncode != 0:
-                        stderr = result.stderr.decode('utf-8', errors='replace')[-500:]
-                        print(f'[web] WARNING: active-segment remux failed '
-                              f'(exit {result.returncode}): {stderr}', flush=True)
+                    try:
+                        _copy(fd, dst)
+                    except OSError as exc:
+                        print(f'[web] WARNING: active-segment copy failed: '
+                              f'{exc}', flush=True)
                         try:
                             os.unlink(dst)
                         except FileNotFoundError:

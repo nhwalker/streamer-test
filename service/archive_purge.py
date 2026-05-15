@@ -12,8 +12,8 @@ def purge_archive(archive_dir, max_bytes, max_age_days):
     removed unconditionally, then the oldest are removed until the total
     size of surviving segments is within max_bytes.
 
-    splitmuxsink writes the in-progress .mkv to ARCHIVE_LIVE_DIR (a
-    different directory), so the live fragment is never visible here.
+    splitmuxsink writes the in-progress fragmented .mp4 to ARCHIVE_LIVE_DIR
+    (a different directory), so the live fragment is never visible here.
     """
     segments = sorted(
         glob.glob(os.path.join(archive_dir, '*.mp4')),

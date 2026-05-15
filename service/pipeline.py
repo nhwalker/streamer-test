@@ -17,9 +17,12 @@ CPU fallback path:
 
 A single `cudaupload` at the head of the GPU path keeps every downstream
 element working in CUDA memory; `tee` distributes GPU-buffer references
-rather than re-copying the frame for each branch.  `nvh264enc` (archive)
-and per-tier `cudascale` (WebRTC fan-out) consume the CUDA buffers
-directly without re-uploading.
+rather than re-copying the frame for each branch.  The archive encoder
+(`nvcudah264enc` when available, else `nvh264enc`) and per-tier
+`cudascale` (WebRTC fan-out) consume the CUDA buffers directly without
+re-uploading.  `nvcudah264enc` is preferred because it shares the
+gst-cuda buffer pool with upstream `cudaupload`/`cudaconvertscale`,
+skipping the internal context-rebind that `nvh264enc` performs.
 
 The tee fans out:
   tee. -> [cudadownload?] -> encoder -> h264parse -> splitmuxsink   (archive)
@@ -27,14 +30,20 @@ The tee fans out:
 
 The optional `cudadownload` between the archive queue and the encoder is
 only inserted when the runtime falls back to `x264enc` (software).
-`nvh264enc` accepts `video/x-raw(memory:CUDAMemory)` natively, so on the
-hardware path the archive branch has zero copies between tee and encoder.
+Both NVENC variants accept `video/x-raw(memory:CUDAMemory)` natively,
+so on the hardware path the archive branch has zero copies between tee
+and encoder.
 
-Archive segments are written as Matroska in ARCHIVE_LIVE_DIR (so the
-in-progress fragment is readable mid-write), then remuxed to MP4 with
-`+faststart` and moved into ARCHIVE_DIR when the fragment rotates.  The
-remux is `ffmpeg -c copy` — no re-encoding — and runs on a single
-background worker so the GStreamer streaming thread is never blocked.
+Archive segments are written as fragmented MP4 directly in ARCHIVE_LIVE_DIR
+(mp4mux with fragment-duration + streamable, so the in-progress fragment
+is readable mid-write), then renamed/moved into ARCHIVE_DIR when the
+fragment rotates.  Each segment file is already a valid faststart-style
+fmp4 (`ftyp + moov + (moof+mdat)*`) the moment splitmuxsink closes it —
+no remux is needed, so rollover is just a rename on same-fs setups or a
+single byte-for-byte copy when ARCHIVE_LIVE_DIR and ARCHIVE_DIR are on
+different filesystems.  The move runs on a single background worker so
+the GStreamer streaming thread is never blocked even on slow bulk
+storage.
 
 The WebRTC branch is a *ladder* of webrtcsinks per stream — one tier per
 entry in WEBRTC_SCALE_LADDER.  Each browser picks the smallest tier whose
@@ -67,10 +76,12 @@ Environment variables:
   STREAM_FRAMERATE       frames per second                        (30)
 
   ARCHIVE_DIR            output dir for completed .mp4 segments   (/archive)
-                         (faststart MP4, web-player friendly)
-  ARCHIVE_LIVE_DIR       output dir for the in-progress .mkv      (/archive-live)
-                         segment; each segment is remuxed to MP4
-                         and moved to ARCHIVE_DIR when it rotates
+                         (fragmented MP4, web-player friendly)
+  ARCHIVE_LIVE_DIR       output dir for the in-progress .mp4      (/archive-live)
+                         segment; written as fragmented MP4 by
+                         mp4mux so it is readable mid-write, then
+                         renamed/moved to ARCHIVE_DIR on rotation
+                         (no re-encoding, no remux step)
   ARCHIVE_SEGMENT_SEC    segment duration in seconds              (600)
   ARCHIVE_QUALITY        quality mode for the archive H.264 encoder.
                          One of:                                  (visually-lossless)
@@ -90,9 +101,6 @@ Environment variables:
                          is better; QP 18 is the conventional visually-
                          lossless threshold for H.264.  Ignored in 'lossless'
                          and 'legacy' modes.                              (18)
-  ARCHIVE_BITRATE_CAP    kbps ceiling on instantaneous bitrate in CQP modes
-                         so a chaotic frame can't blow up segment size.
-                         100000 = 100 Mbps.                          (100000)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps; used only by
                          ARCHIVE_QUALITY=legacy.                       (6000)
   ARCHIVE_QUEUE_MAX_BYTES bytes of raw video the q_arch queue may buffer
@@ -119,7 +127,6 @@ import os
 import queue
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -141,7 +148,6 @@ ARCHIVE_LIVE_DIR        = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
 ARCHIVE_SEGMENT_SEC     = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_QUALITY         = os.environ.get('ARCHIVE_QUALITY', 'visually-lossless').strip().lower()
 ARCHIVE_QP              = int(os.environ.get('ARCHIVE_QP', '18'))
-ARCHIVE_BITRATE_CAP     = int(os.environ.get('ARCHIVE_BITRATE_CAP', '100000'))   # kbps
 ARCHIVE_BITRATE         = int(os.environ.get('ARCHIVE_BITRATE', '6000'))         # kbps, legacy mode
 ARCHIVE_QUEUE_MAX_BYTES = int(os.environ.get('ARCHIVE_QUEUE_MAX_BYTES', str(512 * 1024 * 1024)))
 ARCHIVE_QUEUE_MAX_SEC   = int(os.environ.get('ARCHIVE_QUEUE_MAX_SEC',   '5'))
@@ -205,7 +211,7 @@ def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
     """
     factory = encoder.get_factory()
     name    = factory.get_name() if factory else '<unknown>'
-    if name in ('x264enc', 'nvh264enc'):
+    if name in ('x264enc', 'nvh264enc', 'nvcudah264enc'):
         # H.264 QP scale is 0–51.
         _set_if_present(encoder, 'qp-min', 0)
         _set_if_present(encoder, 'qp-max', 51)
@@ -261,8 +267,7 @@ def _on_q_arch_overrun(_queue):
 def build_archive_encoder():
     """Pick the first available encoder factory and apply its properties."""
     plan = archive_encoder_plan(
-        quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP,
-        bitrate_cap=ARCHIVE_BITRATE_CAP, bitrate_legacy=ARCHIVE_BITRATE,
+        quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP, bitrate_legacy=ARCHIVE_BITRATE,
     )
     for factory_name, props in plan:
         if not Gst.ElementFactory.find(factory_name):
@@ -275,15 +280,13 @@ def build_archive_encoder():
                   f'mode=legacy bitrate={ARCHIVE_BITRATE}kbps', flush=True)
         elif ARCHIVE_QUALITY == 'lossless':
             print(f'[service] archive encoder: {factory_name} '
-                  f'mode=lossless (QP=0, max={ARCHIVE_BITRATE_CAP}kbps)',
-                  flush=True)
+                  f'mode=lossless (QP=0)', flush=True)
         else:
             print(f'[service] archive encoder: {factory_name} '
-                  f'mode=visually-lossless (QP={ARCHIVE_QP}, '
-                  f'max={ARCHIVE_BITRATE_CAP}kbps)', flush=True)
+                  f'mode=visually-lossless (QP={ARCHIVE_QP})', flush=True)
         return enc
     print('[service] ERROR: no archive encoder available '
-          '(need nvh264enc or x264enc)', file=sys.stderr)
+          '(need nvh264enc/nvcudah264enc or x264enc)', file=sys.stderr)
     sys.exit(1)
 
 
@@ -301,7 +304,7 @@ def main():
     os.makedirs(ARCHIVE_LIVE_DIR, exist_ok=True)
 
     segment_ns      = ARCHIVE_SEGMENT_SEC * Gst.SECOND
-    archive_pattern = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-%05d.mkv')
+    archive_pattern = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-%05d.mp4')
 
     print('[service] Starting stream service:', flush=True)
     print(f'  Desktop name      : {desktop_name}')
@@ -507,116 +510,80 @@ def main():
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
     # independently decodable without seeking to the start.
+    #
+    # splitmuxsink + mp4mux with fragment-duration produces a fragmented MP4
+    # per segment.  Completed files (after splitmuxsink EOSes the muxer on
+    # rotation) are fully valid MP4 — moov is written at the end by mp4mux
+    # and ffmpeg/browsers parse them fine.  The active in-progress file
+    # has no parseable moov; /archive's active-segment branch handles that
+    # case by walking the file's `mdat` boxes and remuxing on demand (see
+    # `_copy_active_to_stage` in web_server.py).
+    #
+    # We tried fragment-mode=first-moov here, hoping to get moov-at-front
+    # mid-write — but in this build of mp4mux it didn't deliver a
+    # parseable in-progress file in practice (the integration tests still
+    # saw "moov atom not found").  The simpler hybrid wins: rollover is a
+    # rename (no ffmpeg), and only the active-segment serve path pays the
+    # remux cost.
+    #
+    # fragment-duration=1000 ms aligns each fragment with our 30-frame GOP
+    # (1 s at 30 fps), so each mdat box ends up holding one GOP — a
+    # convenient unit for the mdat-walker in web_server.py.
     arch_h264.set_property('config-interval', -1)
-    archive.set_property('muxer-factory', 'matroskamux')
+    archive.set_property('muxer-factory', 'mp4mux')
+    muxer_props = Gst.Structure.new_from_string(
+        'properties, fragment-duration=(uint)1000'
+    )
+    archive.set_property('muxer-properties', muxer_props)
     archive.set_property('location', archive_pattern)
     archive.set_property('max-size-time', segment_ns)
 
-    # ── Finalize completed segments: remux MKV → MP4 (faststart), then move
+    # ── Finalize completed segments: rename live .mp4 → timestamped .mp4
     # GStreamer's internal clock and Python's time.time() may use different
     # reference points (host CLOCK_MONOTONIC vs container-scoped monotonic).
     # Avoid the mismatch entirely by stamping segments with time.time() at
     # callback invocation.  The end of one fragment == start of the next
     # because both reads happen in the same callback call.
     #
-    # The remux runs on a single background daemon thread so the GStreamer
-    # streaming thread (the one that fires format-location-full) never blocks
-    # on ffmpeg I/O.  ffmpeg is invoked with `-c copy` so no re-encoding
-    # happens; `+faststart` rewrites the moov atom to the front of the file
-    # for web-player progressive playback.
+    # Because the live container is fragmented MP4, the file splitmuxsink
+    # just closed is already a complete, web-player-friendly MP4 — no
+    # remux step is needed.  Finalize is therefore just "rename to the
+    # timestamp-based name and move to ARCHIVE_DIR".  On same-fs setups
+    # that's an instant os.rename; on cross-fs setups (e.g. LIVE on tmpfs,
+    # ARCHIVE on bulk disk) shutil.move performs a single read+write copy.
+    # The worker thread keeps that copy off the GStreamer streaming thread
+    # so cross-fs publication can never stall the pipeline.
     _fragment_starts = {}    # fragment_id -> start nanoseconds (Unix wall-clock)
     _finalize_queue  = queue.Queue()
 
-    def _remux_to_mp4(src, dst):
-        """Remux MKV → MP4 with faststart.  Returns True on success.
-
-        `-f mp4` is passed explicitly because the on-disk filename has a
-        `.mp4.part` suffix during the write — ffmpeg's normal
-        extension-based muxer detection sees `.part` and fails with
-        "Unable to choose an output format".  The atomic rename to the
-        final `.mp4` happens after this call returns.
-        """
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
-             '-fflags', '+genpts', '-i', src,
-             '-c', 'copy', '-map', '0:v:0',
-             '-movflags', '+faststart',
-             '-f', 'mp4', dst],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode('utf-8', errors='replace')[-1000:]
-            print(f'[service] ERROR: ffmpeg remux {src} -> {dst} failed '
-                  f'(exit {result.returncode}): {stderr}',
-                  file=sys.stderr, flush=True)
-            return False
-        return True
-
     def _finalize_fragment(src, dst):
-        """Remux src .mkv to dst .mp4 (faststart) and remove the source.
+        """Publish a completed live .mp4 fragment as a timestamped .mp4.
 
-        ffmpeg writes the new MP4 alongside the source in ARCHIVE_LIVE_DIR
-        (under a `.part` suffix) so /archive never sees a partial file.
-        `+faststart` does a 2-pass write — the file passes through several
-        intermediate states before the moov atom lands at the front — and
-        keeping all of that confined to ARCHIVE_LIVE_DIR means /archive's
-        `*.mp4` glob only ever lists fully-finalized segments.
+        The move is staged via a `.part` suffix in ARCHIVE_DIR so /archive's
+        `*.mp4` glob never matches a partially-copied file: on cross-fs
+        setups shutil.move writes bytes into the `.part` name, then the
+        atomic os.rename publishes them under the final name in one step.
+        On same-fs setups shutil.move is itself an os.rename, so this is
+        effectively a no-op extra rename — still cheap.
 
-        Once ffmpeg succeeds we publish to ARCHIVE_DIR via a `.part` →
-        final-name rename so the publication itself is atomic within
-        ARCHIVE_DIR even when ARCHIVE_LIVE_DIR and ARCHIVE_DIR are on
-        different filesystems (the cross-fs copy lands under .part; the
-        rename to the final name is on a single filesystem).
-
-        Falls back to moving the .mkv (under a .mkv name in ARCHIVE_DIR)
-        when ffmpeg fails so we never lose the recording.
+        If the move ever fails (disk full, permission, etc.) we leave the
+        source in ARCHIVE_LIVE_DIR under its sequential name so the
+        recording is not lost; the operator can recover manually.
         """
-        tmp_dst        = os.path.join(ARCHIVE_LIVE_DIR,
-                                      os.path.basename(dst) + '.part')
-        publish_part   = dst + '.part'
-
-        if _remux_to_mp4(src, tmp_dst):
-            try:
-                shutil.move(tmp_dst, publish_part)
-                os.rename(publish_part, dst)
-            except OSError as exc:
-                print(f'[service] WARNING: could not publish {tmp_dst} as '
-                      f'{dst}: {exc}', file=sys.stderr, flush=True)
-                for path in (tmp_dst, publish_part):
-                    try:
-                        os.unlink(path)
-                    except FileNotFoundError:
-                        pass
-                return
-            try:
-                os.unlink(src)
-            except OSError as exc:
-                print(f'[service] WARNING: could not unlink {src}: {exc}',
-                      file=sys.stderr, flush=True)
-            print(f'[service] archive: {os.path.basename(src)}'
-                  f' -> {os.path.basename(dst)}', flush=True)
-            return
-
-        # ffmpeg failed — clean up its partial output and keep the .mkv.
+        publish_part = dst + '.part'
         try:
-            os.unlink(tmp_dst)
-        except FileNotFoundError:
-            pass
-
-        fallback      = os.path.splitext(dst)[0] + '.mkv'
-        fallback_part = fallback + '.part'
-        try:
-            shutil.move(src, fallback_part)
-            os.rename(fallback_part, fallback)
-            print(f'[service] archive: fallback move {os.path.basename(src)}'
-                  f' -> {os.path.basename(fallback)}', flush=True)
+            shutil.move(src, publish_part)
+            os.rename(publish_part, dst)
         except OSError as exc:
-            print(f'[service] WARNING: could not move {src} to {fallback}: {exc}',
+            print(f'[service] WARNING: could not publish {src} as {dst}: {exc}',
                   file=sys.stderr, flush=True)
             try:
-                os.unlink(fallback_part)
+                os.unlink(publish_part)
             except FileNotFoundError:
                 pass
+            return
+        print(f'[service] archive: {os.path.basename(src)}'
+              f' -> {os.path.basename(dst)}', flush=True)
 
     def _finalize_worker():
         while True:
@@ -636,7 +603,7 @@ def main():
         if frag_id not in _fragment_starts:
             return
         start_ns = _fragment_starts.pop(frag_id)
-        src = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-{frag_id:05d}.mkv')
+        src = os.path.join(ARCHIVE_LIVE_DIR, f'{archive_prefix}-{frag_id:05d}.mp4')
         dst = renamed_segment_path(src, start_ns, end_ns, archive_prefix,
                                    dest_dir=ARCHIVE_DIR, ext='.mp4')
         _finalize_queue.put((src, dst))
@@ -676,9 +643,10 @@ def main():
     #    the tee outputs to the archive and webrtc branches.
 
     tee.link(q_arch)
-    # On the GPU path, nvh264enc consumes CUDA memory natively — no extra
-    # copy needed.  If the runtime fell back to x264enc (CPU encoder), we
-    # insert a single cudadownload so the encoder sees system memory.
+    # On the GPU path, nvcudah264enc / nvh264enc consume CUDA memory natively
+    # — no extra copy needed.  If the runtime fell back to x264enc (CPU
+    # encoder), we insert a single cudadownload so the encoder sees system
+    # memory.
     arch_factory = arch_enc.get_factory()
     arch_is_software = (
         arch_factory is not None and arch_factory.get_name() == 'x264enc'
@@ -690,11 +658,10 @@ def main():
     else:
         q_arch.link(arch_enc)
     arch_enc.link(arch_h264)
-    # Explicitly negotiate AVCC (length-prefixed) format so matroskamux writes
-    # SPS/PPS in CodecPrivate and NALUs as length-prefixed — without this,
-    # some GStreamer versions negotiate byte-stream (Annex B) format, which
-    # lands in an AVCC-container without proper CodecPrivate, breaking ffprobe
-    # and ffmpeg decoding of the archived segments.
+    # Explicitly negotiate AVCC (length-prefixed) format so mp4mux writes
+    # SPS/PPS in the `avcC` box and NALUs as length-prefixed — mp4mux only
+    # accepts AVCC, and pinning the caps here means h264parse handles any
+    # byte-stream → AVCC conversion before the muxer sees the buffers.
     arch_h264.link_filtered(
         archive,
         Gst.Caps.from_string('video/x-h264, stream-format=avc, alignment=au'),

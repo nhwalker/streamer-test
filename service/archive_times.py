@@ -24,7 +24,7 @@ def renamed_segment_path(location, start_ns, end_ns, prefix,
                          dest_dir=None, ext=None):
     """Return the new file path for a completed segment.
 
-    location  current file path (e.g. /archive-live/stream-00001.mkv)
+    location  current file path (e.g. /archive-live/stream-00001.mp4)
     start_ns  recording start time in nanoseconds since epoch (UTC)
     end_ns    recording end time in nanoseconds since epoch (UTC)
     prefix    configurable filename prefix (e.g. 'stream')

@@ -301,13 +301,13 @@ def turn_params():
 
 
 def _wait_for_first_segment(live_dir, timeout=30.0):
-    """Wait for the first in-progress stream-NNNNN.mkv to appear in live_dir."""
+    """Wait for the first in-progress stream-NNNNN.mp4 to appear in live_dir."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if os.path.isdir(live_dir):
             first = min(
                 (f for f in os.listdir(live_dir)
-                 if f.startswith("stream-") and f.endswith(".mkv")),
+                 if f.startswith("stream-") and f.endswith(".mp4")),
                 default=None,
             )
             if first:
@@ -318,11 +318,11 @@ def _wait_for_first_segment(live_dir, timeout=30.0):
 
 @pytest.fixture(scope="session")
 def first_segment(streaming_container, archive_live_dir, archive_dir, _service):
-    """Path to the first in-progress .mkv segment, waiting up to 30 s.
+    """Path to the first in-progress .mp4 segment, waiting up to 30 s.
 
-    The active segment is written into archive_live_dir; only after a
-    fragment rotates does it move into archive_dir under its timestamp
-    name.
+    The active segment is written into archive_live_dir as a fragmented
+    MP4; only after a fragment rotates does it move into archive_dir
+    under its timestamp name.
     """
     path = _wait_for_first_segment(archive_live_dir, timeout=30.0)
     if path is None:
@@ -332,7 +332,7 @@ def first_segment(streaming_container, archive_live_dir, archive_dir, _service):
         archive_listing = os.listdir(archive_dir) \
             if os.path.isdir(archive_dir) else []
         raise RuntimeError(
-            f"No stream-*.mkv appeared in {archive_live_dir} within 30 s.\n"
+            f"No stream-*.mp4 appeared in {archive_live_dir} within 30 s.\n"
             f"Live dir listing:    {live_listing}\n"
             f"Archive dir listing: {archive_listing}\n"
             f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
