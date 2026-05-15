@@ -1,10 +1,11 @@
 # ─── Desktop-stream Viewer ────────────────────────────────────────────────────
 # Electron app that opens the hub's WebRTC viewer page with hardware H.264
-# decode via VA-API → NVDEC (using elFarto's nvidia-vaapi-driver). Decode only;
-# no encoder is configured. The container is meant to be launched against a
-# real host X11 socket — no Xvfb, no virtual display.
+# decode via VA-API → NVDEC. The libva backend (libva-nvidia-driver) comes
+# from RPM Fusion nonfree; we do not build it from source. Decode only; no
+# encoder is configured. The container is meant to be launched against a real
+# host X11 socket — no Xvfb, no virtual display.
 #
-# Build order:
+# Build:
 #   podman build -t desktop-stream-viewer viewer/
 #
 # Run (host X11):
@@ -51,43 +52,11 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         > /etc/yum.repos.d/rocky10-supplement.repo \
     && dnf install -y \
         https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
+        https://mirrors.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-10.noarch.rpm \
     && dnf clean all
 
-# ── Stage 1: build nvidia-vaapi-driver from source ───────────────────────────
-# Chromium on Linux only routes WebRTC video through VA-API; NVENC/NVDEC is
-# reached via a libva backend that translates VA-API calls to NVDEC. We need
-# nv-codec-headers (for the CUDA video API headers) plus libva headers and
-# gst-plugins-bad's codecparsers helpers.
-FROM rocky-repos AS vaapi-builder
-
-RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
-        gcc make git pkgconf-pkg-config \
-        meson ninja-build \
-        libva-devel \
-        glib2-devel \
-        gstreamer1-plugins-bad-free-devel \
-        libglvnd-devel \
-    && dnf clean all
-
-ARG NV_CODEC_HEADERS_TAG=n12.2.72.0
-RUN git clone --depth 1 --branch "${NV_CODEC_HEADERS_TAG}" \
-        https://github.com/FFmpeg/nv-codec-headers.git /nv-codec-headers \
-    && make -C /nv-codec-headers PREFIX=/usr install \
-    && rm -rf /nv-codec-headers
-
-ARG NVIDIA_VAAPI_DRIVER_TAG=v0.0.12
-RUN git clone --depth 1 --branch "${NVIDIA_VAAPI_DRIVER_TAG}" \
-        https://github.com/elFarto/nvidia-vaapi-driver.git /src \
-    && cd /src \
-    && meson setup build \
-           --prefix=/usr \
-           --libdir=lib64 \
-           --buildtype=release \
-    && meson compile -C build \
-    && DESTDIR=/out meson install -C build \
-    && find /out -name 'nvidia_drv_video.so'
-
-# ── Stage 2: install Electron + bundle the app ───────────────────────────────
+# ── Stage 1: install Electron + bundle the app ───────────────────────────────
 FROM rocky-repos AS app-builder
 
 RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
@@ -99,11 +68,12 @@ COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund --loglevel=error
 COPY main.js ./
 
-# ── Stage 3: runtime ─────────────────────────────────────────────────────────
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM rocky-repos AS runtime
 
-# Chromium / Electron shared-library dependencies, libva runtime, Node (to run
-# the electron launcher script), and a few X11 utilities for debugging.
+# Chromium / Electron shared-library deps, libva + libva-nvidia-driver
+# (RPM Fusion nonfree), Node (to run the electron launcher), and a few X11
+# utilities for debugging.
 RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         nss nspr \
         atk at-spi2-atk at-spi2-core \
@@ -114,16 +84,12 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         libXrandr libXrender libXScrnSaver libXtst libXi \
         libxcb libxshmfence libsecret \
         pango cairo gtk3 alsa-lib \
-        libva libva-utils \
+        libva libva-utils libva-nvidia-driver \
         nodejs \
         xorg-x11-utils \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf* \
               /usr/share/doc /usr/share/man /usr/share/info
-
-# nvidia-vaapi-driver: a single .so loaded by libva when LIBVA_DRIVER_NAME=nvidia
-COPY --from=vaapi-builder /out/usr/lib64/dri/nvidia_drv_video.so \
-                          /usr/lib64/dri/nvidia_drv_video.so
 
 # Electron application
 COPY --from=app-builder /app /opt/viewer
@@ -133,7 +99,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # NVIDIA Container Toolkit env: 'video' lets nvcuvid mount in, 'graphics' and
 # 'display' bring in the GL/EGL stack, 'compute' is needed by the direct
-# (CUDA) backend in nvidia-vaapi-driver.
+# (CUDA) backend in libva-nvidia-driver.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics,display \
     LIBVA_DRIVER_NAME=nvidia \
