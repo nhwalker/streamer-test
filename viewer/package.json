@@ -1,0 +1,13 @@
+{
+  "name": "desktop-stream-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron viewer that opens the desktop-stream hub with hardware H.264 decode via VA-API/NVDEC.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^33.0.0"
+  }
+}
