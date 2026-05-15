@@ -36,12 +36,20 @@ def test_default_mode_is_visually_lossless():
 
 @pytest.mark.parametrize('quality', VALID_ARCHIVE_QUALITIES)
 def test_every_mode_offers_both_encoders(quality):
-    """nvh264enc must come first (preferred) and x264enc must be a fallback."""
+    """NVENC variants preferred (cuda-aware first), x264enc as fallback."""
     plan = archive_encoder_plan(quality=quality)
     factories = [name for name, _ in plan]
-    assert factories == ['nvh264enc', 'x264enc'], (
-        f'{quality}: expected nvh264enc preferred + x264enc fallback'
+    assert factories == ['nvcudah264enc', 'nvh264enc', 'x264enc'], (
+        f'{quality}: expected nvcudah264enc -> nvh264enc -> x264enc ordering'
     )
+
+
+@pytest.mark.parametrize('quality', VALID_ARCHIVE_QUALITIES)
+def test_nvenc_variants_share_property_dict(quality):
+    """Both NVENC variants must apply the same configuration — they share
+    the property API and the runtime picks whichever is registered."""
+    plan = archive_encoder_plan(quality=quality)
+    assert _props(plan, 'nvcudah264enc') == _props(plan, 'nvh264enc')
 
 
 def test_unknown_mode_raises():
@@ -79,12 +87,16 @@ def test_visually_lossless_nvh264enc_uses_constqp_at_qp():
     assert props['qp-const-i'] == 18
     assert props['qp-const-p'] == 18
     assert props['qp-const-b'] == 18
-    # Latency-tuned preset and gop-size match legacy so we know the encoder
-    # negotiates / prerolls the same way it did before quality tuning.
-    assert props['preset']      == 'low-latency-hq'
+    # Archive has no latency requirement (live viewers go via WebRTC), so the
+    # encoder switches to the high-quality preset with B-frames for better
+    # compression at the same QP.
+    assert props['preset']      == 'hq'
+    assert props['bframes']     == 2
     assert props['gop-size']    == 30
-    # max-bitrate caps a chaotic frame so we never blow up segment size.
-    assert props['max-bitrate'] == 100000
+    # max-bitrate is intentionally absent: NVENC ignores it under
+    # rc-mode=constqp (the property is only honored in vbr/cbr modes), so
+    # advertising a "cap" that doesn't apply was misleading.
+    assert 'max-bitrate' not in props
 
 
 def test_visually_lossless_qp_override_propagates_to_both_encoders():
@@ -92,12 +104,6 @@ def test_visually_lossless_qp_override_propagates_to_both_encoders():
     assert _props(plan, 'x264enc')['quantizer']    == 22
     assert _props(plan, 'nvh264enc')['qp-const']   == 22
     assert _props(plan, 'nvh264enc')['qp-const-p'] == 22
-
-
-def test_visually_lossless_bitrate_cap_overrides():
-    plan = archive_encoder_plan(quality='visually-lossless',
-                                bitrate_cap=25000)
-    assert _props(plan, 'nvh264enc')['max-bitrate'] == 25000
 
 
 # ── lossless: opt-in true lossless ──────────────────────────────────────────
@@ -124,11 +130,12 @@ def test_lossless_nvh264enc_pins_qp_to_zero():
     assert props['qp-const-p'] == 0
     assert props['qp-const-b'] == 0
     assert props['rc-mode']    == 'constqp'
-    # Latency-tuned preset kept rather than 'lossless-hp', because not every
-    # gst-plugins-rs build exposes that preset and we'd rather negotiate
-    # against the same preset legacy used and rely on rc-mode/qp-const for
-    # the actual lossless behavior.
-    assert props['preset']     == 'low-latency-hq'
+    # High-quality preset + B-frames: the archive has no latency requirement
+    # so the encoder is free to use the slower preset for better compression.
+    # 'hq' is the conservative choice over 'lossless'/'lossless-hp' which
+    # aren't exposed on every gst-plugins-bad build.
+    assert props['preset']     == 'hq'
+    assert props['bframes']    == 2
 
 
 def test_lossless_ignores_qp_override():
@@ -172,24 +179,33 @@ def test_legacy_bitrate_override_propagates():
 # ── Rate-control switch is the only intentional change vs legacy ────────────
 
 @pytest.mark.parametrize('quality', ['visually-lossless', 'lossless'])
-def test_new_modes_match_legacy_cpu_profile(quality):
-    """The new modes deliberately keep the legacy preset / tune / speed-preset
-    triple so the encoder negotiates and prerolls along the same code path.
+def test_x264_fallback_keeps_legacy_latency_profile(quality):
+    """x264enc deliberately keeps the legacy tune / speed-preset triple.
 
-    An earlier draft of this PR dropped tune=zerolatency and switched to
+    An earlier draft dropped tune=zerolatency and switched to
     speed-preset=4 (faster) / pass=qual / qp-min=0 in the new modes.  CI
     found that the service pipeline got stuck in PAUSED — the archive
     encoder never produced its first buffer, so splitmuxsink never opened
-    a segment and `awaitFirstSegment()` timed out.  Until we have a way
-    to investigate that interaction (likely qp-min=0 with pass=qual on
-    this build of x264enc), the safer move is to keep the latency tunings
-    and only flip rate-control mode.
+    a segment and `awaitFirstSegment()` timed out.  The suspected
+    interaction (qp-min=0 with pass=qual on this build of x264enc) was
+    never fully understood, so x264enc stays on the legacy negotiation
+    path; the NVENC encoders are free to take the slower presets because
+    that path was never implicated.
     """
     plan = archive_encoder_plan(quality=quality)
     x264_props = _props(plan, 'x264enc')
-    nv_props   = _props(plan, 'nvh264enc')
     assert x264_props['tune']         == 0x4
     assert x264_props['speed-preset'] == 1
     assert x264_props['key-int-max']  == 30
-    assert nv_props['preset']         == 'low-latency-hq'
-    assert nv_props['gop-size']       == 30
+
+
+@pytest.mark.parametrize('quality', ['visually-lossless', 'lossless'])
+def test_nvenc_modes_drop_legacy_latency_preset(quality):
+    """NVENC archive encoders use the high-quality preset; the archive has no
+    latency requirement (live viewers go through the WebRTC branch)."""
+    plan = archive_encoder_plan(quality=quality)
+    for factory in ('nvcudah264enc', 'nvh264enc'):
+        nv_props = _props(plan, factory)
+        assert nv_props['preset']   == 'hq'
+        assert nv_props['bframes']  == 2
+        assert nv_props['gop-size'] == 30

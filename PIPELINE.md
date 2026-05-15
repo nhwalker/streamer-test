@@ -15,7 +15,7 @@ that serves the archive download and video-assembly endpoints.
 │                                                                          │
 │  GPU path (preferred, taken when libgstnvcodec.so loads):                │
 │  ximagesrc → videorate → cudaupload → cudaconvertscale → tee             │
-│                                                       ├─ q_arch → nvh264enc │
+│                                                       ├─ q_arch → nvcudah264enc / nvh264enc │
 │                                                       │          → h264parse │
 │                                                       │          → splitmuxsink │
 │                                                       │   (live .mkv → .mp4 on │
@@ -97,8 +97,9 @@ ximagesrc display-name=:0 use-damage=false
   ! cudaconvertscale
   ! video/x-raw(memory:CUDAMemory),format=NV12,width=1920,height=1080
   ! tee name=t
-      t. ! queue ! nvh264enc ! h264parse ! splitmuxsink (archive)
-         (if x264enc fallback was selected, prepend ! cudadownload before the encoder)
+      t. ! queue ! nvcudah264enc ! h264parse ! splitmuxsink (archive)
+         (nvcudah264enc is preferred; falls back to nvh264enc, then to x264enc.
+          if x264enc fallback is selected, prepend ! cudadownload before the encoder)
       t. ! queue ! tee name=t_webrtc
           (per WEBRTC_SCALE_LADDER tier, per stream:)
           t_webrtc. ! queue ! cudascale ! capsfilter(W,H,CUDA) ! webrtcsink   (full,  tier i)
@@ -218,11 +219,26 @@ Setting `ARCHIVE_QUEUE_MAX_BYTES=0` and `ARCHIVE_QUEUE_MAX_SEC=0` reverts to
 the legacy unbounded behaviour: zero archive frame loss, but the queue can
 grow without limit if the encoder cannot keep up.
 
-#### `nvh264enc` or `x264enc` (name: `arch_enc`)
+#### `nvcudah264enc` / `nvh264enc` / `x264enc` (name: `arch_enc`)
 
-Re-encodes the raw decoded video to H.264 for the archive.  The encoder is
-selected at runtime (`build_archive_encoder()`) based on `ARCHIVE_QUALITY`,
-which has three modes:
+Re-encodes the raw decoded video to H.264 for the archive.  The encoder
+factory is selected at runtime (`build_archive_encoder()`) by walking a
+preference list and picking the first factory that is registered:
+
+1. **`nvcudah264enc`** — CUDA-context-aware NVENC.  Shares the gst-cuda
+   buffer pool with upstream `cudaupload`/`cudaconvertscale`, so the
+   handoff into the encoder reuses the same CUDA context without an
+   internal rebind.  Present on gst-plugins-bad ≥ 1.22.
+2. **`nvh264enc`** — original NVENC element.  Still consumes CUDAMemory
+   natively but predates the unified CUDA memory model.
+3. **`x264enc`** — software fallback.  Used when no NVENC element is
+   registered (typically a CPU-only host).
+
+Both NVENC variants share the same property API and receive the same
+configuration dict; the table rows below labelled `nvh264enc` apply to
+`nvcudah264enc` as well.
+
+`ARCHIVE_QUALITY` selects between three modes:
 
 **`ARCHIVE_QUALITY=visually-lossless`** *(default)* — constant-quantizer
 encoding at `ARCHIVE_QP` (default 18).  Indistinguishable from the source
@@ -232,9 +248,9 @@ on screen content; ~2-4× the file size of `legacy` mode.
 |---|---|---|---|
 | `nvh264enc` | `rc-mode` | `constqp` | Quality-targeted (not bitrate-targeted) |
 | `nvh264enc` | `qp-const{,-i,-p,-b}` | `ARCHIVE_QP` | All QP knobs at the configured value (build-version compat) |
-| `nvh264enc` | `preset` | `low-latency-hq` | Same as legacy mode — see note below |
-| `nvh264enc` | `gop-size` | `30` | Same as legacy mode |
-| `nvh264enc` | `max-bitrate` | `ARCHIVE_BITRATE_CAP` kbps (default 100 000) | Ceiling so a chaotic frame can't blow up segment size |
+| `nvh264enc` | `preset` | `hq` | High-quality preset — archive has no latency requirement |
+| `nvh264enc` | `bframes` | `2` | B-frames improve compression on screen content |
+| `nvh264enc` | `gop-size` | `30` | Keyframe interval (one IDR per second at 30 fps) |
 | `x264enc`   | `pass` | `4` (quant) | Constant quantizer at `ARCHIVE_QP` |
 | `x264enc`   | `quantizer` | `ARCHIVE_QP` | Constant QP value |
 | `x264enc`   | `tune` | `0x4` (zerolatency) | Same as legacy mode — see note below |
@@ -248,7 +264,8 @@ large (50–200 Mbps during heavy motion); set `ARCHIVE_MAX_BYTES`.
 |---|---|---|
 | `nvh264enc` | `rc-mode` | `constqp` |
 | `nvh264enc` | `qp-const{,-i,-p,-b}` | `0` |
-| `nvh264enc` | `preset` | `low-latency-hq` |
+| `nvh264enc` | `preset` | `hq` |
+| `nvh264enc` | `bframes` | `2` |
 | `nvh264enc` | `gop-size` | `30` |
 | `x264enc`   | `pass` | `4` (quant — true CQP) |
 | `x264enc`   | `quantizer` | `0` |
@@ -257,17 +274,27 @@ large (50–200 Mbps during heavy motion); set `ARCHIVE_MAX_BYTES`.
 | `x264enc`   | `speed-preset` | `1` (ultrafast) |
 | `x264enc`   | `key-int-max` | `30` |
 
-**Why the new modes keep `tune=zerolatency`, `speed-preset=ultrafast`, and
-`preset=low-latency-hq`:** an earlier draft dropped these settings on the
-grounds that the archive isn't latency-sensitive, and pushed `x264enc` to
-`speed-preset=faster` / `pass=qual` (CRF) and `nvh264enc` to
-`preset=high-quality`.  CI surfaced a hang — the archive encoder never
-produced its first buffer, so the pipeline got stuck in PAUSED and
-`splitmuxsink` never opened a segment.  Reverting the latency tunings to
-exactly match `legacy` mode keeps the encoder on the same negotiation
-path, and switching only `rc-mode` / `pass` / `quantizer` is enough to
-move from bitrate-targeted to quality-targeted output.  We can revisit
-the slower presets in a follow-up once the interaction is understood.
+**Why `x264enc` keeps the legacy latency tunings while NVENC takes the
+slower preset:** an earlier draft dropped `tune=zerolatency` /
+`speed-preset=ultrafast` from `x264enc` (pushing it to
+`speed-preset=faster` / `pass=qual` / `qp-min=0`) at the same time as
+swapping `nvh264enc` to `preset=high-quality`.  CI surfaced a hang — the
+archive encoder never produced its first buffer, so the pipeline got
+stuck in PAUSED and `splitmuxsink` never opened a segment.  Bisecting in
+the test docs narrows the cause to the `x264enc` change (suspected
+`qp-min=0` + `pass=qual` interaction); the NVENC path was never
+implicated.  So `x264enc` stays on the legacy negotiation path while
+`nvcudah264enc`/`nvh264enc` are free to use `preset=hq` + `bframes=2`
+for better compression at the same QP.
+
+**Why there is no bitrate cap on CQP modes:** NVENC's `max-bitrate`
+property is only honored under `rc-mode=vbr*`/`cbr*`.  Under `constqp`
+the encoder emits whatever bitrate the configured QP dictates; setting
+`max-bitrate` is a silent no-op.  Earlier docs advertised an
+`ARCHIVE_BITRATE_CAP` knob; it never actually capped anything, so it has
+been removed.  Operators who need a hard ceiling on archive size should
+combine `ARCHIVE_MAX_BYTES` with `ARCHIVE_MAX_AGE_DAYS`, or switch to
+`ARCHIVE_QUALITY=legacy` (VBR with `ARCHIVE_BITRATE`).
 
 **`ARCHIVE_QUALITY=legacy`** — byte-for-byte compatible with the
 configuration shipped before the archive quality work.  `ARCHIVE_BITRATE`
@@ -288,12 +315,6 @@ The archive encoder runs independently of the browser-facing `webrtcsink`
 instances and the network — its quality is fixed at the configured QP rather
 than reactive to viewer bandwidth.  This means the archived recording always
 carries the configured quality, even when individual viewers are throttled.
-
-The `visually-lossless` and `lossless` modes deliberately drop the
-`tune=zerolatency` / `preset=low-latency-hq` settings: viewers see the
-screen via the WebRTC branch, so the archive encoder has no latency
-requirement and is free to use larger lookahead and B-frames for better
-compression.
 
 #### `h264parse` (name: `arch_h264`)
 
@@ -688,7 +709,6 @@ window.  Requests longer than 12 hours are rejected with 400.
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration in seconds |
 | `ARCHIVE_QUALITY` | `visually-lossless` | Encoder quality mode: `visually-lossless` (CRF/CQP at `ARCHIVE_QP`), `lossless` (true QP=0), or `legacy` (fixed-bitrate VBR using `ARCHIVE_BITRATE`) |
 | `ARCHIVE_QP` | `18` | QP for `visually-lossless` mode (0–51, lower is better; 18 is the conventional visually-lossless threshold for H.264).  Ignored in other modes |
-| `ARCHIVE_BITRATE_CAP` | `100000` | kbps ceiling on instantaneous bitrate in CQP modes — caps a chaotic frame from blowing up segment size |
 | `ARCHIVE_BITRATE` | `6000` | Archive H.264 bitrate in kbps; consulted only when `ARCHIVE_QUALITY=legacy` |
 | `ARCHIVE_QUEUE_MAX_BYTES` | `536870912` (512 MB) | Bytes of raw video the `q_arch` queue may buffer before dropping the oldest frame.  Set to `0` to disable the byte gate |
 | `ARCHIVE_QUEUE_MAX_SEC` | `5` | Seconds of running-time the `q_arch` queue may buffer before dropping the oldest frame.  Set to `0` to disable the time gate |

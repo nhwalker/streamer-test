@@ -17,9 +17,12 @@ CPU fallback path:
 
 A single `cudaupload` at the head of the GPU path keeps every downstream
 element working in CUDA memory; `tee` distributes GPU-buffer references
-rather than re-copying the frame for each branch.  `nvh264enc` (archive)
-and per-tier `cudascale` (WebRTC fan-out) consume the CUDA buffers
-directly without re-uploading.
+rather than re-copying the frame for each branch.  The archive encoder
+(`nvcudah264enc` when available, else `nvh264enc`) and per-tier
+`cudascale` (WebRTC fan-out) consume the CUDA buffers directly without
+re-uploading.  `nvcudah264enc` is preferred because it shares the
+gst-cuda buffer pool with upstream `cudaupload`/`cudaconvertscale`,
+skipping the internal context-rebind that `nvh264enc` performs.
 
 The tee fans out:
   tee. -> [cudadownload?] -> encoder -> h264parse -> splitmuxsink   (archive)
@@ -27,8 +30,9 @@ The tee fans out:
 
 The optional `cudadownload` between the archive queue and the encoder is
 only inserted when the runtime falls back to `x264enc` (software).
-`nvh264enc` accepts `video/x-raw(memory:CUDAMemory)` natively, so on the
-hardware path the archive branch has zero copies between tee and encoder.
+Both NVENC variants accept `video/x-raw(memory:CUDAMemory)` natively,
+so on the hardware path the archive branch has zero copies between tee
+and encoder.
 
 Archive segments are written as Matroska in ARCHIVE_LIVE_DIR (so the
 in-progress fragment is readable mid-write), then remuxed to MP4 with
@@ -90,9 +94,6 @@ Environment variables:
                          is better; QP 18 is the conventional visually-
                          lossless threshold for H.264.  Ignored in 'lossless'
                          and 'legacy' modes.                              (18)
-  ARCHIVE_BITRATE_CAP    kbps ceiling on instantaneous bitrate in CQP modes
-                         so a chaotic frame can't blow up segment size.
-                         100000 = 100 Mbps.                          (100000)
   ARCHIVE_BITRATE        archive H.264 bitrate in kbps; used only by
                          ARCHIVE_QUALITY=legacy.                       (6000)
   ARCHIVE_QUEUE_MAX_BYTES bytes of raw video the q_arch queue may buffer
@@ -141,7 +142,6 @@ ARCHIVE_LIVE_DIR        = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
 ARCHIVE_SEGMENT_SEC     = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 ARCHIVE_QUALITY         = os.environ.get('ARCHIVE_QUALITY', 'visually-lossless').strip().lower()
 ARCHIVE_QP              = int(os.environ.get('ARCHIVE_QP', '18'))
-ARCHIVE_BITRATE_CAP     = int(os.environ.get('ARCHIVE_BITRATE_CAP', '100000'))   # kbps
 ARCHIVE_BITRATE         = int(os.environ.get('ARCHIVE_BITRATE', '6000'))         # kbps, legacy mode
 ARCHIVE_QUEUE_MAX_BYTES = int(os.environ.get('ARCHIVE_QUEUE_MAX_BYTES', str(512 * 1024 * 1024)))
 ARCHIVE_QUEUE_MAX_SEC   = int(os.environ.get('ARCHIVE_QUEUE_MAX_SEC',   '5'))
@@ -205,7 +205,7 @@ def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
     """
     factory = encoder.get_factory()
     name    = factory.get_name() if factory else '<unknown>'
-    if name in ('x264enc', 'nvh264enc'):
+    if name in ('x264enc', 'nvh264enc', 'nvcudah264enc'):
         # H.264 QP scale is 0–51.
         _set_if_present(encoder, 'qp-min', 0)
         _set_if_present(encoder, 'qp-max', 51)
@@ -261,8 +261,7 @@ def _on_q_arch_overrun(_queue):
 def build_archive_encoder():
     """Pick the first available encoder factory and apply its properties."""
     plan = archive_encoder_plan(
-        quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP,
-        bitrate_cap=ARCHIVE_BITRATE_CAP, bitrate_legacy=ARCHIVE_BITRATE,
+        quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP, bitrate_legacy=ARCHIVE_BITRATE,
     )
     for factory_name, props in plan:
         if not Gst.ElementFactory.find(factory_name):
@@ -275,15 +274,13 @@ def build_archive_encoder():
                   f'mode=legacy bitrate={ARCHIVE_BITRATE}kbps', flush=True)
         elif ARCHIVE_QUALITY == 'lossless':
             print(f'[service] archive encoder: {factory_name} '
-                  f'mode=lossless (QP=0, max={ARCHIVE_BITRATE_CAP}kbps)',
-                  flush=True)
+                  f'mode=lossless (QP=0)', flush=True)
         else:
             print(f'[service] archive encoder: {factory_name} '
-                  f'mode=visually-lossless (QP={ARCHIVE_QP}, '
-                  f'max={ARCHIVE_BITRATE_CAP}kbps)', flush=True)
+                  f'mode=visually-lossless (QP={ARCHIVE_QP})', flush=True)
         return enc
     print('[service] ERROR: no archive encoder available '
-          '(need nvh264enc or x264enc)', file=sys.stderr)
+          '(need nvh264enc/nvcudah264enc or x264enc)', file=sys.stderr)
     sys.exit(1)
 
 
@@ -676,9 +673,10 @@ def main():
     #    the tee outputs to the archive and webrtc branches.
 
     tee.link(q_arch)
-    # On the GPU path, nvh264enc consumes CUDA memory natively — no extra
-    # copy needed.  If the runtime fell back to x264enc (CPU encoder), we
-    # insert a single cudadownload so the encoder sees system memory.
+    # On the GPU path, nvcudah264enc / nvh264enc consume CUDA memory natively
+    # — no extra copy needed.  If the runtime fell back to x264enc (CPU
+    # encoder), we insert a single cudadownload so the encoder sees system
+    # memory.
     arch_factory = arch_enc.get_factory()
     arch_is_software = (
         arch_factory is not None and arch_factory.get_name() == 'x264enc'
