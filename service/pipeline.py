@@ -2,12 +2,33 @@
 """
 pipeline.py -- desktop-stream-service: ingress -> tee -> archive + WebRTC.
 
-Ingress:
-  ximagesrc -> videorate -> videoscale -> videoconvert -> tee
+The pipeline runs on the GPU when the gst-cuda elements are registered
+(which happens automatically when libcuda.so is dlopen-able — typically
+because nvidia-container-toolkit has injected the driver libraries) and
+falls back to the equivalent software elements otherwise.
+
+GPU path (preferred):
+  ximagesrc -> videorate -> cudaupload -> cudaconvertscale -> tee
+                                          [video/x-raw(memory:CUDAMemory),
+                                           format=NV12,width=W,height=H]
+
+CPU fallback path:
+  ximagesrc -> videorate -> videoscale  -> videoconvert      -> tee
+
+A single `cudaupload` at the head of the GPU path keeps every downstream
+element working in CUDA memory; `tee` distributes GPU-buffer references
+rather than re-copying the frame for each branch.  `nvh264enc` (archive)
+and per-tier `cudascale` (WebRTC fan-out) consume the CUDA buffers
+directly without re-uploading.
 
 The tee fans out:
-  tee. -> encoder -> h264parse -> splitmuxsink matroskamux    (archive)
+  tee. -> [cudadownload?] -> encoder -> h264parse -> splitmuxsink   (archive)
   tee. -> tee_webrtc
+
+The optional `cudadownload` between the archive queue and the encoder is
+only inserted when the runtime falls back to `x264enc` (software).
+`nvh264enc` accepts `video/x-raw(memory:CUDAMemory)` natively, so on the
+hardware path the archive branch has zero copies between tee and encoder.
 
 Archive segments are written as Matroska in ARCHIVE_LIVE_DIR (so the
 in-progress fragment is readable mid-write), then remuxed to MP4 with
@@ -20,16 +41,22 @@ entry in WEBRTC_SCALE_LADDER.  Each browser picks the smallest tier whose
 dimensions still match its rendered video element and connects to that
 tier's signalling port; webrtcsink only builds its per-consumer encoder
 when a consumer actually subscribes, so an idle tier costs zero encoder
-CPU.  The upstream `videoscale` runs continuously regardless — software
-videoscale on a desktop-resolution source is cheap (a few ms/frame per
-tier).
+CPU.  Per-tier scaling stays on the GPU (`cudascale`) when available; on
+the CPU fallback it uses `videoscale` and is a few ms/frame per tier.
 
-            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 0)
-            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier 1)
-            ...                                                                          (full,  tier N-1)
-            tee_webrtc. -> queue -> crop -> videoscale -> capsfilter(WxH) -> webrtcsink  (screen 0, tier 0)
-            tee_webrtc. -> queue -> crop -> videoscale -> capsfilter(WxH) -> webrtcsink  (screen 0, tier 1)
-            ...
+GPU path:
+            tee_webrtc. -> queue -> cudascale -> capsfilter(WxH,CUDA) -> webrtcsink (full,  tier i)
+            tee_webrtc. -> queue -> cudadownload -> videocrop -> cudaupload
+                                    -> cudascale -> capsfilter(WxH,CUDA) -> webrtcsink (screen, tier i)
+
+CPU fallback:
+            tee_webrtc. -> queue -> videoscale -> capsfilter(WxH) -> webrtcsink (full,  tier i)
+            tee_webrtc. -> queue -> videocrop -> videoscale -> capsfilter(WxH) -> webrtcsink (screen, tier i)
+
+The screen branches round-trip through system memory because gst-cuda
+ships no native crop element in this build; the cost is bounded —
+`videocrop` runs on CPU but the upload-after-crop covers only the cropped
+region, smaller than the source frame.
 
 The resolution, the list of per-screen regions, and the per-tier widths,
 heights and signalling ports all come from desktop_config.load_config();
@@ -149,6 +176,20 @@ def _set_if_present(element, name, value):
             element.set_property(name, value)
     except Exception:
         pass
+
+
+# Elements required to take the GPU pipeline path.  They all live in
+# libgstnvcodec.so, which dlopen's libcuda.so when the plugin loads; with
+# the NVIDIA container toolkit injecting the driver libraries they light up
+# as a set (no separate CUDA-runtime install needed).  When the probe fails
+# the pipeline falls back to the equivalent software elements without any
+# behavioural change for callers.
+_CUDA_ELEMENTS = ('cudaupload', 'cudadownload', 'cudaconvertscale', 'cudascale')
+
+
+def _have_cuda():
+    """Return True when every gst-cuda element we rely on is registered."""
+    return all(Gst.ElementFactory.find(n) is not None for n in _CUDA_ELEMENTS)
 
 
 def _on_encoder_setup(_sink, _consumer_id, _pad_name, encoder):
@@ -310,8 +351,16 @@ def main():
         pipeline.add(el)
         return el
 
-    # ── Ingress source + videoconvert + tee
-    vconvert  = make('videoconvert', 'vconvert')
+    # Probe gst-cuda once so every branch below picks the GPU or CPU element
+    # set consistently.  Logged so operators can see at a glance which path
+    # the pipeline chose at startup.
+    have_cuda = _have_cuda()
+    print(f'  Pipeline mode     : '
+          f'{"GPU (cuda*)" if have_cuda else "CPU (videoscale/videoconvert)"}',
+          flush=True)
+
+    # ── Ingress + tee (the convert/scale elements are created below where
+    #    we know whether to use the GPU or CPU variants).
     tee       = make('tee',          't')
 
     # ── Archive branch
@@ -333,23 +382,30 @@ def main():
     # ── Browser WebRTC branch: fan out to full / per-screen streams ×
     # per-tier sub-streams.  Each (stream, tier) pair gets its own:
     #
-    #   queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
+    #   GPU path:
+    #     queue → [cudadownload → videocrop → cudaupload] → cudascale
+    #           → capsfilter(W,H,CUDAMemory) → webrtcsink
+    #
+    #   CPU fallback:
+    #     queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
     #
     # The crop is only present for screen sub-streams (the full stream
-    # serves the whole frame).  We *duplicate* the crop per tier rather
-    # than sharing one crop with a downstream tee because each tier scales
-    # to different dimensions downstream; the crop runs in source
-    # coordinates and is metadata-only on the common path, so duplication
-    # is cheap.
+    # serves the whole frame).  On the GPU path the crop runs in system
+    # memory because gst-cuda has no native crop element here, so screen
+    # branches round-trip via cudadownload → videocrop → cudaupload; the
+    # cudaupload only carries the cropped (smaller) result.  Each tier
+    # duplicates the crop rather than sharing one crop with a downstream
+    # tee because each tier scales to different dimensions; sharing the
+    # crop across tiers per screen is a possible future optimisation.
     #
     # webrtcsink already lazily creates its per-consumer encoder, so tiers
-    # with no consumer pay zero encoder CPU.  The upstream videoscale runs
-    # continuously regardless — software videoscale on a desktop-resolution
-    # source is cheap (a few ms/frame per tier), but at high tier counts on
-    # CPU-bound hosts this can add up.  A future optimisation can gate the
-    # videoscale with a valve driven by webrtcsink's consumer-added /
-    # consumer-removed signals; we leave that out for now because in 0.13.3
-    # those hooks didn't reliably keep the pipeline in PLAYING.
+    # with no consumer pay zero encoder CPU.  The upstream scale runs
+    # continuously regardless — `cudascale` is essentially free on the GPU
+    # path; `videoscale` is a few ms/frame per tier on the CPU fallback.
+    # A future optimisation can gate the scale with a valve driven by
+    # webrtcsink's consumer-added / consumer-removed signals; we leave
+    # that out for now because in gst-plugins-rs 0.13.3 those hooks
+    # didn't reliably keep the pipeline in PLAYING.
     q_webrtc   = make('queue',       'q_webrtc')
     tee_webrtc = make('tee',         't_webrtc')
 
@@ -367,22 +423,36 @@ def main():
     def _build_tier_branch(stream_label, tier_idx, tier, screen_cfg=None):
         suffix = f'{stream_label}_t{tier_idx}'
         q     = make('queue',       f'q_{suffix}')
+        # Elements between the per-branch queue and the scale.  On the CPU
+        # path this is just `videocrop` for screen branches; on the GPU path
+        # screen branches round-trip through system memory because gst-cuda
+        # has no native crop element — cudadownload → videocrop → cudaupload.
+        pre = []
         if screen_cfg is not None:
+            if have_cuda:
+                pre.append(make('cudadownload', f'cudadl_{suffix}'))
             vc = make('videocrop',  f'crop_{suffix}')
             vc.set_property('left',   screen_cfg['cropLeft'])
             vc.set_property('top',    screen_cfg['cropTop'])
             vc.set_property('right',  screen_cfg['cropRight'])
             vc.set_property('bottom', screen_cfg['cropBottom'])
+            pre.append(vc)
+            if have_cuda:
+                pre.append(make('cudaupload',   f'cudaup_{suffix}'))
+        if have_cuda:
+            sc    = make('cudascale',  f'scale_{suffix}')
+            caps_str = (f'video/x-raw(memory:CUDAMemory),format=NV12,'
+                        f'width={tier["width"]},height={tier["height"]}')
         else:
-            vc = None
-        sc    = make('videoscale',  f'scale_{suffix}')
+            sc    = make('videoscale', f'scale_{suffix}')
+            caps_str = (f'video/x-raw,'
+                        f'width={tier["width"]},height={tier["height"]}')
         capsf = make('capsfilter',  f'capsf_{suffix}')
-        capsf.set_property('caps', Gst.Caps.from_string(
-            f'video/x-raw,width={tier["width"]},height={tier["height"]}'))
+        capsf.set_property('caps', Gst.Caps.from_string(caps_str))
         wsk   = make('webrtcsink',  f'ws_{suffix}')
         webrtc_branches.append({
             'label': suffix,
-            'queue': q, 'crop': vc,
+            'queue': q, 'pre': pre,
             'scale': sc, 'capsf': capsf, 'sink': wsk,
             'port':  tier['signallingPort'],
             'tier':  tier,
@@ -400,20 +470,39 @@ def main():
             _build_tier_branch(s['name'], tier_idx, tier, screen_cfg=s)
 
     # ── Configure ingress source
+    # GPU path: upload once into CUDA memory, then run convert+scale on the
+    #   GPU in a single cudaconvertscale op.  Every downstream branch (tee →
+    #   nvh264enc, tee → tee_webrtc → cudascale → ...) stays in CUDA memory.
+    # CPU fallback: same shape as the legacy pipeline — videoscale + videoconvert.
     xsrc      = make('ximagesrc',   'xsrc')
     vrate     = make('videorate',   'vrate')
-    vscale    = make('videoscale',  'vscale')
     xsrc.set_property('display-name', DISPLAY)
     xsrc.set_property('use-damage', False)
     xsrc.link_filtered(
         vrate,
         Gst.Caps.from_string(f'video/x-raw,framerate={FRAMERATE}/1'),
     )
-    vrate.link(vscale)
-    vscale.link_filtered(
-        vconvert,
-        Gst.Caps.from_string(f'video/x-raw,width={width},height={height}'),
-    )
+    if have_cuda:
+        cudaup = make('cudaupload',       'cudaup_src')
+        cudacs = make('cudaconvertscale', 'cudacs_src')
+        vrate.link(cudaup)
+        cudaup.link(cudacs)
+        cudacs.link_filtered(
+            tee,
+            Gst.Caps.from_string(
+                f'video/x-raw(memory:CUDAMemory),format=NV12,'
+                f'width={width},height={height}'
+            ),
+        )
+    else:
+        vscale   = make('videoscale',   'vscale')
+        vconvert = make('videoconvert', 'vconvert')
+        vrate.link(vscale)
+        vscale.link_filtered(
+            vconvert,
+            Gst.Caps.from_string(f'video/x-raw,width={width},height={height}'),
+        )
+        vconvert.link(tee)
 
     # ── Configure archive
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
@@ -583,11 +672,23 @@ def main():
         if STUN:
             sink.set_property('stun-server', STUN)
 
-    # ── Static links: vconvert -> tee -> archive + webrtc branches
-    vconvert.link(tee)  # host mode: xsrc→vrate→vscale→vconvert already linked above
+    # ── Static links: ingress already linked to `tee` above; here we wire
+    #    the tee outputs to the archive and webrtc branches.
 
     tee.link(q_arch)
-    q_arch.link(arch_enc)
+    # On the GPU path, nvh264enc consumes CUDA memory natively — no extra
+    # copy needed.  If the runtime fell back to x264enc (CPU encoder), we
+    # insert a single cudadownload so the encoder sees system memory.
+    arch_factory = arch_enc.get_factory()
+    arch_is_software = (
+        arch_factory is not None and arch_factory.get_name() == 'x264enc'
+    )
+    if have_cuda and arch_is_software:
+        cudadl_arch = make('cudadownload', 'cudadl_arch')
+        q_arch.link(cudadl_arch)
+        cudadl_arch.link(arch_enc)
+    else:
+        q_arch.link(arch_enc)
     arch_enc.link(arch_h264)
     # Explicitly negotiate AVCC (length-prefixed) format so matroskamux writes
     # SPS/PPS in CodecPrivate and NALUs as length-prefixed — without this,
@@ -605,9 +706,9 @@ def main():
     for branch in webrtc_branches:
         tee_webrtc.link(branch['queue'])
         prev = branch['queue']
-        if branch['crop'] is not None:
-            prev.link(branch['crop'])
-            prev = branch['crop']
+        for el in branch['pre']:
+            prev.link(el)
+            prev = el
         prev.link(branch['scale'])
         branch['scale'].link(branch['capsf'])
         branch['capsf'].link(branch['sink'])
