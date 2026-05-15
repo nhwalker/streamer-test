@@ -4,15 +4,15 @@ in web_server.py.
 
 No Docker, GStreamer, or live HTTP server required.
 
-The active-segment branch of stage_segments invokes ffmpeg to remux a live
-.mkv into a faststart .mp4.  These tests inject a fake remux callable so
-they remain self-contained: ffmpeg is not required on the test host.
+The active-segment branch of stage_segments streams the live fragmented-
+MP4 into the stage dir via os.sendfile.  These tests inject a fake copy
+callable so they remain self-contained — they don't depend on the
+sendfile syscall succeeding on whatever odd fds the test fixtures use.
 """
 import datetime
 import os
 import sys
 import time
-import types
 import zipfile
 
 import pytest
@@ -27,24 +27,23 @@ _REF_EPS = _REF_DT.timestamp()
 SEGMENT_SEC = 600
 
 
-def _fake_remux(content_marker=b'remuxed-mp4'):
-    """Build a stub for stage_segments' _remux that writes a placeholder MP4.
+def _fake_copy(content_marker=b'copied-mp4'):
+    """Build a stub for stage_segments' _copy that writes a placeholder MP4.
 
-    The stub takes (src_fd, dst), writes content_marker into dst, and
-    returns a CompletedProcess-like object with returncode 0.  The real
-    function shells out to ffmpeg; tests never need that.
+    The stub takes (src_fd, dst) and writes content_marker into dst.
+    Successful copies return None; failures raise OSError.  The real
+    function streams bytes via os.sendfile; tests never need that.
     """
     def _stub(src_fd, dst):
         with open(dst, 'wb') as fh:
             fh.write(content_marker)
-        return types.SimpleNamespace(returncode=0, stderr=b'')
     return _stub
 
 
-def _make_segment(directory, index, content=b'mkv-data', age_seconds=0):
-    """Write a fake unnamed (active) live .mkv segment file."""
+def _make_segment(directory, index, content=b'mp4-data', age_seconds=0):
+    """Write a fake unnamed (active) live .mp4 segment file."""
     os.makedirs(str(directory), exist_ok=True)
-    path = os.path.join(str(directory), f'stream-{index:05d}.mkv')
+    path = os.path.join(str(directory), f'stream-{index:05d}.mp4')
     with open(path, 'wb') as fh:
         fh.write(content)
     mtime = time.time() - age_seconds
@@ -208,7 +207,7 @@ class TestStageSegments:
         archive, live = dirs
         _make_segment(live, 0)
         with stage_segments(archive, live, 0, time.time() + 1,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             assert os.listdir(stage_dir) == []
 
     def test_active_with_renamed_predecessor_included(self, dirs):
@@ -217,7 +216,7 @@ class TestStageSegments:
         _make_renamed_segment(archive, now - 1200, now - 600)
         _make_segment(live, 0)  # active: starts at now-600, ends at now
         with stage_segments(archive, live, now - 300, now + 1,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
 
     def test_active_with_renamed_predecessor_excluded_when_range_before_it(self, dirs):
@@ -228,7 +227,7 @@ class TestStageSegments:
         _make_segment(live, 0)  # active: starts at renamed_end
         # query window ends before the active segment starts
         with stage_segments(archive, live, 0, renamed_end - 10,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
 
     def test_orphan_unnamed_files_dropped(self, dirs):
@@ -239,7 +238,7 @@ class TestStageSegments:
         _make_segment(live, 0)  # orphan from a crash
         _make_segment(live, 1)  # active
         with stage_segments(archive, live, now - 1800, now + 1,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             # renamed + active only; orphan dropped → 2 files
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 2
 
@@ -252,42 +251,42 @@ class TestStageSegments:
             with open(os.path.join(stage_dir, name), 'rb') as fh:
                 assert fh.read() == content
 
-    def test_active_content_remuxed(self, dirs):
-        """Active live .mkv is staged as a faststart .mp4 produced by the remux stub."""
+    def test_active_content_copied(self, dirs):
+        """Active live .mp4 is streamed verbatim into the stage dir."""
         archive, live = dirs
         now = time.time()
         _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0, content=b'\x1a\x45\xdf\xa3live-mkv-bytes')
+        _make_segment(live, 0, content=b'\x00\x00\x00\x20ftypisomlive-mp4-bytes')
 
-        marker = b'\x00\x00\x00\x20ftypisom-remuxed'
+        marker = b'\x00\x00\x00\x20ftypisom-copied'
         # Window overlaps both renamed (ends at now-600) and active
         # (starts at now-600, ends at now).
         with stage_segments(archive, live, now - 1200, now + 1,
-                            _remux=_fake_remux(marker)) as stage_dir:
+                            _copy=_fake_copy(marker)) as stage_dir:
             mp4s = [f for f in os.listdir(stage_dir) if f.endswith('.mp4')]
-            assert len(mp4s) == 2  # renamed + remuxed active
+            assert len(mp4s) == 2  # renamed + copied active
             staged = []
             for fname in mp4s:
                 with open(os.path.join(stage_dir, fname), 'rb') as fh:
                     staged.append(fh.read())
             assert marker in staged
 
-    def test_active_remux_failure_is_skipped(self, dirs):
-        """When ffmpeg fails on the active segment, the partial output is removed."""
+    def test_active_copy_failure_is_skipped(self, dirs):
+        """When the copy raises on the active segment, the partial output is removed."""
         archive, live = dirs
         now = time.time()
         _make_renamed_segment(archive, now - 1200, now - 600)
         _make_segment(live, 0)
 
-        def failing_remux(src_fd, dst):
+        def failing_copy(src_fd, dst):
             with open(dst, 'wb') as fh:
                 fh.write(b'partial')
-            return types.SimpleNamespace(returncode=1, stderr=b'broken')
+            raise OSError('broken')
 
         # Window covers renamed + active, but only the renamed should
-        # survive because the active remux fails.
+        # survive because the active copy fails.
         with stage_segments(archive, live, now - 1200, now + 1,
-                            _remux=failing_remux) as stage_dir:
+                            _copy=failing_copy) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
 
     def test_staged_files_all_have_timestamp_names(self, dirs):
@@ -298,7 +297,7 @@ class TestStageSegments:
         _make_renamed_segment(archive, now - 1200, now - 600)
         _make_segment(live, 0)
         with stage_segments(archive, live, now - 1200, now + 1,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             for fname in os.listdir(stage_dir):
                 if fname.endswith('.mp4'):
                     assert parse_segment_times(fname) is not None, \
@@ -353,7 +352,7 @@ class TestStageSegmentsRenamed:
         _make_renamed_segment(archive, now - 1200, now - 600)
         _make_segment(live, 0)  # active (in live_dir)
         with stage_segments(archive, live, now - 300, now + 1,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
 
     def test_mix_renamed_and_unnamed_all_in_range(self, dirs):
@@ -362,7 +361,7 @@ class TestStageSegmentsRenamed:
         _make_renamed_segment(archive, now - 1200, now - 600)
         _make_segment(live, 0)  # active
         with stage_segments(archive, live, now - 1300, now + 1,
-                            _remux=_fake_remux()) as stage_dir:
+                            _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 2
 
 
@@ -422,7 +421,7 @@ class TestStageAndZip:
         _make_segment(live, 0, content=b'active')
 
         tmp = stage_segments(archive, live, now - 1200, now + 1,
-                             _remux=_fake_remux(b'remuxed-mp4'))
+                             _copy=_fake_copy(b'copied-mp4'))
         try:
             zip_path = os.path.join(tmp.name, '_archive.zip')
             zip_segments(tmp.name, zip_path)

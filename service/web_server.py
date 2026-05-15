@@ -16,9 +16,9 @@ GET /archive?start=<timestamp>&end=<timestamp>
 GET /archive?last=<duration>
   Returns a zip of the .mp4 segments whose recorded time overlaps the requested
   window.  The active (currently-writing) segment is included when the window
-  extends past the last completed segment; it is still being written as
-  Matroska, so it is remuxed on the fly into a faststart .mp4 with `ffmpeg
-  -c copy` (no re-encoding) before being added to the zip.
+  extends past the last completed segment; it is already a fragmented MP4 on
+  disk (mp4mux + fragment-duration in pipeline.py), so we just stream the
+  bytes through into the stage dir — no remux is needed.
 
 GET /video?start=<timestamp>&end=<timestamp>
 GET /video?last=<duration>
@@ -43,9 +43,9 @@ Environment variables:
   WEB_PORT             HTTP listening port              (8080)
   WEB_DIR              Static file root                 (/var/www/html)
   ARCHIVE_DIR          Directory of completed .mp4      (/archive)
-                       segments (timestamp-named, faststart)
-  ARCHIVE_LIVE_DIR     Directory the in-progress .mkv   (/archive-live)
-                       segment is being written into
+                       segments (timestamp-named, fragmented MP4)
+  ARCHIVE_LIVE_DIR     Directory the in-progress .mp4   (/archive-live)
+                       fragmented-MP4 segment is being written into
   ARCHIVE_SEGMENT_SEC  Nominal segment duration         (600)
   VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
   VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
@@ -56,7 +56,6 @@ import glob
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -111,54 +110,67 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
-def _remux_active_to_mp4(src_fd, dst):
-    """Remux a live Matroska fragment (read from an open fd) to faststart MP4.
+def _copy_active_to_stage(src_fd, dst):
+    """Copy the live fragmented-MP4 fragment (read from an open fd) into dst.
 
-    Reading via /proc/self/fd/<n> rather than the path means our open file
-    descriptor pins the inode: even if pipeline.py moves the .mkv away from
-    live_dir mid-read, ffmpeg keeps reading the same bytes we opened.  The
-    `+faststart` flag rewrites the moov atom to the front of the output so
-    web players can begin decoding from the first received bytes.
-    `-c copy` means no re-encoding — the H.264 packets are remuxed verbatim.
-    `-err_detect ignore_err` tolerates a fragment whose tail is a partially
-    written cluster (the live file may still be being flushed at open time).
+    The live container is fmp4 (mp4mux fragment-duration + streamable in
+    pipeline.py), so the bytes on disk are already a valid, web-playable
+    MP4 — ftyp + moov at the front, moof+mdat pairs as the file grows.
+    We just stream the bytes through with os.sendfile (zero-copy on
+    Linux when both fds are regular files); no remux step is needed.
+
+    Reading via the supplied fd rather than the path means our descriptor
+    pins the inode: even if pipeline.py renames the file away from
+    live_dir mid-read, we keep reading the same bytes we opened.  The
+    caller owns src_fd; we do not close it.
+
+    Raises OSError on copy failure (caller decides whether to retain or
+    discard the partial dst).
     """
-    cmd = [
-        'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
-        '-fflags', '+genpts', '-err_detect', 'ignore_err',
-        '-i', f'/proc/self/fd/{src_fd}',
-        '-c', 'copy', '-map', '0:v:0',
-        '-movflags', '+faststart',
-        dst,
-    ]
-    return subprocess.run(cmd, capture_output=True, pass_fds=(src_fd,))
+    with open(dst, 'wb') as out:
+        offset = 0
+        while True:
+            try:
+                sent = os.sendfile(out.fileno(), src_fd, offset, 4 * 1024 * 1024)
+            except OSError:
+                # os.sendfile is unsupported on this fd/fs pair (e.g. a
+                # test stub using an unusual fd).  Fall back to read+write.
+                os.lseek(src_fd, offset, os.SEEK_SET)
+                while True:
+                    buf = os.read(src_fd, 1024 * 1024)
+                    if not buf:
+                        return
+                    out.write(buf)
+                return
+            if sent == 0:
+                return
+            offset += sent
 
 
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,
-                   _remux=_remux_active_to_mp4):
+                   _copy=_copy_active_to_stage):
     """Copy overlapping segments into a TemporaryDirectory and return it.
 
     archive_dir   directory of completed .mp4 segments — files with
-                  timestamps embedded in their filenames (finalized by
-                  pipeline.py when splitmuxsink rotates a fragment, after
-                  remux from .mkv to faststart .mp4).
-    live_dir      directory the pipeline writes the in-progress .mkv
-                  segment into.  Pipeline remuxes each fragment from
-                  live_dir into archive_dir on rotation.
+                  timestamps embedded in their filenames (renamed/moved
+                  by pipeline.py when splitmuxsink rotates a fragment).
+    live_dir      directory the pipeline writes the in-progress
+                  fragmented-MP4 segment into.  On rotation, pipeline.py
+                  renames/moves each fragment from live_dir into
+                  archive_dir.
 
     Completed segments have their recording timestamps embedded in their
     filenames; those timestamps are used directly.
 
-    The current active segment (the highest-named unnamed file in live_dir)
-    is included when its estimated time range overlaps the request window.
-    Its start time is the end of the last completed segment; its end time
-    is now().  If no completed segments exist before it, the active
-    segment is excluded (no reliable start time can be determined).
-    Because the live segment is still Matroska, it is remuxed on the fly
-    into a faststart .mp4 (no re-encoding) before being staged.
+    The current active segment (the highest-named sequential file in
+    live_dir) is included when its estimated time range overlaps the
+    request window.  Its start time is the end of the last completed
+    segment; its end time is now().  If no completed segments exist
+    before it, the active segment is excluded (no reliable start time
+    can be determined).  The live segment is already a fragmented MP4
+    on disk, so we stream the bytes through to the stage dir — no remux.
 
-    `_remux` is a seam for unit tests — pass a stub to avoid invoking
-    ffmpeg.  Production callers omit it.
+    `_copy` is a seam for unit tests; production callers omit it.
 
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
@@ -181,21 +193,24 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
             except FileNotFoundError:
                 pass  # purge deleted it between glob and copy; skip it
 
-    # The active (currently-writing) segment is the highest-named .mkv in
-    # live_dir.  Its start time equals the end of the last completed
-    # segment — the same boundary pipeline.py will use when it finalizes
-    # the file.  Without a completed predecessor we have no reliable start
-    # time, so any other unnamed files (orphans from crashed runs) are
-    # dropped.
+    # The active (currently-writing) segment is the highest-named
+    # sequential .mp4 in live_dir.  Its start time equals the end of the
+    # last completed segment — the same boundary pipeline.py will use
+    # when it finalizes the file.  Without a completed predecessor we
+    # have no reliable start time, so any other sequential files (orphans
+    # from crashed runs) are dropped.
     #
-    # Race with segment rollover (pipeline.py finalizing into archive_dir):
-    #   - If we os.open() the file before the rotation fires, the fd holds
-    #     a reference to the inode; ffmpeg reads it via /proc/self/fd/N
-    #     and the remux completes even if the name changes underneath us.
+    # Race with segment rollover (pipeline.py renaming into archive_dir):
+    #   - If we os.open() the file before the rotation fires, the fd
+    #     holds a reference to the inode; we read it and write the bytes
+    #     into the stage dir even if the name changes underneath us.
     #   - If the rotation fires before os.open(), we get FileNotFoundError.
-    #     The file now exists as a faststart .mp4 in archive_dir, so we
-    #     re-glob there to find and copy it as a completed segment.
-    live_files = glob.glob(os.path.join(live_dir, '*.mkv'))
+    #     The file now exists under its timestamped name in archive_dir,
+    #     so we re-glob there to find and copy it as a completed segment.
+    live_files = [
+        p for p in glob.glob(os.path.join(live_dir, '*.mp4'))
+        if parse_segment_times(os.path.basename(p)) is None
+    ]
     if live_files and renamed:
         active    = max(live_files)
         seg_start = renamed[-1][2]
@@ -218,11 +233,11 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
 
             if fd is not None:
                 try:
-                    result = _remux(fd, dst)
-                    if result.returncode != 0:
-                        stderr = result.stderr.decode('utf-8', errors='replace')[-500:]
-                        print(f'[web] WARNING: active-segment remux failed '
-                              f'(exit {result.returncode}): {stderr}', flush=True)
+                    try:
+                        _copy(fd, dst)
+                    except OSError as exc:
+                        print(f'[web] WARNING: active-segment copy failed: '
+                              f'{exc}', flush=True)
                         try:
                             os.unlink(dst)
                         except FileNotFoundError:

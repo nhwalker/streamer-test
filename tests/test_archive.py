@@ -2,9 +2,10 @@
 Archive tests for the desktop-stream-service container.
 
 The service container tees the incoming H.264 bitstream so that one branch
-writes to rotating Matroska (.mkv) segments in /archive-live via
-splitmuxsink + matroskamux.  When a fragment rotates, pipeline.py remuxes
-it to a faststart .mp4 and moves it into /archive (no re-encoding).
+writes rotating fragmented-MP4 segments in /archive-live via splitmuxsink
++ mp4mux (fragment-duration + streamable).  When a fragment rotates,
+pipeline.py renames/moves it into /archive under its timestamped name —
+no re-encoding, no remux step.
 
 These tests confirm both halves of that flow without relying on ffprobe.
 """
@@ -14,70 +15,67 @@ import time
 import pytest
 
 
-# Every Matroska/EBML file starts with the EBML element header
-# 0x1A 0x45 0xDF 0xA3.  We check this rather than a full container parse
-# so the test stays self-contained.
-EBML_MAGIC = b"\x1a\x45\xdf\xa3"
-
 # Every MP4/ISO BMFF file has the bytes 'ftyp' at offset 4 (start of the
-# first box header).  Checking this is enough to confirm the remuxed
-# output is an actual MP4 container, again with no external tooling.
+# first box header).  Checking this is enough to confirm the file is an
+# actual MP4 container, with no external tooling.
 MP4_FTYP = b"ftyp"
 
 
 class TestArchive:
-    """Verifies RTP → h264parse → tee → matroskamux → splitmuxsink → MP4 remux."""
+    """Verifies tee → h264parse → splitmuxsink(mp4mux frag) → /archive."""
 
     def test_first_segment_appears(self, first_segment):
         """
-        At least one stream-NNNNN.mkv file shows up in the live archive volume
-        within a generous timeout of the service coming up.
+        At least one stream-NNNNN.mp4 file shows up in the live archive
+        volume within a generous timeout of the service coming up.
 
         The first_segment fixture waits and surfaces container logs on failure.
         """
         assert os.path.isfile(first_segment)
 
-    def test_segment_is_valid_matroska(self, first_segment, _service):
+    def test_segment_is_valid_mp4(self, first_segment, _service):
         """
-        The live (in-progress) segment starts with the EBML magic 1A 45 DF A3.
+        The live (in-progress) segment starts with `ftyp` at offset 4.
 
-        Matroska is streaming-by-default, so the file is readable as soon
-        as the first cluster is flushed -- no need to wait for the segment
-        boundary to rotate.  Keeping the live fragment as MKV is what lets
-        /archive include the active segment mid-recording.
+        mp4mux in fragmented-streamable mode writes `ftyp + moov(empty) +
+        moof+mdat ...` from the first buffer onward, so the file is
+        readable as soon as the first fragment is flushed — no need to
+        wait for the segment boundary to rotate.  This is what lets
+        /archive include the active segment mid-recording without any
+        remux step.
         """
         first = first_segment
 
-        # Allow up to 10 s for the EBML header to land on disk.  In practice
-        # matroskamux flushes the header within milliseconds of the first
-        # buffer arriving, well before the first keyframe propagates through
+        # Allow up to 10 s for the ftyp+moov prelude to land on disk.
+        # mp4mux flushes it within milliseconds of the first buffer
+        # arriving, well before the first keyframe propagates through
         # the rest of the pipeline.
         deadline = time.monotonic() + 10.0
         header = b""
         while time.monotonic() < deadline:
             try:
                 with open(first, "rb") as fh:
-                    header = fh.read(4)
+                    header = fh.read(12)
             except FileNotFoundError:
                 header = b""
-            if header == EBML_MAGIC:
+            if len(header) >= 8 and header[4:8] == MP4_FTYP:
                 break
             time.sleep(0.5)
 
-        if header != EBML_MAGIC:
+        if not (len(header) >= 8 and header[4:8] == MP4_FTYP):
             service_out, service_err = _service.get_logs()
             pytest.fail(
-                f"Expected EBML magic {EBML_MAGIC.hex()} at the start of "
-                f"{first}, got {header.hex()!r} ({len(header)} bytes).\n"
+                f"Expected 'ftyp' at offset 4 of {first}, got "
+                f"{header!r} ({len(header)} bytes).\n"
                 f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
                 f"===== service stderr =====\n{service_err.decode(errors='replace')}"
             )
 
     def test_segment_has_content(self, first_segment):
         """
-        The first segment grows past the EBML+SegmentInfo header size.
-        A fresh matroskamux file that never got any real frame data is
-        under ~1 KB (just EBML + SegmentInfo headers).  Real streamed
+        The first segment grows past the ftyp+moov prelude size.
+        A fresh mp4mux file that never got any real frame data is
+        under ~1 KB (just ftyp + empty moov boxes).  Real streamed
         content hits tens of KB within a second or two at 1280x720.
         """
         first = first_segment
@@ -95,23 +93,20 @@ class TestArchive:
             "looks like no real video frames were written."
         )
 
-    def test_completed_segment_is_faststart_mp4(self, first_segment, archive_dir,
-                                                _service):
+    def test_completed_segment_is_valid_mp4(self, first_segment, archive_dir,
+                                            _service):
         """
-        After the first fragment rotation, a completed *_to_*.mp4 lands in
-        archive_dir and starts with `ftyp` at offset 4 (MP4 magic).  The
-        remux uses `-c copy -movflags +faststart` so the moov atom is at
-        the front of the file, allowing web players to start decoding from
-        the first received bytes.
+        After the first fragment rotation, a completed *_to_*.mp4 lands
+        in archive_dir and starts with `ftyp` at offset 4 (MP4 magic).
+        Because the live container is already fragmented MP4, the
+        rollover is a pure rename/move — the same bytes that were live
+        in /archive-live are now in /archive under a timestamped name.
 
         We bypass ffprobe / mp4info here for self-containment; the `ftyp`
-        check is sufficient evidence the remux ran and produced a real
-        MP4 container (a failed remux falls back to .mkv, which would not
-        match the *.mp4 glob).
+        check is sufficient evidence the file is a real MP4 container.
         """
-        # Rotation happens once per ARCHIVE_SEGMENT_SEC, but the remux can
-        # take a moment after rotation to complete.  Generous deadline to
-        # absorb both.
+        # Rotation happens once per ARCHIVE_SEGMENT_SEC, plus the
+        # finalize worker handles the rename/move.  Generous deadline.
         deadline = time.monotonic() + 90.0
         completed = None
         while time.monotonic() < deadline:
