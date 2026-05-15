@@ -13,17 +13,21 @@ that serves the archive download and video-assembly endpoints.
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  SERVICE CONTAINER                                                       │
 │                                                                          │
-│  ximagesrc → videorate → videoscale → videoconvert → tee                 │
-│                                                       ├─ q_arch → encoder │
+│  GPU path (preferred, taken when libgstnvcodec.so loads):                │
+│  ximagesrc → videorate → cudaupload → cudaconvertscale → tee             │
+│                                                       ├─ q_arch → nvh264enc │
 │                                                       │          → h264parse │
 │                                                       │          → splitmuxsink │
 │                                                       │   (live .mkv → .mp4 on │
 │                                                       │    rotation, faststart)│
 │                                                       └─ q_webrtc → tee_webrtc │
 │                                                                  ├─ × N tiers of  full-stream branches  │
-│                                                                  │   (queue → videoscale → capsfilter → webrtcsink) │
+│                                                                  │   (queue → cudascale → capsfilter(CUDA) → webrtcsink) │
 │                                                                  └─ × N tiers of  per-screen   branches │
-│                                                                      (queue → videocrop → videoscale → capsfilter → webrtcsink) │
+│                                                                      (queue → cudadownload → videocrop → cudaupload → cudascale → capsfilter(CUDA) → webrtcsink) │
+│                                                                          │
+│  CPU fallback (when gst-cuda is not available):                          │
+│  ximagesrc → videorate → videoscale → videoconvert → tee → ... (videoscale / videocrop+videoscale per tier) │
 │                                                                          │
 │  gst-webrtc-signalling-server: one per (stream, tier) pair               │
 │      default ports: 8443/8543/8643/8743 (full × 4 tiers)                 │
@@ -82,7 +86,29 @@ sequenceDiagram
 The pipeline is constructed programmatically (`service/pipeline.py`,
 `main()`).
 
-**Pipeline string** (equivalent gst-launch form):
+**Pipeline string — GPU path** (equivalent gst-launch form, taken when the
+gst-cuda elements are registered; nvidia-container-toolkit injecting
+`libcuda.so` is enough — no in-container CUDA-runtime install required):
+```
+ximagesrc display-name=:0 use-damage=false
+  ! videorate
+  ! video/x-raw,framerate=30/1
+  ! cudaupload
+  ! cudaconvertscale
+  ! video/x-raw(memory:CUDAMemory),format=NV12,width=1920,height=1080
+  ! tee name=t
+      t. ! queue ! nvh264enc ! h264parse ! splitmuxsink (archive)
+         (if x264enc fallback was selected, prepend ! cudadownload before the encoder)
+      t. ! queue ! tee name=t_webrtc
+          (per WEBRTC_SCALE_LADDER tier, per stream:)
+          t_webrtc. ! queue ! cudascale ! capsfilter(W,H,CUDA) ! webrtcsink   (full,  tier i)
+          t_webrtc. ! queue ! cudadownload ! videocrop ! cudaupload
+                            ! cudascale ! capsfilter(W,H,CUDA) ! webrtcsink   (screen, tier i)
+```
+
+**Pipeline string — CPU fallback** (taken when `cudaupload`,
+`cudaconvertscale`, `cudascale` or `cudadownload` aren't registered —
+typically a CPU-only host with no NVIDIA driver libs available):
 ```
 ximagesrc display-name=:0 use-damage=false
   ! videorate
@@ -93,10 +119,14 @@ ximagesrc display-name=:0 use-damage=false
   ! tee name=t
       t. ! queue ! encoder ! h264parse ! splitmuxsink (archive)
       t. ! queue ! tee name=t_webrtc
-          (per WEBRTC_SCALE_LADDER tier, per stream:)
           t_webrtc. ! queue !            videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
           t_webrtc. ! queue ! videocrop ! videoscale ! capsfilter(W,H) ! webrtcsink  (screen, tier i)
 ```
+
+The mode is picked once at startup by probing for the four gst-cuda
+elements above and is logged as `Pipeline mode : GPU (cuda*)` or
+`CPU (videoscale/videoconvert)`.  Every branch sees the same choice; we
+deliberately do not mix GPU and CPU element variants within a single run.
 
 ### `ximagesrc`
 
@@ -432,39 +462,53 @@ match the size it's actually rendering the `<video>` element at.
 
 #### Per-tier sub-branch
 
-Every (stream, tier) pair shares the same shape:
+Every (stream, tier) pair shares the same shape, with GPU vs. CPU element
+choices following the global pipeline mode:
 
 ```
-tee_webrtc → queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
+GPU path:
+  tee_webrtc → queue → [cudadownload → videocrop → cudaupload]
+              → cudascale → capsfilter(W,H,CUDAMemory) → webrtcsink
+
+CPU fallback:
+  tee_webrtc → queue → [videocrop] → videoscale → capsfilter(W,H) → webrtcsink
 ```
 
 | Element | Property | Value | Purpose |
 |---|---|---|---|
 | `q_<stream>_t<i>` | — | — | Isolate this branch from sibling branches |
+| `cudadl_<screen>_t<i>` (GPU + screens only) | — | — | Bring source CUDAMemory frame back to system memory so `videocrop` can run |
 | `crop_<screen>_t<i>` (screens only) | `left`/`top`/`right`/`bottom` | per-screen `cropLeft`/`cropTop`/`cropRight`/`cropBottom` | Trim the frame to the screen's region; *duplicated per tier* so each tier's downstream scale runs on the same crop result |
-| `scale_<stream>_t<i>` | — | — | Software downscale to the tier's dimensions |
-| `capsf_<stream>_t<i>` | `caps` | `video/x-raw,width=W,height=H` | Pin output dimensions (computed from the source size × tier scale, rounded to even pixels for YUV 4:2:0) |
+| `cudaup_<screen>_t<i>` (GPU + screens only) | — | — | Re-upload the cropped (smaller) frame to CUDA memory before `cudascale` |
+| `scale_<stream>_t<i>` | — | — | GPU resampler (`cudascale`) or software resampler (`videoscale`) to the tier's dimensions |
+| `capsf_<stream>_t<i>` | `caps` | `video/x-raw,width=W,height=H` (GPU adds `(memory:CUDAMemory),format=NV12`) | Pin output dimensions (computed from the source size × tier scale, rounded to even pixels for YUV 4:2:0) |
 | `ws_<stream>_t<i>` | `signaller.uri` | `ws://127.0.0.1:PORT` | Tier-specific signalling endpoint |
 | `ws_<stream>_t<i>` | `video-caps` | `video/x-vp9;video/x-h264` | Offer VP9 and H.264 to browsers |
 | `ws_<stream>_t<i>` | `stun-server` | `$GST_WEBRTC_STUN_SERVER` | Optional STUN for NAT traversal |
 
-The full stream branch omits `videocrop` and uses the source dimensions
-× scale; per-screen branches crop first (in source coordinates) and then
-scale the cropped output. Both VP9 and H.264 are offered because VP9
+The full stream branch omits the crop pre-elements and uses the source
+dimensions × scale; per-screen branches crop first (in source
+coordinates) and then scale the cropped output.  On the GPU path the
+screen branches round-trip through system memory because gst-cuda has no
+native crop element — the unavoidable cost is two PCIe copies per screen
+tier per frame, the second of which is the smaller cropped frame; the
+`cudaupload`/`cudadownload` boundary is *only* present on screen
+branches, never on the full-stream branches. Both VP9 and H.264 are offered because VP9
 delivers better quality at lower bitrates while H.264 has broader hardware
 decode support; the browser picks.
 
-#### Per-tier CPU cost
+#### Per-tier compute cost
 
 `webrtcsink` lazily constructs its per-consumer encoder, so a tier with
-no consumers pays zero encoder CPU. The upstream `videoscale` runs
-continuously regardless — software videoscale of a desktop-resolution
-source is cheap (~a few ms/frame per tier), but at high tier counts on
-CPU-bound hosts it adds up. A future optimisation can gate the
-`videoscale` with a `valve` driven by webrtcsink's `consumer-added` /
-`consumer-removed` signals; this is intentionally not done today because
-gating with `valve.drop=true` before the first consumer prevents the
-pipeline from reaching PLAYING in `gst-plugins-rs` 0.13.3.
+no consumers pays zero encoder CPU.  The upstream scale runs continuously
+regardless: on the **GPU path** `cudascale` is essentially free; on the
+**CPU fallback** `videoscale` of a desktop-resolution source costs ~a
+few ms/frame per tier and at high tier counts on CPU-bound hosts that
+adds up.  A future optimisation can gate the scale with a `valve` driven
+by webrtcsink's `consumer-added` / `consumer-removed` signals; this is
+intentionally not done today because gating with `valve.drop=true` before
+the first consumer prevents the pipeline from reaching PLAYING in
+`gst-plugins-rs` 0.13.3.
 
 #### Port allocation
 
