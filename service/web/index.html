@@ -34,15 +34,20 @@
 
     #header {
       flex: 0 0 auto;
-      padding: 0 1em;
+      padding: 0.25em 1em;
       line-height: 2.2;
       background: #1a1a1a;
       border-bottom: 1px solid #333;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
       font-variant-numeric: tabular-nums;
     }
+
+    /*
+      Each readout stays as a single non-breaking unit (the embedded &nbsp;
+      pairs already prevent breaks within a metric).  Allowing the header
+      itself to wrap lets a row of metrics flow onto a second line on
+      narrow viewports instead of being clipped by overflow:hidden.
+    */
+    #header .metric { display: inline-block; }
 
     #m-health {
       display: inline-block;
@@ -90,10 +95,11 @@
       padding: 0.75em 1.25em;
       background: rgba(255,255,255,0.07);
       border-radius: 6px;
-      max-width: 480px;
+      max-width: min(480px, calc(100% - 2em));
       text-align: center;
       line-height: 1.5;
-      white-space: nowrap;
+      white-space: normal;
+      overflow-wrap: anywhere;
       z-index: 1;
     }
 
@@ -118,7 +124,9 @@
       >&nbsp;&nbsp;Res: <span id="m-res">--</span></span><span class="metric" title="QP (quantization parameter): how aggressively the encoder is compressing each frame. Lower is better — every increment of 6 in H.264 roughly doubles the compression. 0 = mathematically lossless. Under ~18 (H.264) is visually indistinguishable from the source. Above ~35 is visibly blocky or smeared. The exact scale depends on the codec (H.264: 0–51, VP8: 0–127, VP9/AV1: 0–255). Averaged over the last 10 seconds."
       >&nbsp;&nbsp;QP: <span id="m-qp">--</span></span><span class="metric" title="Freezes per minute: the number of stalls longer than 150 ms your browser detected, scaled to a per-minute rate over the last 10 seconds. 0 is what you want. Anything &gt; 0 means the picture briefly stopped moving. More than 2 per minute is jarring and usually means the network can't keep up."
       >&nbsp;&nbsp;Freezes/min: <span id="m-frz">--</span></span><span class="metric" title="JBD (jitter buffer delay): how long, on average, your browser holds each frame after it arrives before showing it. The browser deliberately delays frames to absorb network timing variation; without this buffer, packets arriving slightly out of order would cause stutter. Under 100 ms is excellent. 100–200 ms is fine. Rising JBD typically predicts freezes a few seconds before they occur."
-      >&nbsp;&nbsp;JBD (ms): <span id="m-jbd">--</span></span>
+      >&nbsp;&nbsp;JBD (ms): <span id="m-jbd">--</span></span><span class="metric" title="Codec: the video compression format negotiated with the producer (e.g. H264, VP8, VP9, AV1). The codec controls how the picture is encoded on the source side and decoded here, and it determines the QP scale shown above."
+      >&nbsp;&nbsp;Codec: <span id="m-codec">--</span></span><span class="metric" title="Hardware decode: whether your browser is using a GPU/ASIC video decoder rather than the CPU. ✓ HW = hardware-accelerated (cheaper on the CPU and battery, and usually faster). ✗ SW = software decoding on the CPU. The browser reports both an implementation name (e.g. ExternalDecoder, libvpx, FFmpeg) and a powerEfficientDecoder hint — both are surfaced here. ? = the browser has not yet reported a decoder."
+      >&nbsp;&nbsp;HW decode: <span id="m-hw">--</span></span>
   </div>
   <div id="video-area">
     <p id="status">Connecting to signalling server…</p>
@@ -434,6 +442,12 @@
           snap.frameWidth     = r.frameWidth        ?? 0;
           snap.frameHeight    = r.frameHeight       ?? 0;
           snap.mimeType       = codecsById.get(r.codecId) || null;
+          // Decoder implementation name (e.g. "ExternalDecoder", "libvpx",
+          // "FFmpeg", "OpenH264") and the spec-defined power-efficient hint.
+          // Either may be missing on browsers that haven't shipped the
+          // RTCInboundRtpStreamStats fields yet; both are best-effort.
+          snap.decoderImpl     = (typeof r.decoderImplementation === 'string') ? r.decoderImplementation : null;
+          snap.powerEfficient  = (typeof r.powerEfficientDecoder === 'boolean') ? r.powerEfficientDecoder : null;
         }
         // Per-stream RTT (preferred): from RTCP RR/SR exchange for this video track.
         if (r.type === 'remote-inbound-rtp' && r.kind === 'video') {
@@ -545,12 +559,14 @@
         }
       }
 
-      const fpsEl = document.getElementById('m-fps');
-      const latEl = document.getElementById('m-lat');
-      const resEl = document.getElementById('m-res');
-      const qpEl  = document.getElementById('m-qp');
-      const frzEl = document.getElementById('m-frz');
-      const jbdEl = document.getElementById('m-jbd');
+      const fpsEl   = document.getElementById('m-fps');
+      const latEl   = document.getElementById('m-lat');
+      const resEl   = document.getElementById('m-res');
+      const qpEl    = document.getElementById('m-qp');
+      const frzEl   = document.getElementById('m-frz');
+      const jbdEl   = document.getElementById('m-jbd');
+      const codecEl = document.getElementById('m-codec');
+      const hwEl    = document.getElementById('m-hw');
 
       fpsEl.textContent = fps    != null ? fps.toFixed(1) : '--';
       // RTT/2 in ms = rttSec * 1000 / 2 = rttSec * 500
@@ -559,6 +575,34 @@
       qpEl .textContent = avgQp  != null ? Math.round(avgQp).toString() : '--';
       frzEl.textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
       jbdEl.textContent = avgJbMs != null ? Math.round(avgJbMs).toString() : '--';
+
+      // Codec name: stats report "video/H264" etc.; strip the "video/" prefix
+      // for a tighter readout.
+      codecEl.textContent = snap.mimeType
+          ? snap.mimeType.replace(/^video\//, '')
+          : '--';
+
+      // Hardware acceleration: prefer the spec's powerEfficientDecoder flag,
+      // since it's the only signal explicitly defined to indicate hardware
+      // backing.  When that's absent, fall back to a name heuristic on
+      // decoderImplementation: known software decoders are listed below;
+      // anything else (e.g. "ExternalDecoder", "MediaCodecVideoDecoder",
+      // "VTVideoDecodeAccelerator") is treated as hardware.  When neither
+      // field is populated yet we show '?' rather than guessing.
+      const impl = snap.decoderImpl;
+      let hwAccel = null;
+      if (snap.powerEfficient != null) {
+        hwAccel = snap.powerEfficient;
+      } else if (impl) {
+        const swNames = /^(libvpx|ffmpeg|openh264|dav1d|libaom|unknown)/i;
+        hwAccel = !swNames.test(impl);
+      }
+      if (hwAccel == null) {
+        hwEl.textContent = impl ? `? (${impl})` : '?';
+      } else {
+        hwEl.textContent = (hwAccel ? '✓ HW' : '✗ SW')
+                         + (impl ? ` (${impl})` : '');
+      }
 
       // Colour each value according to its individual tier, so the user can
       // see at a glance which metric is keeping the overall gumball below
@@ -591,7 +635,8 @@
         _metricsTimer = null;
       }
       _snapshots.length = 0;
-      for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz', 'm-jbd']) {
+      for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz', 'm-jbd',
+                        'm-codec', 'm-hw']) {
         const el = document.getElementById(id);
         el.textContent = '--';
         setQuality(el, null);
