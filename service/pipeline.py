@@ -512,18 +512,24 @@ def main():
     # independently decodable without seeking to the start.
     #
     # splitmuxsink + mp4mux with fragment-duration produces a fragmented MP4
-    # per segment:  ftyp + moov + (moof + mdat)+ .  Because the moov atom
-    # lives at the start and each fragment is self-contained, the file is
-    # readable mid-write — there is no "finalize the moov on EOS" pass to
-    # wait for.  streamable=true tells mp4mux to flush fragments out as
-    # they're produced rather than buffering them for a single final write,
-    # which we need so the active segment serves /archive and /video while
-    # recording.  fragment-duration=1000 ms aligns each fragment with our
-    # 30-frame GOP (1 s at 30 fps), so every fragment starts on a keyframe.
+    # per segment:  ftyp + moov(template) + (moof + mdat)+ .  The moov atom
+    # lands at the start of the file as soon as the first encoded buffer
+    # reaches the muxer, so the active fragment is readable mid-write
+    # (every consumer of `/archive` and `/video` needs that — without moov-
+    # at-front, demuxers like ffmpeg's mov demuxer reject the file with
+    # "moov atom not found").  fragment-duration=1000 ms aligns each
+    # fragment with our 30-frame GOP (1 s at 30 fps), so every fragment
+    # starts on a keyframe.
+    #
+    # NOTE on `streamable`: leave it false (the default).  In mp4mux's
+    # fragmented mode `streamable=true` skips the moov-at-front and writes
+    # moov only after EOS — that's appropriate for live-streaming over a
+    # socket but kills mid-write readability, which is the whole reason
+    # this branch exists.
     arch_h264.set_property('config-interval', -1)
     archive.set_property('muxer-factory', 'mp4mux')
     muxer_props = Gst.Structure.new_from_string(
-        'properties, fragment-duration=(uint)1000, streamable=true'
+        'properties, fragment-duration=(uint)1000'
     )
     archive.set_property('muxer-properties', muxer_props)
     archive.set_property('location', archive_pattern)
