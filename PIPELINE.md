@@ -99,7 +99,7 @@ ximagesrc display-name=:0 use-damage=false
   ! tee name=t
       t. ! queue ! nvcudah264enc ! h264parse ! video/x-h264,stream-format=avc,alignment=au
               ! splitmuxsink muxer-factory=mp4mux
-                             muxer-properties="properties,fragment-duration=(uint)1000,fragment-mode=first-moov"
+                             muxer-properties="properties,fragment-duration=(uint)1000"
                              max-size-time=600000000000
          (nvcudah264enc is preferred; falls back to nvh264enc, then to x264enc.
           if x264enc fallback is selected, prepend ! cudadownload before the encoder)
@@ -123,7 +123,7 @@ ximagesrc display-name=:0 use-damage=false
   ! tee name=t
       t. ! queue ! encoder ! h264parse ! video/x-h264,stream-format=avc,alignment=au
               ! splitmuxsink muxer-factory=mp4mux
-                             muxer-properties="properties,fragment-duration=(uint)1000,fragment-mode=first-moov"
+                             muxer-properties="properties,fragment-duration=(uint)1000"
                              max-size-time=600000000000
       t. ! queue ! tee name=t_webrtc
           t_webrtc. ! queue !            videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
@@ -347,7 +347,7 @@ boxes.
 | Property | Value | Purpose |
 |---|---|---|
 | `muxer-factory` | `mp4mux` | Per-segment muxer |
-| `muxer-properties` | `fragment-duration=(uint)1000, fragment-mode=first-moov` | Fragmented MP4 with moov-at-front |
+| `muxer-properties` | `fragment-duration=(uint)1000` | Fragmented MP4 output |
 | `location` | `${ARCHIVE_LIVE_DIR}/{prefix}-%05d.mp4` | Output path for the in-progress segment |
 | `max-size-time` | `ARCHIVE_SEGMENT_SEC × Gst.SECOND` | Rotate to a new file every N seconds |
 
@@ -355,30 +355,33 @@ Muxes the H.264 stream into rotating **fragmented MP4** files.
 `splitmuxsink` opens a new file automatically when the current segment
 reaches the `max-size-time` limit, so no single file grows unboundedly.
 
-**Why fragmented MP4 as the live container?**  Plain MP4 needs its `moov`
-atom to be finalised before the file is playable, which means a writer
-either has to seek back at EOS (so the file is unplayable mid-write) or
-ship two passes (the `+faststart` rewrite).  Fragmented MP4 sidesteps
-both: `mp4mux` writes `ftyp + moov(track defs) + (moof + mdat)*` from
-the first encoded buffer onward — moov is at the front from byte zero,
-each fragment is self-contained, and the file is naturally readable
-mid-write.  Browsers, ffmpeg, and ffprobe all parse it as ordinary MP4
-(it's literally the same container format DASH and HLS-CMAF ship).
+**Why fragmented MP4 as the live container?**  Two reasons.  First, the
+on-disk structure is `ftyp + (moof + mdat)*` — each `mdat` box is a
+self-describing run of AVCC H.264 NAL units, so the web server can
+recover the H.264 stream from the in-progress file by walking the
+top-level boxes (no moov needed; see
+[Active-segment remux](#active-segment-remux) below).  Second, when
+`splitmuxsink` rotates the file, mp4mux writes the `moov` at EOS in a
+single pass — no `+faststart` rewrite, no separate ffmpeg invocation,
+no temporary file.  The rotation is then a pure rename/move from
+`ARCHIVE_LIVE_DIR` into `ARCHIVE_DIR` under the timestamped name.
 
 Concretely on mp4mux:
 
 - **`fragment-duration=1000`** (ms) — each fragment is ~1 s of media,
   which aligns with the 30-frame GOP from the encoder so every fragment
-  starts on a keyframe.
-- **`fragment-mode=first-moov`** — write a complete `moov` (containing
-  track templates and `mvex/trex` declaring fragments follow) at the
-  *start* of the file, before any fragments.  This is what makes the
-  in-progress file readable: anything that opens the file finds the
-  moov immediately, then walks through whatever moof+mdat pairs are on
-  disk.  The other two `fragment-mode` choices —
-  `dash-or-mss` (the default) and `streamable` — both write the moov at
-  EOS or not at all, which leaves the active fragment unreadable.
-  `first-moov` was added to mp4mux in GStreamer 1.20.
+  starts on a keyframe.  This keeps each `mdat` box bounded in size
+  (one GOP) and gives the active-segment remux a clean unit of work.
+
+**Why not also force `moov` to the front of the live file?**  In an
+ideal world, mp4mux's `fragment-mode=first-moov` would put a track-defs
+moov at the start of the in-progress file and make it directly
+parseable by ffmpeg/browsers.  In practice (this build, GStreamer
+1.22), it doesn't deliver a parseable in-progress file — the
+integration tests still report "moov atom not found" against the
+active fragment.  The hybrid path (web server walks `mdat` boxes and
+remuxes the active segment on demand) sidesteps the problem entirely
+without paying the rollover-time ffmpeg cost.
 
 The combination keeps the live recording on the "happy path" the moment
 splitmuxsink closes a file: it's already a complete, faststart-style,
@@ -676,21 +679,32 @@ window.  Requests longer than 12 hours are rejected with 400.
    container format.
 
    - **Completed segments** (timestamp names, renamed `.mp4` after the
-     pipeline's rotation rename): copied as-is.
-   - **Active segment** (sequential numeric `.mp4` — the fragment
-     currently being written by `splitmuxsink`): already fragmented MP4
-     on disk, no remux needed.  Its start time is taken from the end
-     timestamp of the last completed segment (the same boundary
-     `pipeline.py` will record when it finalises the file).  The file
-     is opened by file descriptor before the copy begins; reads go via
+     pipeline's rotation rename): copied as-is — the file is already a
+     valid mp4 (mp4mux wrote `moov` at EOS during rotation).
+   - <a name="active-segment-remux"></a>**Active segment** (sequential
+     numeric `.mp4` — the fragment currently being written by
+     `splitmuxsink`): needs a small remux on the way to the stage dir.
+     mp4mux's in-progress file is fragmented MP4 with no `moov` at the
+     front (the `moov` lands only at EOS), so a byte-for-byte copy
+     wouldn't be playable.  Instead, `_copy_active_to_stage` walks the
+     in-progress file's top-level boxes, pulls AVCC H.264 NAL units out
+     of every `mdat` box, converts them to Annex-B byte stream, and
+     pipes the result through `ffmpeg -f h264 -c copy -movflags
+     +faststart` to produce a faststart mp4 at the stage path.  The
+     remux is cheap — `-c copy` does no re-encoding, h264parse with
+     `config-interval=-1` keeps SPS/PPS inline before every keyframe
+     (so ffmpeg can synthesise the `avcC` box from the bitstream), and
+     ffmpeg only sees one in-flight segment at a time so memory tops
+     out around one GOP (~1 MB at our bitrate).
+
+     The active segment's start time is taken from the end timestamp
+     of the last completed segment (the same boundary `pipeline.py`
+     used when it renamed that file).  The in-progress file is opened
+     by file descriptor before the box walk begins; reads go through
      that fd, so a rotation by the pipeline after that point does not
-     interrupt the copy because the fd holds the inode reference.  If
-     the rotation fires before the `os.open()` call, the now-completed
-     `.mp4` is found in `ARCHIVE_DIR` via a fresh directory scan.  The
-     stage-dir copy uses `os.sendfile` (zero-copy on Linux for regular
-     files), and the destination is named with the same
-     `{prefix}_..._to_....mp4` convention so the assembly step can
-     treat the active fragment identically to a completed segment.
+     interrupt us (the fd pins the inode).  If the rotation fires
+     before `os.open()`, the now-completed `.mp4` is found in
+     `ARCHIVE_DIR` via a fresh directory scan.
 
 2. **Assembly** (`video_transcode.py`, `transcode_to_video()`): builds and runs
    an ffmpeg `filter_complex`:
