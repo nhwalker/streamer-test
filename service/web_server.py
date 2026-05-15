@@ -214,19 +214,23 @@ def _copy_active_to_stage(src_fd, dst):
     Approach:
       1. Walk the top-level boxes of the in-progress file (see
          `_iter_active_mdats`).
-      2. For each mdat, convert AVCC NAL units to Annex-B byte stream.
-      3. Pipe the byte stream into `ffmpeg -f h264 -c copy
-         -movflags +faststart`.  ffmpeg builds a proper mp4 (with moov
-         at the front) from the bitstream — h264parse with
+      2. For each mdat, convert AVCC NAL units to Annex-B byte stream
+         and concatenate into a single buffer.
+      3. Hand that buffer to `ffmpeg -f h264 -c copy
+         -movflags +faststart` via stdin.  ffmpeg builds a proper mp4
+         (with moov at the front) from the bitstream — h264parse with
          `config-interval=-1` in pipeline.py guarantees SPS/PPS are
          inline before each keyframe, so ffmpeg can synthesize the
          track header from the bitstream itself.
 
     The remux is `-c copy` (no re-encode), so it costs roughly one
     pass of CPU over the H.264 bytes plus the disk write for `dst`.
-    Memory peaks at one mdat-body worth (typically a single GOP of
-    video at our fragment-duration=1000ms; ~125 KB to 1 MB depending
-    on bitrate).
+    Memory peaks at the full Annex-B buffer — that's the whole H.264
+    elementary stream of the active fragment, typically a few MB
+    (10-60 s of recording at the bitrates we run).  Buffering rather
+    than streaming via `proc.stdin.write()` avoids the classic
+    stderr-pipe-fills-up deadlock that subprocess pipelines fall into
+    when one side reads input only after producing all output.
 
     Reading via the supplied fd rather than the path means our
     descriptor pins the inode: even if pipeline.py renames the file
@@ -236,6 +240,13 @@ def _copy_active_to_stage(src_fd, dst):
     Raises OSError on remux failure (caller decides whether to retain
     or discard the partial dst).
     """
+    annex_b = b''.join(
+        _avcc_to_annex_b(mdat_body)
+        for mdat_body in _iter_active_mdats(src_fd)
+    )
+    if not annex_b:
+        raise OSError('no H.264 data found in active mp4 file')
+
     cmd = [
         'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
         '-framerate', str(STREAM_FRAMERATE),
@@ -243,42 +254,18 @@ def _copy_active_to_stage(src_fd, dst):
         '-c', 'copy', '-movflags', '+faststart',
         dst,
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+    result = subprocess.run(
+        cmd, input=annex_b, capture_output=True, check=False,
     )
-    bytes_written = 0
-    try:
-        for mdat_body in _iter_active_mdats(src_fd):
-            try:
-                annex_b = _avcc_to_annex_b(mdat_body)
-                if annex_b:
-                    proc.stdin.write(annex_b)
-                    bytes_written += len(annex_b)
-            except BrokenPipeError:
-                # ffmpeg exited (likely an error) before we finished
-                # writing — let the wait() below surface the cause.
-                break
-        try:
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
-    except Exception:
-        proc.kill()
-        proc.wait()
-        raise
-    _, stderr = proc.communicate()
-    if proc.returncode != 0 or bytes_written == 0:
+    if result.returncode != 0:
         try:
             os.unlink(dst)
         except FileNotFoundError:
             pass
-        tail = stderr.decode('utf-8', errors='replace')[-500:]
+        tail = result.stderr.decode('utf-8', errors='replace')[-500:]
         raise OSError(
-            f'active-segment remux failed (exit {proc.returncode}, '
-            f'{bytes_written} bytes piped): {tail}'
+            f'active-segment remux failed (exit {result.returncode}, '
+            f'{len(annex_b)} bytes piped): {tail}'
         )
 
 
