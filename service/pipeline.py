@@ -511,25 +511,25 @@ def main():
     # config-interval=-1: SPS/PPS before every keyframe → each segment is
     # independently decodable without seeking to the start.
     #
-    # splitmuxsink + mp4mux with fragment-duration produces a fragmented MP4
-    # per segment:  ftyp + moov(template) + (moof + mdat)+ .  The moov atom
-    # lands at the start of the file as soon as the first encoded buffer
-    # reaches the muxer, so the active fragment is readable mid-write
-    # (every consumer of `/archive` and `/video` needs that — without moov-
-    # at-front, demuxers like ffmpeg's mov demuxer reject the file with
-    # "moov atom not found").  fragment-duration=1000 ms aligns each
-    # fragment with our 30-frame GOP (1 s at 30 fps), so every fragment
-    # starts on a keyframe.
+    # splitmuxsink + mp4mux with fragment-duration + fragment-mode=first-moov
+    # produces a fragmented MP4 per segment:  ftyp + moov(track defs) +
+    # (moof + mdat)+ .  The moov atom — containing track templates and
+    # `mvex/trex` declaring that fragments follow — lands at the start of
+    # the file as soon as the first encoded buffer reaches the muxer, so
+    # the active fragment is readable mid-write.  Every consumer of
+    # `/archive` and `/video` needs that: without moov-at-front, demuxers
+    # like ffmpeg's mov demuxer reject the file with "moov atom not found".
     #
-    # NOTE on `streamable`: leave it false (the default).  In mp4mux's
-    # fragmented mode `streamable=true` skips the moov-at-front and writes
-    # moov only after EOS — that's appropriate for live-streaming over a
-    # socket but kills mid-write readability, which is the whole reason
-    # this branch exists.
+    # IMPORTANT: the default fragment-mode is `dash-or-mss`, which writes
+    # the moov *at EOS* (so the file is unplayable until splitmuxsink
+    # rotates).  `streamable` writes no tail moov at all.  Neither gives
+    # moov-at-front mid-write; only `first-moov` (added in GStreamer 1.20)
+    # does.  fragment-duration=1000 ms aligns each fragment with our
+    # 30-frame GOP (1 s at 30 fps), so every fragment starts on a keyframe.
     arch_h264.set_property('config-interval', -1)
     archive.set_property('muxer-factory', 'mp4mux')
     muxer_props = Gst.Structure.new_from_string(
-        'properties, fragment-duration=(uint)1000'
+        'properties, fragment-duration=(uint)1000, fragment-mode=first-moov'
     )
     archive.set_property('muxer-properties', muxer_props)
     archive.set_property('location', archive_pattern)

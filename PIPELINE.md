@@ -99,7 +99,7 @@ ximagesrc display-name=:0 use-damage=false
   ! tee name=t
       t. ! queue ! nvcudah264enc ! h264parse ! video/x-h264,stream-format=avc,alignment=au
               ! splitmuxsink muxer-factory=mp4mux
-                             muxer-properties="properties,fragment-duration=(uint)1000"
+                             muxer-properties="properties,fragment-duration=(uint)1000,fragment-mode=first-moov"
                              max-size-time=600000000000
          (nvcudah264enc is preferred; falls back to nvh264enc, then to x264enc.
           if x264enc fallback is selected, prepend ! cudadownload before the encoder)
@@ -123,7 +123,7 @@ ximagesrc display-name=:0 use-damage=false
   ! tee name=t
       t. ! queue ! encoder ! h264parse ! video/x-h264,stream-format=avc,alignment=au
               ! splitmuxsink muxer-factory=mp4mux
-                             muxer-properties="properties,fragment-duration=(uint)1000"
+                             muxer-properties="properties,fragment-duration=(uint)1000,fragment-mode=first-moov"
                              max-size-time=600000000000
       t. ! queue ! tee name=t_webrtc
           t_webrtc. ! queue !            videoscale ! capsfilter(W,H) ! webrtcsink   (full,  tier i)
@@ -347,7 +347,7 @@ boxes.
 | Property | Value | Purpose |
 |---|---|---|
 | `muxer-factory` | `mp4mux` | Per-segment muxer |
-| `muxer-properties` | `fragment-duration=(uint)1000` | Enable fragmented MP4 output |
+| `muxer-properties` | `fragment-duration=(uint)1000, fragment-mode=first-moov` | Fragmented MP4 with moov-at-front |
 | `location` | `${ARCHIVE_LIVE_DIR}/{prefix}-%05d.mp4` | Output path for the in-progress segment |
 | `max-size-time` | `ARCHIVE_SEGMENT_SEC × Gst.SECOND` | Rotate to a new file every N seconds |
 
@@ -359,9 +359,9 @@ reaches the `max-size-time` limit, so no single file grows unboundedly.
 atom to be finalised before the file is playable, which means a writer
 either has to seek back at EOS (so the file is unplayable mid-write) or
 ship two passes (the `+faststart` rewrite).  Fragmented MP4 sidesteps
-both: `mp4mux` writes `ftyp + moov(template) + (moof + mdat)*` from the
-first encoded buffer onward — moov is at the front from byte zero, each
-fragment is self-contained, and the file is naturally readable
+both: `mp4mux` writes `ftyp + moov(track defs) + (moof + mdat)*` from
+the first encoded buffer onward — moov is at the front from byte zero,
+each fragment is self-contained, and the file is naturally readable
 mid-write.  Browsers, ffmpeg, and ffprobe all parse it as ordinary MP4
 (it's literally the same container format DASH and HLS-CMAF ship).
 
@@ -370,13 +370,15 @@ Concretely on mp4mux:
 - **`fragment-duration=1000`** (ms) — each fragment is ~1 s of media,
   which aligns with the 30-frame GOP from the encoder so every fragment
   starts on a keyframe.
-- **`streamable=false`** (the default — we leave it unset) — write `moov`
-  at the **start** of the file, before any fragments.  Setting
-  `streamable=true` would push the `moov` to the end, which is fine for
-  live socket streaming but breaks every mid-write reader of the active
-  segment (ffmpeg's mov demuxer fails with "moov atom not found" when
-  the file ends mid-fragment).  Since we want `/archive` and `/video` to
-  serve the in-progress fragment, we explicitly avoid that mode.
+- **`fragment-mode=first-moov`** — write a complete `moov` (containing
+  track templates and `mvex/trex` declaring fragments follow) at the
+  *start* of the file, before any fragments.  This is what makes the
+  in-progress file readable: anything that opens the file finds the
+  moov immediately, then walks through whatever moof+mdat pairs are on
+  disk.  The other two `fragment-mode` choices —
+  `dash-or-mss` (the default) and `streamable` — both write the moov at
+  EOS or not at all, which leaves the active fragment unreadable.
+  `first-moov` was added to mp4mux in GStreamer 1.20.
 
 The combination keeps the live recording on the "happy path" the moment
 splitmuxsink closes a file: it's already a complete, faststart-style,
