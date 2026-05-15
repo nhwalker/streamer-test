@@ -19,47 +19,51 @@
 #       desktop-stream-viewer
 
 # ── Stage 0: shared repo configuration ───────────────────────────────────────
-FROM registry.access.redhat.com/ubi10/ubi:latest AS rocky-repos
+FROM registry.access.redhat.com/ubi9/ubi:latest AS rocky-repos
 
 RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
-    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
     && printf '%s\n' \
-        '[rocky10-baseos]' \
-        'name=Rocky Linux 10 - BaseOS' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        '[rocky9-baseos]' \
+        'name=Rocky Linux 9 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-appstream]' \
-        'name=Rocky Linux 10 - AppStream' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        '[rocky9-appstream]' \
+        'name=Rocky Linux 9 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
         'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-crb]' \
-        'name=Rocky Linux 10 - CRB' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        '[rocky9-crb]' \
+        'name=Rocky Linux 9 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
-        > /etc/yum.repos.d/rocky10-supplement.repo \
+        > /etc/yum.repos.d/rocky9-supplement.repo \
     && dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
-        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
-        https://mirrors.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-10.noarch.rpm \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm \
+        https://mirrors.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-9.noarch.rpm \
     && dnf clean all
 
 # ── Stage 1: install Electron + bundle the app ───────────────────────────────
 FROM rocky-repos AS app-builder
 
-RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+# RHEL 9 ships nodejs as an AppStream module; pin the :20 stream so the npm
+# that builds Electron is new enough (Electron ≥ 30 needs Node ≥ 18.18).
+RUN dnf module reset -y nodejs \
+    && dnf module enable -y nodejs:20 \
+    && dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         nodejs npm \
     && dnf clean all
 
@@ -74,11 +78,13 @@ FROM rocky-repos AS runtime
 # Chromium / Electron shared-library deps, libva + libva-nvidia-driver
 # (RPM Fusion nonfree), Node (to run the electron launcher), and a few X11
 # utilities for debugging.
-RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+RUN dnf module reset -y nodejs \
+    && dnf module enable -y nodejs:20 \
+    && dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         nss nspr \
         atk at-spi2-atk at-spi2-core \
         cups-libs \
-        libdrm libgbm libxkbcommon \
+        libdrm mesa-libgbm libxkbcommon \
         mesa-libEGL mesa-libGL \
         libX11 libXcomposite libXdamage libXext libXfixes \
         libXrandr libXrender libXScrnSaver libXtst libXi \
