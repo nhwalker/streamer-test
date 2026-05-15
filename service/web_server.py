@@ -160,10 +160,17 @@ def _iter_active_mdats(src_fd):
             body_offset = offset + 8
 
         body_size = size - (body_offset - offset)
-        if body_size <= 0:
+
+        # Sanity-bound the advance step.  `body_size < 0` means a box
+        # header smaller than 8 bytes, which is malformed — bail.  But
+        # `body_size == 0` is perfectly legal (an empty-body box like
+        # `free` for padding); we must advance past it, NOT return,
+        # otherwise any zero-body box before the first mdat would
+        # silently swallow the rest of the file.
+        if body_size < 0 or size < 8:
             return
 
-        if box_type == b'mdat':
+        if box_type == b'mdat' and body_size > 0:
             os.lseek(src_fd, body_offset, os.SEEK_SET)
             remaining = body_size
             chunks = []
