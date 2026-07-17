@@ -431,11 +431,14 @@ class TestSplitStreamPlayback:
     ffmpeg crop filters are active and sized correctly.
     """
 
-    def _run(self, browser, http_port, page_path, turn_params, label):
+    def _run(self, browser, http_port, page_path, turn_params, label, service):
         try:
             _wait_for_playing(browser, http_port, page_path, turn_params)
         except Exception:
-            pytest.fail(f"{label} WebRTC stream did not start playing within 60 s")
+            _dump_diagnostics(
+                browser, service,
+                f"{label} WebRTC stream did not start playing within 60 s",
+            )
 
         stats = _capture_frame(browser)
 
@@ -452,11 +455,11 @@ class TestSplitStreamPlayback:
 
     def test_top_webrtc_plays(self, streaming_container, _service, browser, turn_params):
         http_port, _ = streaming_container
-        self._run(browser, http_port, "/top", turn_params, "/top")
+        self._run(browser, http_port, "/top", turn_params, "/top", _service)
 
     def test_bottom_webrtc_plays(self, streaming_container, _service, browser, turn_params):
         http_port, _ = streaming_container
-        self._run(browser, http_port, "/bottom", turn_params, "/bottom")
+        self._run(browser, http_port, "/bottom", turn_params, "/bottom", _service)
 
 
 # ── Level 4: split-stream crop-offset colour tests ────────────────────────────
@@ -477,11 +480,15 @@ class TestSplitStreamCrop:
     """
 
     def _run_colour_test(self, browser, http_port, page_path, turn_params,
-                         label, colour_check, colour_desc):
+                         label, colour_check, colour_desc, service):
         try:
             _wait_for_playing(browser, http_port, page_path, turn_params)
         except Exception:
-            pytest.fail(f"{label} WebRTC stream (two-tone) did not start playing within 60 s")
+            _dump_diagnostics(
+                browser, service,
+                f"{label} WebRTC stream (two-tone) did not start playing "
+                f"within 60 s",
+            )
 
         stats = _capture_frame(browser)
         assert colour_check(stats), (
@@ -501,6 +508,7 @@ class TestSplitStreamCrop:
             "/top",
             lambda s: s.get("avgR", 0) > 200 and s.get("avgG", 255) < 60 and s.get("avgB", 255) < 60,
             "red (R>200, G<60, B<60)",
+            _service_two_tone,
         )
 
     def test_bottom_stream_shows_blue(
@@ -513,4 +521,5 @@ class TestSplitStreamCrop:
             "/bottom",
             lambda s: s.get("avgR", 255) < 60 and s.get("avgG", 255) < 60 and s.get("avgB", 0) > 200,
             "blue (R<60, G<60, B>200)",
+            _service_two_tone,
         )

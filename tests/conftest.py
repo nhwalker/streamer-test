@@ -481,6 +481,12 @@ def _service_two_tone(xvfb_two_tone):
         .with_env("WEBRTC_UDP_PORT", str(TWO_TONE_WEBRTC_UDP_PORT))
         .with_env("MEDIAMTX_RTSP_PORT", str(TWO_TONE_RTSP_PORT))
         .with_env("WEBRTC_ADDITIONAL_HOSTS", "127.0.0.1")
+        # Single tier: this chain only verifies crop correctness at full
+        # resolution, and it runs while the regular chain's encoders are
+        # still alive — every tier is an always-on encode in the ffmpeg
+        # stack, so trimming the ladder halves this chain's CPU load on
+        # the shared CI runner.
+        .with_env("WEBRTC_SCALE_LADDER", "1.0")
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         .with_kwargs(network_mode="host", ipc_mode="host")
