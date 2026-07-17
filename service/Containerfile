@@ -1,44 +1,10 @@
-# ─── Artifacts from shared base ──────────────────────────────────────────────
-# streamer-base must be built first:  podman build -t streamer-base base/
-FROM streamer-base:latest AS base
-
-# ─── JS Bundle Builder ───────────────────────────────────────────────────────
-# Builds the gstwebrtc-api browser-side library from the gst-plugins-rs source
-# tree that was cloned into /src by the base image.
-FROM base AS js-builder
-
-RUN dnf install -y nodejs npm && dnf clean all
-
-WORKDIR /src/net/webrtc/gstwebrtc-api
-RUN npm install && npm run build && \
-    OUTPUT_DIR="" && \
-    for candidate in dist build output out; do \
-        if [ -d "/src/net/webrtc/gstwebrtc-api/${candidate}" ]; then \
-            OUTPUT_DIR="/src/net/webrtc/gstwebrtc-api/${candidate}"; \
-            break; \
-        fi; \
-    done && \
-    if [ -z "${OUTPUT_DIR}" ]; then \
-        echo "ERROR: could not find dist/, build/, output/, or out/ directory" && exit 1; \
-    fi && \
-    mkdir -p /opt/gstwebrtc-api && \
-    cp -r "${OUTPUT_DIR}/." /opt/gstwebrtc-api/ && \
-    ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "gstwebrtc-api*.js" \
-                 -not -name "*.js.map" 2>/dev/null | sort | head -1) && \
-    if [ -z "${ENTRY}" ]; then \
-        ENTRY=$(find /opt/gstwebrtc-api -maxdepth 1 -name "*.js" \
-                     -not -name "*.js.map" 2>/dev/null | sort | head -1); \
-    fi && \
-    if [ -z "${ENTRY}" ]; then \
-        echo "ERROR: no JS entry point found in ${OUTPUT_DIR}" && exit 1; \
-    fi && \
-    if [ "$(basename "${ENTRY}")" != "gstwebrtc-api.js" ]; then \
-        ln -s "$(basename "${ENTRY}")" /opt/gstwebrtc-api/gstwebrtc-api.js && \
-        echo "Symlinked: $(basename "${ENTRY}") -> gstwebrtc-api.js"; \
-    fi
-
-
-# ─── Runtime Stage ───────────────────────────────────────────────────────────
+# desktop-stream-service: ffmpeg (x11grab + NVENC) -> MediaMTX (WebRTC/WHEP).
+#
+# Single-stage build — no source compilation.  Everything comes from
+# mirror-able RPM repositories (Rocky 10 / EPEL 10 / RPM Fusion Free) except
+# MediaMTX, which is a single static Go binary vendored from a pinned release
+# (override MEDIAMTX_URL to pull it from an internal artifact store on
+# air-gapped builders).
 FROM registry.access.redhat.com/ubi10/ubi:latest
 
 # ── Repos: Rocky 10 + EPEL10 + RPM Fusion Free ───────────────────────────────
@@ -77,100 +43,90 @@ RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
         https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
     && dnf clean all
 
-# ── GStreamer runtime packages ──────────────────────────────────────────────
+# ── Runtime packages ─────────────────────────────────────────────────────────
+# ffmpeg comes from RPM Fusion Free (full build: h264_nvenc, libx264,
+# libopus, x11grab).  Do NOT let EPEL's stripped ffmpeg-free variant in —
+# it conflicts with RPM Fusion's ffmpeg-libs and lacks NVENC.
 RUN dnf install -y \
         --setopt=install_weak_deps=False \
         --setopt=tsflags=nodocs \
-        gstreamer1 \
-        gstreamer1-plugins-base \
-        gstreamer1-plugins-good \
-        gstreamer1-plugins-bad-free \
-        gstreamer1-plugins-ugly \
-        gstreamer1-plugin-libav \
-        openssl-libs \
-        libnice \
-        libnice-gstreamer1 \
-        libsrtp \
-        libsodium \
-        zvbi \
-        libwebp \
-        gtk4 \
+        ffmpeg \
         python3 \
         python3-pip \
         nmap-ncat \
-        python3-gobject \
-        ffmpeg \
+        tar \
     && pip3 install --no-cache-dir --root-user-action=ignore python-xlib \
+    && ffmpeg -hide_banner -encoders | grep -q h264_nvenc \
+    && ffmpeg -hide_banner -devices  | grep -q x11grab \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* \
               /usr/share/doc /usr/share/man /usr/share/info \
               /root/.cache/pip
 
-# ── Rust GStreamer plugins ────────────────────────────────────────────────────
-COPY --from=base /opt/gst-rs/lib/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
+# ── MediaMTX (vendored release binary) ───────────────────────────────────────
+# Pinned version + checksum.  Air-gapped builds: pass
+#   --build-arg MEDIAMTX_URL=https://artifacts.internal/…/mediamtx.tar.gz
+# pointing at the mirrored tarball (and keep MEDIAMTX_SHA256 in sync when
+# bumping the version).
+ARG MEDIAMTX_VERSION=v1.19.2
+ARG MEDIAMTX_URL=https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz
+ARG MEDIAMTX_SHA256=""
+RUN curl -fsSL -o /tmp/mediamtx.tar.gz "${MEDIAMTX_URL}" \
+    && if [ -n "${MEDIAMTX_SHA256}" ]; then \
+           echo "${MEDIAMTX_SHA256}  /tmp/mediamtx.tar.gz" | sha256sum -c -; \
+       else \
+           echo "WARNING: MEDIAMTX_SHA256 not set — skipping checksum check"; \
+       fi \
+    && tar -xzf /tmp/mediamtx.tar.gz -C /usr/local/bin mediamtx \
+    && rm /tmp/mediamtx.tar.gz \
+    && /usr/local/bin/mediamtx --version
 
-# ── nvcodec + libgstcuda ─────────────────────────────────────────────────────
-COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstnvcodec.so /usr/local/lib/gstreamer-1.0/
-COPY --from=base /opt/gst-nvcodec/lib/libgstcuda-1.0.so* /usr/local/lib/
-
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/gst-local.conf && ldconfig
-
-# ── Replace RHEL10's webrtcbin/dtls/sctp/srtp with our libsrtp2+libnice build ─
-COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstwebrtc.so /usr/lib64/gstreamer-1.0/libgstwebrtc.so
-COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstdtls.so   /usr/lib64/gstreamer-1.0/libgstdtls.so
-COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsctp.so   /usr/lib64/gstreamer-1.0/libgstsctp.so
-COPY --from=base /opt/gst-nvcodec/lib/gstreamer-1.0/libgstsrtp.so   /usr/lib64/gstreamer-1.0/libgstsrtp.so
-COPY --from=base /opt/gst-nvcodec/lib/libgstwebrtc-1.0.so*     /usr/lib64/
-COPY --from=base /opt/gst-nvcodec/lib/libgstwebrtcnice-1.0.so* /usr/lib64/
-COPY --from=base /opt/gst-nvcodec/lib/libgstsctp-1.0.so*       /usr/lib64/
-RUN ldconfig
-
-# ── Signalling server binary ──────────────────────────────────────────────────
-COPY --from=base /opt/gst-webrtc-signalling-server /usr/local/bin/gst-webrtc-signalling-server
-RUN chmod +x /usr/local/bin/gst-webrtc-signalling-server
-
-# ── Browser-side JS library + web page ───────────────────────────────────────
-COPY --from=js-builder /opt/gstwebrtc-api/ /var/www/html/gstwebrtc-api/
+# ── Web page ─────────────────────────────────────────────────────────────────
+# The WHEP client is inlined in index.html — no JS build step, no bundle.
 COPY web/index.html /var/www/html/index.html
 
 # ── Application scripts ───────────────────────────────────────────────────────
-COPY entrypoint.sh       /usr/local/bin/entrypoint.sh
-COPY pipeline.py         /usr/local/bin/pipeline.py
-COPY web_server.py       /usr/local/bin/web_server.py
-COPY archive_encoder.py  /usr/local/bin/archive_encoder.py
-COPY archive_purge.py    /usr/local/bin/archive_purge.py
-COPY archive_times.py    /usr/local/bin/archive_times.py
-COPY video_transcode.py  /usr/local/bin/video_transcode.py
-COPY desktop_config.py   /usr/local/bin/desktop_config.py
+COPY entrypoint.sh        /usr/local/bin/entrypoint.sh
+COPY pipeline.py          /usr/local/bin/pipeline.py
+COPY stream_command.py    /usr/local/bin/stream_command.py
+COPY web_server.py        /usr/local/bin/web_server.py
+COPY archive_encoder.py   /usr/local/bin/archive_encoder.py
+COPY archive_finalize.py  /usr/local/bin/archive_finalize.py
+COPY archive_purge.py     /usr/local/bin/archive_purge.py
+COPY archive_times.py     /usr/local/bin/archive_times.py
+COPY video_transcode.py   /usr/local/bin/video_transcode.py
+COPY desktop_config.py    /usr/local/bin/desktop_config.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
-             /usr/local/bin/web_server.py /usr/local/bin/archive_encoder.py \
+             /usr/local/bin/stream_command.py /usr/local/bin/web_server.py \
+             /usr/local/bin/archive_encoder.py /usr/local/bin/archive_finalize.py \
              /usr/local/bin/archive_purge.py /usr/local/bin/archive_times.py \
              /usr/local/bin/video_transcode.py /usr/local/bin/desktop_config.py
 
 # ── Default archive volumes ───────────────────────────────────────────────────
 # /archive holds completed (timestamp-named) segments.
-# /archive-live holds the in-progress segment until splitmuxsink rotates it,
-# then it's moved into /archive.  Keeping live segments separate lets
-# operators put them on a different (e.g. faster, ephemeral) filesystem.
+# /archive-live holds the in-progress segment until ffmpeg rotates it, then
+# it's moved into /archive.  Keeping live segments separate lets operators
+# put them on a different (e.g. faster, ephemeral) filesystem.
 VOLUME /archive
 VOLUME /archive-live
 
 # ── Environment defaults (all overridable at runtime via -e) ────────────────
 # STREAM_WIDTH/STREAM_HEIGHT and DESKTOP_SPLITS are intentionally unset —
-# the runtime auto-detects native screen size + monitor geometry from xrandr.
-ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
-    DISPLAY=:0 \
+# the runtime auto-detects native screen size + monitor geometry via RandR.
+ENV DISPLAY=:0 \
     DESKTOP_NAME=desktop \
     STREAM_FRAMERATE=30 \
     ARCHIVE_DIR=/archive \
     ARCHIVE_LIVE_DIR=/archive-live \
     ARCHIVE_SEGMENT_SEC=600 \
     ARCHIVE_BITRATE=6000 \
-    SIGNALLING_HOST=0.0.0.0 \
-    SIGNALLING_PORT=8443 \
     WEB_PORT=8080 \
-    GST_WEBRTC_STUN_SERVER="" \
-    GST_WEBRTC_TURN_SERVER="" \
+    MEDIAMTX_RTSP_PORT=8554 \
+    WEBRTC_PORT=8889 \
+    WEBRTC_UDP_PORT=8189 \
+    WEBRTC_ADDITIONAL_HOSTS="" \
+    LIVE_CQ=18 \
+    LIVE_MAXRATE=8M \
     VIDEO_FILL_COLOR=0xFF000000 \
     VIDEO_DEFAULT_WIDTH=1920 \
     VIDEO_DEFAULT_HEIGHT=1080 \
@@ -179,16 +135,8 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 \
 
 # Web UI.
 EXPOSE 8080/tcp
-
-# WebRTC signalling: SIGNALLING_PORT (default 8443) + screen index + tier-stride.
-# With the default WEBRTC_SCALE_LADDER (1.0, 0.75, 0.5, 0.25) and SIGNALLING_PORT_STRIDE=100,
-# each stream uses 4 ports — tier 0 at 8443+screen_index, then +100 per tier.
-# The ranges below cover up to 8 screens × 4 tiers; non-default ladders or a
-# different stride require widening these.  Note: EXPOSE is Docker metadata only;
-# ports outside this range will still bind, but `docker run --publish-all` skips them.
-EXPOSE 8443-8451/tcp
-EXPOSE 8543-8551/tcp
-EXPOSE 8643-8651/tcp
-EXPOSE 8743-8751/tcp
+# MediaMTX WHEP (HTTP signalling) + ICE/UDP media.
+EXPOSE 8889/tcp
+EXPOSE 8189/udp
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

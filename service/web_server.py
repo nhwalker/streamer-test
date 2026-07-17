@@ -17,11 +17,11 @@ GET /archive?last=<duration>
   Returns a zip of the .mp4 segments whose recorded time overlaps the requested
   window.  The active (currently-writing) segment is included when the window
   extends past the last completed segment.  Completed segments are copied
-  byte-for-byte (they're already valid mp4 after splitmuxsink rotated them).
-  The active segment requires a small remux: mp4mux's in-progress file has
-  no parseable moov at the front, so we walk its top-level `mdat` boxes,
-  extract the AVCC H.264 NAL units, convert them to Annex-B byte stream,
-  and pipe to `ffmpeg -c copy -movflags +faststart` for a faststart mp4.
+  byte-for-byte (they're already valid mp4 after rotation).  The active
+  segment is also a plain byte-copy: ffmpeg writes the archive as fragmented
+  MP4 with the moov atom up front (movflags empty_moov), so the in-progress
+  file is parseable mid-write — a truncated trailing fragment is simply
+  ignored by players.
 
 GET /video?start=<timestamp>&end=<timestamp>
 GET /video?last=<duration>
@@ -59,13 +59,11 @@ import glob
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import time
 import urllib.parse
 import zipfile
 
-STREAM_FRAMERATE = int(os.environ.get('STREAM_FRAMERATE', '30'))
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 from archive_times import parse_segment_times, renamed_segment_path
@@ -116,164 +114,34 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
-def _iter_active_mdats(src_fd):
-    """Yield the body bytes of each `mdat` box in an in-progress mp4 file.
-
-    mp4mux writes fragmented MP4 as `ftyp + (moof + mdat)*`, with the
-    moov atom landing only at EOS — so an in-progress file has no
-    parseable moov, and standard demuxers reject it.  But the actual
-    H.264 NAL units sit in the `mdat` boxes verbatim (AVCC-formatted,
-    length-prefixed), and we can walk the top-level box structure
-    without consulting moov: each box header is 4 bytes of big-endian
-    size + 4 bytes of ASCII type, followed by `size - 8` bytes of body.
-
-    Stops cleanly at EOF — the trailing box of an in-progress file may
-    be truncated mid-write, and we just yield what we can read.
-
-    The caller owns src_fd; we do not close it.
-    """
-    offset = 0
-    while True:
-        os.lseek(src_fd, offset, os.SEEK_SET)
-        header = os.read(src_fd, 8)
-        if len(header) < 8:
-            return
-        size = int.from_bytes(header[:4], 'big')
-        box_type = header[4:8]
-
-        if size == 1:
-            # 64-bit extended size follows the 8-byte header.
-            ext = os.read(src_fd, 8)
-            if len(ext) < 8:
-                return
-            size = int.from_bytes(ext, 'big')
-            body_offset = offset + 16
-        elif size == 0:
-            # "Size 0" means the box extends to EOF — only legal for the
-            # final box, and only useful if we know the file size.
-            body_offset = offset + 8
-            try:
-                size = os.fstat(src_fd).st_size - offset
-            except OSError:
-                return
-        else:
-            body_offset = offset + 8
-
-        body_size = size - (body_offset - offset)
-
-        # Sanity-bound the advance step.  `body_size < 0` means a box
-        # header smaller than 8 bytes, which is malformed — bail.  But
-        # `body_size == 0` is perfectly legal (an empty-body box like
-        # `free` for padding); we must advance past it, NOT return,
-        # otherwise any zero-body box before the first mdat would
-        # silently swallow the rest of the file.
-        if body_size < 0 or size < 8:
-            return
-
-        if box_type == b'mdat' and body_size > 0:
-            os.lseek(src_fd, body_offset, os.SEEK_SET)
-            remaining = body_size
-            chunks = []
-            while remaining > 0:
-                chunk = os.read(src_fd, min(remaining, 1024 * 1024))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            if chunks:
-                yield b''.join(chunks)
-
-        offset += size
-
-
-def _avcc_to_annex_b(avcc):
-    """Convert AVCC-formatted H.264 (length-prefixed NAL units) to Annex-B.
-
-    AVCC:    [4-byte big-endian length][NAL bytes]...
-    Annex-B: [0x00 0x00 0x00 0x01][NAL bytes]...
-
-    Annex-B is what `ffmpeg -f h264` expects.  Truncated trailing NALs
-    are dropped silently (the in-progress mdat may end mid-NAL).
-    """
-    out = bytearray()
-    i = 0
-    n = len(avcc)
-    while i + 4 <= n:
-        nal_length = int.from_bytes(avcc[i:i + 4], 'big')
-        i += 4
-        if nal_length == 0 or i + nal_length > n:
-            break
-        out.extend(b'\x00\x00\x00\x01')
-        out.extend(avcc[i:i + nal_length])
-        i += nal_length
-    return bytes(out)
-
-
 def _copy_active_to_stage(src_fd, dst):
-    """Build a faststart `.mp4` at dst from the in-progress mp4mux file.
+    """Byte-copy the in-progress archive segment to dst.
 
-    The live container is fragmented MP4 — mp4mux writes the moov atom
-    only at EOS, so the in-progress file isn't directly parseable by
-    `ffmpeg`/`ffprobe`/browsers (they report "moov atom not found").
-    But the actual H.264 stream sits in the `mdat` boxes as AVCC NAL
-    units, and we know how to find them without consulting moov.
-
-    Approach:
-      1. Walk the top-level boxes of the in-progress file (see
-         `_iter_active_mdats`).
-      2. For each mdat, convert AVCC NAL units to Annex-B byte stream
-         and concatenate into a single buffer.
-      3. Hand that buffer to `ffmpeg -f h264 -c copy
-         -movflags +faststart` via stdin.  ffmpeg builds a proper mp4
-         (with moov at the front) from the bitstream — h264parse with
-         `config-interval=-1` in pipeline.py guarantees SPS/PPS are
-         inline before each keyframe, so ffmpeg can synthesize the
-         track header from the bitstream itself.
-
-    The remux is `-c copy` (no re-encode), so it costs roughly one
-    pass of CPU over the H.264 bytes plus the disk write for `dst`.
-    Memory peaks at the full Annex-B buffer — that's the whole H.264
-    elementary stream of the active fragment, typically a few MB
-    (10-60 s of recording at the bitrates we run).  Buffering rather
-    than streaming via `proc.stdin.write()` avoids the classic
-    stderr-pipe-fills-up deadlock that subprocess pipelines fall into
-    when one side reads input only after producing all output.
+    The live segment is fragmented MP4 written with
+    `movflags=+frag_keyframe+empty_moov` — the moov atom sits at the
+    front of the file from the first write, so the in-progress file is
+    directly parseable by browsers/ffprobe.  A trailing fragment that is
+    truncated mid-write is simply ignored by players, so a plain copy of
+    whatever bytes exist right now is a valid, playable MP4.
 
     Reading via the supplied fd rather than the path means our
-    descriptor pins the inode: even if pipeline.py renames the file
+    descriptor pins the inode: even if the finalizer renames the file
     away from live_dir mid-read, we keep reading the same bytes we
     opened.  The caller owns src_fd; we do not close it.
 
-    Raises OSError on remux failure (caller decides whether to retain
-    or discard the partial dst).
+    Raises OSError when the file has no content yet (caller skips it).
     """
-    annex_b = b''.join(
-        _avcc_to_annex_b(mdat_body)
-        for mdat_body in _iter_active_mdats(src_fd)
-    )
-    if not annex_b:
-        raise OSError('no H.264 data found in active mp4 file')
-
-    cmd = [
-        'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
-        '-framerate', str(STREAM_FRAMERATE),
-        '-f', 'h264', '-i', 'pipe:0',
-        '-c', 'copy', '-movflags', '+faststart',
-        dst,
-    ]
-    result = subprocess.run(
-        cmd, input=annex_b, capture_output=True, check=False,
-    )
-    if result.returncode != 0:
-        try:
-            os.unlink(dst)
-        except FileNotFoundError:
-            pass
-        tail = result.stderr.decode('utf-8', errors='replace')[-500:]
-        raise OSError(
-            f'active-segment remux failed (exit {result.returncode}, '
-            f'{len(annex_b)} bytes piped): {tail}'
-        )
+    os.lseek(src_fd, 0, os.SEEK_SET)
+    total = 0
+    with open(dst, 'wb') as out:
+        while True:
+            chunk = os.read(src_fd, 1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            total += len(chunk)
+    if total == 0:
+        raise OSError('active segment is empty')
 
 
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,
@@ -282,10 +150,10 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
 
     archive_dir   directory of completed .mp4 segments — files with
                   timestamps embedded in their filenames (renamed/moved
-                  by pipeline.py when splitmuxsink rotates a fragment).
-    live_dir      directory the pipeline writes the in-progress
-                  fragmented-MP4 segment into.  On rotation, pipeline.py
-                  renames/moves each fragment from live_dir into
+                  by the finalize watcher when ffmpeg rotates a segment).
+    live_dir      directory ffmpeg writes the in-progress fragmented-MP4
+                  segment into.  On rotation, the finalize watcher
+                  renames/moves each segment from live_dir into
                   archive_dir.
 
     Completed segments have their recording timestamps embedded in their

@@ -2,33 +2,29 @@
 Integration tests for the streamer-test desktop-stream-service container.
 
 Level 1 (TestServiceAvailability): verifies the service container's HTTP
-  and WebSocket endpoints are reachable and return expected content. No
+  and WHEP endpoints are reachable and return expected content. No
   browser required; fast.
 
 Level 2 (TestWebRTCStream): drives a headless Chrome browser to load the
   service container's streaming page and confirms a WebRTC video stream
-  actually plays — exercises the full pipeline (Xvfb → ximagesrc →
-  service → WebRTC → browser).
+  actually plays — exercises the full pipeline (Xvfb → ffmpeg x11grab →
+  MediaMTX → WHEP → browser).
 """
-import asyncio
-import re
 import time
 
 import pytest
 import requests
-import websockets
 
 from selenium.webdriver.support.ui import WebDriverWait
 
 from conftest import (
     CROP_HEIGHT, STREAM_WIDTH,
-    WS_PORT_TOP, WS_PORT_BOTTOM,
-    TWO_TONE_WS_PORT_TOP, TWO_TONE_WS_PORT_BOTTOM,
+    WEBRTC_PORT, TWO_TONE_WEBRTC_PORT,
 )
 
 
 class TestServiceAvailability:
-    """HTTP and WebSocket smoke tests — no browser needed."""
+    """HTTP and WHEP smoke tests — no browser needed."""
 
     def test_http_returns_200(self, streaming_container):
         http_port, _ = streaming_container
@@ -40,51 +36,35 @@ class TestServiceAvailability:
         r = requests.get(f"http://localhost:{http_port}/", timeout=10)
         assert "<video" in r.text, "index.html must contain a <video> element"
 
-    def test_html_has_gstwebrtc_api_script(self, streaming_container):
-        """Guards against the JS bundle being missing from the container image."""
+    def test_html_has_inline_whep_client(self, streaming_container):
+        """The WHEP client is inlined — no external JS bundle to break."""
         http_port, _ = streaming_container
         r = requests.get(f"http://localhost:{http_port}/", timeout=10)
-        assert "gstwebrtc-api" in r.text, "index.html must reference gstwebrtc-api"
+        assert "/whep" in r.text, "index.html must build WHEP endpoint URLs"
+        assert "RTCPeerConnection" in r.text, (
+            "index.html must contain the inline WebRTC client"
+        )
 
-    def test_gstwebrtc_api_js_served(self, streaming_container):
-        """Confirms the JS bundle was copied from the builder stage."""
-        http_port, _ = streaming_container
-        page = requests.get(f"http://localhost:{http_port}/", timeout=10)
-        # Derive the path from the actual import statement in index.html so
-        # the test is not brittle against build-output filename changes.
-        m = re.search(r"""(?:from|src=)\s*['"]([^'"]*gstwebrtc-api[^'"]*\.js)['"]""", page.text)
-        assert m, "Could not find a gstwebrtc-api JS src/import in index.html"
-        js_path = m.group(1).lstrip("./")
-        r = requests.get(f"http://localhost:{http_port}/{js_path}", timeout=10)
-        if r.status_code != 200:
-            listing = requests.get(
-                f"http://localhost:{http_port}/gstwebrtc-api/", timeout=10
-            )
-            found = re.findall(r'href="([^"?#]+)"', listing.text)
-            pytest.fail(
-                f"JS bundle at /{js_path} returned {r.status_code}.\n"
-                f"Files in /gstwebrtc-api/: {found}"
-            )
-        assert len(r.content) > 0, "gstwebrtc-api JS bundle must not be empty"
+    def test_whep_endpoint_reachable(self, streaming_container):
+        """MediaMTX answers WHEP preflight on the tier-0 full-stream path."""
+        _, webrtc_port = streaming_container
+        r = requests.options(
+            f"http://localhost:{webrtc_port}/full_t0/whep", timeout=10,
+        )
+        assert r.status_code in (200, 204), (
+            f"WHEP OPTIONS returned {r.status_code}"
+        )
 
-    def test_websocket_accepts_connection(self, streaming_container):
-        """
-        Signalling server accepts a plain WebSocket upgrade on port 8443.
-
-        Uses asyncio.run() to drive the async websockets API from a
-        synchronous test, avoiding a pytest-asyncio dependency.
-        """
-        _, ws_port = streaming_container
-
-        async def _connect():
-            uri = f"ws://localhost:{ws_port}"
-            async with websockets.connect(uri, open_timeout=10) as ws:
-                await asyncio.sleep(0.2)
-                # websockets 12 exposed `ws.closed`; 13+ replaced it with
-                # `ws.state` (an enum).  Use `state.name` which works in both.
-                assert ws.state.name == "OPEN", "WebSocket closed immediately after connect"
-
-        asyncio.run(_connect())
+    def test_whep_rejects_junk_offer(self, streaming_container):
+        """POSTing a non-SDP body must produce a 4xx, not a hang or 5xx."""
+        _, webrtc_port = streaming_container
+        r = requests.post(
+            f"http://localhost:{webrtc_port}/full_t0/whep",
+            data="not-an-sdp-offer",
+            headers={"Content-Type": "application/sdp"},
+            timeout=10,
+        )
+        assert 400 <= r.status_code < 500
 
     def test_config_endpoint_returns_runtime_config(self, streaming_container):
         """The /config.json endpoint exposes the desktop name and screen layout."""
@@ -93,26 +73,20 @@ class TestServiceAvailability:
         assert r.status_code == 200
         cfg = r.json()
         assert cfg["desktopName"] == "stream"
-        # Legacy port fields still present, pointed at tier 0 (scale 1.0).
-        assert cfg["fullSignallingPort"] == 8443
+        assert cfg["webrtcPort"] == WEBRTC_PORT
         names = [s["name"] for s in cfg["screens"]]
         assert names == ["top", "bottom"], (
             f"expected top/bottom split from CROP_HEIGHT={CROP_HEIGHT}; got {names}"
         )
-        ports = [s["signallingPort"] for s in cfg["screens"]]
-        assert ports == [WS_PORT_TOP, WS_PORT_BOTTOM]
-        # Ladder fields: tier 0 mirrors the legacy port; subsequent tiers
-        # shift by SIGNALLING_PORT_STRIDE (default 100).  The default
-        # ladder has 4 tiers (1.0, 0.75, 0.5, 0.25).
+        # Default ladder has 2 tiers (1.0, 0.5); each tier carries the
+        # MediaMTX path the browser derives its WHEP URL from.
         full_tiers = cfg["fullTiers"]
-        assert len(full_tiers) == 4
-        assert [t["scale"] for t in full_tiers] == [1.0, 0.75, 0.5, 0.25]
-        assert full_tiers[0]["signallingPort"] == cfg["fullSignallingPort"]
-        assert [t["signallingPort"] for t in full_tiers] == [8443, 8543, 8643, 8743]
+        assert [t["scale"] for t in full_tiers] == [1.0, 0.5]
+        assert [t["whepPath"] for t in full_tiers] == ["full_t0", "full_t1"]
         for s in cfg["screens"]:
-            assert "tiers" in s
-            assert len(s["tiers"]) == 4
-            assert s["tiers"][0]["signallingPort"] == s["signallingPort"]
+            assert [t["whepPath"] for t in s["tiers"]] == [
+                f"{s['name']}_t0", f"{s['name']}_t1",
+            ]
 
     def test_top_endpoint_returns_200(self, streaming_container):
         http_port, _ = streaming_container
@@ -134,25 +108,22 @@ class TestServiceAvailability:
         r = requests.get(f"http://localhost:{http_port}/bottom", timeout=10)
         assert "<video" in r.text, "/bottom must contain a <video> element"
 
-    def test_top_signalling_accepts_connection(self, streaming_container):
-        """Top-half signalling server accepts WebSocket connections on WS_PORT+1."""
-        async def _connect():
-            uri = f"ws://localhost:{WS_PORT_TOP}"
-            async with websockets.connect(uri, open_timeout=10) as ws:
-                await asyncio.sleep(0.2)
-                assert ws.state.name == "OPEN", "Top signalling WebSocket closed immediately"
-
-        asyncio.run(_connect())
-
-    def test_bottom_signalling_accepts_connection(self, streaming_container):
-        """Bottom-half signalling server accepts WebSocket connections on WS_PORT+2."""
-        async def _connect():
-            uri = f"ws://localhost:{WS_PORT_BOTTOM}"
-            async with websockets.connect(uri, open_timeout=10) as ws:
-                await asyncio.sleep(0.2)
-                assert ws.state.name == "OPEN", "Bottom signalling WebSocket closed immediately"
-
-        asyncio.run(_connect())
+    def test_every_tier_whep_endpoint_reachable(self, streaming_container):
+        """All (stream x tier) paths must be enumerated in MediaMTX."""
+        http_port, webrtc_port = streaming_container
+        cfg = requests.get(
+            f"http://localhost:{http_port}/config.json", timeout=10,
+        ).json()
+        paths = [t["whepPath"] for t in cfg["fullTiers"]]
+        for s in cfg["screens"]:
+            paths += [t["whepPath"] for t in s["tiers"]]
+        for path in paths:
+            r = requests.options(
+                f"http://localhost:{webrtc_port}/{path}/whep", timeout=10,
+            )
+            assert r.status_code in (200, 204), (
+                f"WHEP OPTIONS for {path} returned {r.status_code}"
+            )
 
 
 class TestWebRTCStream:
@@ -164,18 +135,19 @@ class TestWebRTCStream:
         Headless Chrome loads the streaming page and receives a WebRTC stream.
 
         video.currentTime > 0 proves the decoder is advancing — encoded
-        frames have arrived from the GStreamer pipeline and been decoded.
-        Timeout is 60 s to accommodate ICE gathering and codec negotiation.
+        frames have arrived from the ffmpeg/MediaMTX pipeline and been
+        decoded.  Timeout is 60 s to accommodate ICE gathering and the
+        keyframe wait on join (up to one GOP).
 
         turn_params adds TURN relay candidates when WEBRTC_TURN_SERVER is set
         (required in CI on Azure VMs where same-IP UDP hairpin is blocked).
         """
-        http_port, ws_port = streaming_container
+        http_port, _ = streaming_container
 
         # Inject diagnostic hooks that log RTCPeerConnection config and ICE
         # events to the browser console.  Runs on every new document so all
-        # ICE candidates (including relay) and the iceServers config used by
-        # gstwebrtc-api are visible in the captured browser log on failure.
+        # ICE candidates and connection state changes are visible in the
+        # captured browser log on failure.
         browser.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": """
@@ -212,12 +184,10 @@ class TestWebRTCStream:
             """},
         )
 
-        # Pass the host-mapped signalling port and, in CI, a loopback TURN relay
-        # so ICE relay candidates bypass Azure's same-IP UDP hairpin restriction.
-        browser.get(
-            f"http://localhost:{http_port}/"
-            f"?signalling=ws://localhost:{ws_port}{turn_params}"
-        )
+        # Pin tier 0 so the asserted resolution is deterministic regardless
+        # of the headless viewport size; turn_params adds relay candidates
+        # in CI.
+        browser.get(f"http://localhost:{http_port}/?tier=0{turn_params}")
 
         def video_is_playing(driver):
             t = driver.execute_script(
@@ -267,65 +237,12 @@ class TestWebRTCStream:
         # the red Xvfb root, not a black/empty placeholder.  Chroma subsampling
         # and YUV<->RGB rounding in the codec shift pure red a few units, so
         # thresholds allow ~20 % slack rather than requiring exactly (255,0,0).
-        #
-        # Poll with a wait loop because video.currentTime can advance on the
-        # first RTP packet before readyState reaches HAVE_CURRENT_DATA (2),
-        # and drawImage() on a video without a current frame leaves the canvas
-        # at its initial transparent-black state (returning avg RGB = 0,0,0
-        # with no exception).  The loop waits for readyState >= 2 and for the
-        # drawn canvas to contain non-zero pixels.
-        capture_script = """
-            const v = document.querySelector('video');
-            if (!v || !v.videoWidth || !v.videoHeight) {
-                return {stage: 'no-video-size',
-                        readyState: v ? v.readyState : -1};
-            }
-            if (v.readyState < 2) {
-                return {stage: 'not-ready',
-                        readyState: v.readyState,
-                        currentTime: v.currentTime};
-            }
-            const c = document.createElement('canvas');
-            c.width = v.videoWidth;
-            c.height = v.videoHeight;
-            const ctx = c.getContext('2d');
-            try {
-                ctx.drawImage(v, 0, 0, c.width, c.height);
-            } catch (e) {
-                return {stage: 'drawImage-error', error: String(e),
-                        readyState: v.readyState};
-            }
-            let data;
-            try {
-                data = ctx.getImageData(0, 0, c.width, c.height).data;
-            } catch (e) {
-                return {stage: 'getImageData-error', error: String(e)};
-            }
-            // Sample the first pixel and a center pixel separately so we can
-            // distinguish "drawImage didn't run" (canvas alpha = 0 everywhere)
-            // from "stream is genuinely solid black" (alpha = 255) in the
-            // failure message — the root-cause shape is very different.
-            const centerIdx = (Math.floor(c.height / 2) * c.width +
-                               Math.floor(c.width / 2)) * 4;
-            let r = 0, g = 0, b = 0, a = 0;
-            const n = data.length / 4;
-            for (let i = 0; i < data.length; i += 4) {
-                r += data[i]; g += data[i + 1];
-                b += data[i + 2]; a += data[i + 3];
-            }
-            return {
-                stage: 'ok',
-                width: c.width, height: c.height,
-                avgR: r / n, avgG: g / n, avgB: b / n, avgA: a / n,
-                firstPixel:  [data[0], data[1], data[2], data[3]],
-                centerPixel: [data[centerIdx], data[centerIdx + 1],
-                              data[centerIdx + 2], data[centerIdx + 3]],
-                readyState: v.readyState,
-                currentTime: v.currentTime,
-            };
-        """
+        last_stats = {}
 
-        def frame_is_red(stats):
+        def red_frame_available(driver):
+            stats = driver.execute_script(_CAPTURE_SCRIPT)
+            last_stats.clear()
+            last_stats.update(stats or {})
             return (
                 stats is not None
                 and stats.get("stage") == "ok"
@@ -333,14 +250,6 @@ class TestWebRTCStream:
                 and stats.get("avgG", 255) < 60
                 and stats.get("avgB", 255) < 60
             )
-
-        last_stats = {}
-
-        def red_frame_available(driver):
-            stats = driver.execute_script(capture_script)
-            last_stats.clear()
-            last_stats.update(stats or {})
-            return stats if frame_is_red(stats) else False
 
         try:
             WebDriverWait(browser, timeout=30, poll_frequency=0.5).until(
@@ -364,8 +273,8 @@ class TestWebRTCStream:
         on the values themselves — RTT/2 and QP are not absolute quality
         measures, and CI hardware varies too much for a meaningful bound.
         """
-        http_port, ws_port = streaming_container
-        _wait_for_playing(browser, http_port, ws_port, turn_params)
+        http_port, _ = streaming_container
+        _wait_for_playing(browser, http_port, "/", turn_params)
         try:
             _wait_for_metrics(browser)
         except TimeoutError as exc:
@@ -407,11 +316,10 @@ _CAPTURE_SCRIPT = """
 """
 
 
-def _wait_for_playing(browser, http_port, signalling_port, turn_params, timeout=60):
-    """Navigate to the service page using the given signalling port and wait for playback."""
+def _wait_for_playing(browser, http_port, page_path, turn_params, timeout=60):
+    """Navigate to the given page path pinned to tier 0 and wait for playback."""
     browser.get(
-        f"http://localhost:{http_port}/"
-        f"?signalling=ws://localhost:{signalling_port}{turn_params}"
+        f"http://localhost:{http_port}{page_path}?tier=0{turn_params}"
     )
 
     def video_is_playing(driver):
@@ -472,7 +380,7 @@ def _dump_diagnostics(browser, service, reason):
         page_state = {'error': str(exc)}
     service_out, service_err = service.get_logs()
     pytest.fail(
-        f"Latency test failed: {reason}\n"
+        f"Metrics test failed: {reason}\n"
         f"  page state     : {page_state}\n"
         f"  browser console:\n{console_text}\n"
         f"===== service stdout =====\n{service_out.decode(errors='replace')}\n"
@@ -520,12 +428,12 @@ class TestSplitStreamPlayback:
 
     Uses the regular single-colour (all-red) container chain.  Both halves are
     expected to produce frames of exactly CROP_HEIGHT rows — confirming the
-    videocrop elements are active and sized correctly.
+    ffmpeg crop filters are active and sized correctly.
     """
 
-    def _run(self, browser, http_port, sig_port, turn_params, label):
+    def _run(self, browser, http_port, page_path, turn_params, label):
         try:
-            _wait_for_playing(browser, http_port, sig_port, turn_params)
+            _wait_for_playing(browser, http_port, page_path, turn_params)
         except Exception:
             pytest.fail(f"{label} WebRTC stream did not start playing within 60 s")
 
@@ -544,11 +452,11 @@ class TestSplitStreamPlayback:
 
     def test_top_webrtc_plays(self, streaming_container, _service, browser, turn_params):
         http_port, _ = streaming_container
-        self._run(browser, http_port, WS_PORT_TOP, turn_params, "/top")
+        self._run(browser, http_port, "/top", turn_params, "/top")
 
     def test_bottom_webrtc_plays(self, streaming_container, _service, browser, turn_params):
         http_port, _ = streaming_container
-        self._run(browser, http_port, WS_PORT_BOTTOM, turn_params, "/bottom")
+        self._run(browser, http_port, "/bottom", turn_params, "/bottom")
 
 
 # ── Level 4: split-stream crop-offset colour tests ────────────────────────────
@@ -568,10 +476,10 @@ class TestSplitStreamCrop:
     the blue assertion would fail.
     """
 
-    def _run_colour_test(self, browser, http_port, sig_port, turn_params,
+    def _run_colour_test(self, browser, http_port, page_path, turn_params,
                          label, colour_check, colour_desc):
         try:
-            _wait_for_playing(browser, http_port, sig_port, turn_params)
+            _wait_for_playing(browser, http_port, page_path, turn_params)
         except Exception:
             pytest.fail(f"{label} WebRTC stream (two-tone) did not start playing within 60 s")
 
@@ -589,7 +497,7 @@ class TestSplitStreamCrop:
         """Top stream shows the red upper half of the two-tone source."""
         http_port, _ = streaming_container_two_tone
         self._run_colour_test(
-            browser, http_port, TWO_TONE_WS_PORT_TOP, turn_params,
+            browser, http_port, "/top", turn_params,
             "/top",
             lambda s: s.get("avgR", 0) > 200 and s.get("avgG", 255) < 60 and s.get("avgB", 255) < 60,
             "red (R>200, G<60, B<60)",
@@ -601,7 +509,7 @@ class TestSplitStreamCrop:
         """Bottom stream shows the blue lower half — proving the y-offset is applied."""
         http_port, _ = streaming_container_two_tone
         self._run_colour_test(
-            browser, http_port, TWO_TONE_WS_PORT_BOTTOM, turn_params,
+            browser, http_port, "/bottom", turn_params,
             "/bottom",
             lambda s: s.get("avgR", 255) < 60 and s.get("avgG", 255) < 60 and s.get("avgB", 0) > 200,
             "blue (R<60, G<60, B>200)",

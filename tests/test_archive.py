@@ -1,11 +1,11 @@
 """
 Archive tests for the desktop-stream-service container.
 
-The service container tees the incoming H.264 bitstream so that one branch
-writes rotating fragmented-MP4 segments in /archive-live via splitmuxsink
-+ mp4mux (fragment-duration + streamable).  When a fragment rotates,
-pipeline.py renames/moves it into /archive under its timestamped name —
-no re-encoding, no remux step.
+The service's ffmpeg process writes rotating fragmented-MP4 segments in
+/archive-live (segment muxer, movflags empty_moov so the moov atom sits at
+the front of the in-progress file).  When a segment rotates, the finalize
+watcher renames/moves it into /archive under its timestamped name — no
+re-encoding, no remux step.
 
 These tests confirm both halves of that flow without relying on ffprobe.
 """
@@ -22,7 +22,7 @@ MP4_FTYP = b"ftyp"
 
 
 class TestArchive:
-    """Verifies tee → h264parse → splitmuxsink(mp4mux frag) → /archive."""
+    """Verifies ffmpeg segment output → finalize watcher → /archive."""
 
     def test_first_segment_appears(self, first_segment):
         """
@@ -37,14 +37,12 @@ class TestArchive:
         """
         The live (in-progress) segment starts with `ftyp` at offset 4.
 
-        mp4mux in fragmented-streamable mode writes `ftyp + moov(empty) +
-        moof+mdat ...` once the first encoded buffer reaches the muxer.
-        The header itself is small (~600 bytes), but on a CI host where
-        15+ webrtcsink encoders are spinning up in parallel the archive
-        encoder's first buffer can take 10–15 s to land on the muxer's
-        sink pad.  The deadline here is generous on purpose — it's
-        bounded by encoder startup time, not by mp4mux: once the first
-        buffer arrives, the ftyp+moov pair is on disk in milliseconds.
+        ffmpeg's segment muxer with movflags empty_moov writes
+        `ftyp + moov + moof+mdat ...` once the first encoded frame
+        reaches the muxer.  The deadline here is generous on purpose —
+        it's bounded by encoder startup under CI contention, not by the
+        muxer: once the first frame arrives, the ftyp+moov pair is on
+        disk in milliseconds.
         """
         first = first_segment
 
@@ -72,10 +70,10 @@ class TestArchive:
     def test_segment_has_content(self, first_segment):
         """
         The first segment grows past the ftyp+moov prelude size.
-        A fresh mp4mux file that never got any real frame data is
-        under ~1 KB (just ftyp + empty moov boxes).  Real streamed
-        content hits tens of KB once the first fragment's worth of
-        frames has been muxed.
+        A fresh fragmented-MP4 file that never got any real frame data
+        is around 1 KB (just ftyp + moov boxes).  Real streamed content
+        hits tens of KB once the first fragment's worth of frames has
+        been muxed.
 
         The 30 s deadline matches the magic-bytes test — the bottleneck
         is encoder startup under CI contention, not muxer fragment

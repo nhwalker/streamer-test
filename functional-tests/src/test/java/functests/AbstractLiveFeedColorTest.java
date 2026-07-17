@@ -137,8 +137,10 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
         driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
         recorder = BrowserRecorder.forDriver(driver);
 
-        String url = stack.baseUrl() + "/?signalling=ws://localhost:" + stack.wsPort()
-                + buildTurnParams();
+        // Pin tier 0 so the received resolution is deterministic regardless
+        // of the headless viewport size; the page resolves the WHEP endpoint
+        // from /config.json.
+        String url = stack.baseUrl() + "/?tier=0" + buildTurnParams();
         driver.get(url);
 
         // Wait up to 60 s for the video element to start advancing.
@@ -322,7 +324,7 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
         assumeTrue(flipStartEpoch > 0,
                 "Flip test did not record timestamps — wrong execution order?");
 
-        // Wait for the GStreamer pipeline to flush and seal the current MKV cluster.
+        // Give the encoder/muxer a moment to flush the current fragment to disk.
         Thread.sleep(5_000);
 
         HttpClient httpClient = HttpClient.newBuilder()
@@ -471,9 +473,10 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
 
         // A segment that overlaps the request window [flipStartEpoch-5, flipEndEpoch+5]
         // may have started up to one full segment duration before the window start.
-        // splitmuxsink rotates at the next keyframe AFTER max-size-time elapses, so
-        // actual segment durations exceed the nominal archiveSegmentSec() by up to
-        // one keyframe interval; allow a few seconds of slack to absorb that.
+        // The segment muxer rotates at the next keyframe AFTER segment_time
+        // elapses, so actual segment durations exceed the nominal
+        // archiveSegmentSec() by up to one keyframe interval; allow a few
+        // seconds of slack to absorb that.
         long segmentRotationSlackSec = 5;
         Instant windowStart = Instant.ofEpochSecond(
                 flipStartEpoch - 5 - archiveSegmentSec() - segmentRotationSlackSec);
@@ -627,7 +630,7 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
         return (JavascriptExecutor) driver;
     }
 
-    /** Converts GStreamer TURN URL to browser query params, or returns "". */
+    /** Converts a turn:// URL (CI relay) to browser query params, or returns "". */
     static String buildTurnParams() {
         String gstTurn = System.getProperty("GST_WEBRTC_TURN_SERVER", "");
         if (gstTurn.isEmpty()) return "";

@@ -17,7 +17,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Owns the Xvfb process and the service container for one test class.
- * The service container captures the Xvfb display directly via ximagesrc.
+ * The service container captures the Xvfb display directly via ffmpeg
+ * x11grab and serves viewers over WHEP via its embedded MediaMTX.
  *
  * <h3>Usage patterns</h3>
  * <ul>
@@ -32,21 +33,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * </ul>
  *
  * The container runs with network_mode=host, matching the proven Python test
- * setup. Service signalling servers use 8443/8444/8445 on the host.
+ * setup. MediaMTX serves WHEP on 8889 (ICE/UDP on 8189) on the host.
  */
 public final class ServiceStack {
 
     private static final String SERVICE_IMAGE =
             System.getProperty("SERVICE_IMAGE", "desktop-stream-service:ci");
-    private static final String TURN_SERVER   =
-            System.getProperty("GST_WEBRTC_TURN_SERVER", "");
 
     // Fixed ports — service runs with network_mode=host so there is no
     // dynamic port mapping.
-    private static final int HTTP_PORT      = 8080;
-    private static final int WS_PORT        = 8443;
-    private static final int WS_PORT_TOP    = 8444;
-    private static final int WS_PORT_BOTTOM = 8445;
+    private static final int HTTP_PORT   = 8080;
+    private static final int WEBRTC_PORT = 8889;
 
     // 1280x720 Xvfb split into top (0..360) / bottom (360..720) regions.
     private static final String DESKTOP_SPLITS =
@@ -141,27 +138,25 @@ public final class ServiceStack {
     // ── Service container ────────────────────────────────────────────────────
     @SuppressWarnings("resource")
     private GenericContainer<?> buildService(int archiveSegmentSec) {
-        GenericContainer<?> c = new GenericContainer<>(SERVICE_IMAGE)
+        return new GenericContainer<>(SERVICE_IMAGE)
                 .withNetworkMode("host")
                 .withEnv("DISPLAY", ":99")
                 .withEnv("STREAM_WIDTH", "1280")
                 .withEnv("STREAM_HEIGHT", "720")
                 .withEnv("STREAM_FRAMERATE", "30")
-                .withEnv("SIGNALLING_PORT", String.valueOf(WS_PORT))
                 .withEnv("DESKTOP_SPLITS", DESKTOP_SPLITS)
                 .withEnv("ARCHIVE_SEGMENT_SEC", String.valueOf(archiveSegmentSec))
                 .withEnv("ARCHIVE_DIR", "/archive")
                 .withEnv("WEB_PORT", String.valueOf(HTTP_PORT))
+                // Host networking: advertise loopback in ICE candidates so
+                // the CI browser can connect over 127.0.0.1.
+                .withEnv("WEBRTC_ADDITIONAL_HOSTS", "127.0.0.1")
                 .withFileSystemBind("/tmp/.X11-unix", "/tmp/.X11-unix")
                 .withCreateContainerCmdModifier(cmd ->
                         cmd.getHostConfig().withIpcMode("host"))
                 .withFileSystemBind(archiveDir.toString(), "/archive")
                 .waitingFor(Wait.forLogMessage(".*web server on port.*", 1)
                         .withStartupTimeout(Duration.ofSeconds(120)));
-        if (!TURN_SERVER.isEmpty()) {
-            c = c.withEnv("GST_WEBRTC_TURN_SERVER", TURN_SERVER);
-        }
-        return c;
     }
 
     private void awaitHttpReady() throws Exception {
@@ -214,9 +209,7 @@ public final class ServiceStack {
     // ── Public API ────────────────────────────────────────────────────────────
     public String baseUrl()     { return "http://localhost:" + HTTP_PORT; }
     public String serviceLogs() { return service.getLogs(); }
-    public int    wsPort()      { return WS_PORT; }
-    public int    wsPortTop()   { return WS_PORT_TOP; }
-    public int    wsPortBottom(){ return WS_PORT_BOTTOM; }
+    public int    webrtcPort()  { return WEBRTC_PORT; }
     public Path   archiveDir()  { return archiveDir; }
 
     /**

@@ -9,19 +9,14 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.net.http.WebSocket;
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Common test logic for the static endpoint suite (/, /top, /bottom, WebSocket
- * ports).  Concrete subclasses supply the {@link ServiceStack} to test against
- * via a {@code @BeforeAll} that sets {@link #stack} and {@link #client}.
+ * Common test logic for the static endpoint suite (/, /top, /bottom, WHEP
+ * endpoints).  Concrete subclasses supply the {@link ServiceStack} to test
+ * against via a {@code @BeforeAll} that sets {@link #stack} and {@link #client}.
  */
 abstract class AbstractStaticEndpointTest {
 
@@ -56,11 +51,14 @@ abstract class AbstractStaticEndpointTest {
     }
 
     @Test
-    @DisplayName("GET / references gstwebrtc-api JS bundle")
-    @Description("Verifies the root page HTML references the gstwebrtc-api JavaScript bundle via a src attribute.")
-    void rootBodyReferencesGstWebRtcApiBundle() throws Exception {
-        assertNotNull(extractBundlePath(body("/")),
-                "Expected a src= attribute referencing gstwebrtc-api*.js in the root page");
+    @DisplayName("GET / contains the inline WHEP client")
+    @Description("Verifies the root page HTML carries the inline WHEP/WebRTC client (no external JS bundle).")
+    void rootBodyContainsInlineWhepClient() throws Exception {
+        String html = body("/");
+        assertTrue(html.contains("/whep"),
+                "Expected the page to build WHEP endpoint URLs");
+        assertTrue(html.contains("RTCPeerConnection"),
+                "Expected the inline WebRTC client in the root page");
     }
 
     // ── GET /top ──────────────────────────────────────────────────────────────
@@ -111,47 +109,27 @@ abstract class AbstractStaticEndpointTest {
         assertTrue(body("/bottom").contains("<video"), "Expected <video> element in /bottom response body");
     }
 
-    // ── JS bundle ─────────────────────────────────────────────────────────────
+    // ── WHEP endpoints ─────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("JS bundle URL is served with HTTP 200")
-    @Description("Extracts the gstwebrtc-api bundle src URL from the index page and verifies it returns HTTP 200.")
-    void jsBundleIsServed() throws Exception {
-        String indexBody  = body("/");
-        String bundlePath = extractBundlePath(indexBody);
-        assertNotNull(bundlePath, "Could not find gstwebrtc-api bundle src in index HTML");
-
-        String bundleUrl = stack.baseUrl() + (bundlePath.startsWith("/") ? bundlePath : "/" + bundlePath);
-        HttpResponse<byte[]> r = client.send(
-                HttpRequest.newBuilder(URI.create(bundleUrl))
-                           .GET().timeout(Duration.ofSeconds(10)).build(),
-                HttpResponse.BodyHandlers.ofByteArray());
-
-        assertEquals(200, r.statusCode(), "JS bundle URL returned non-200: " + bundleUrl);
-        assertTrue(r.body().length > 0, "JS bundle body is empty");
-    }
-
-    // ── WebSocket signalling ports ─────────────────────────────────────────────
-
-    @Test
-    @DisplayName("Main signalling port accepts WebSocket connection")
-    @Description("Verifies that the full-stream WebRTC signalling server accepts a WebSocket upgrade on its mapped port.")
-    void mainSignallingPortAcceptsWebSocket() throws Exception {
-        assertWebSocketConnects(stack.wsPort());
+    @DisplayName("Full-stream WHEP endpoint answers preflight")
+    @Description("Verifies MediaMTX answers a WHEP OPTIONS request on the full-stream tier-0 path.")
+    void fullStreamWhepEndpointReachable() throws Exception {
+        assertWhepEndpointReachable("full_t0");
     }
 
     @Test
-    @DisplayName("Top-half signalling port accepts WebSocket connection")
-    @Description("Verifies that the top-half WebRTC signalling server accepts a WebSocket upgrade on its mapped port.")
-    void topSignallingPortAcceptsWebSocket() throws Exception {
-        assertWebSocketConnects(stack.wsPortTop());
+    @DisplayName("Top-half WHEP endpoint answers preflight")
+    @Description("Verifies MediaMTX answers a WHEP OPTIONS request on the top-half tier-0 path.")
+    void topWhepEndpointReachable() throws Exception {
+        assertWhepEndpointReachable("top_t0");
     }
 
     @Test
-    @DisplayName("Bottom-half signalling port accepts WebSocket connection")
-    @Description("Verifies that the bottom-half WebRTC signalling server accepts a WebSocket upgrade on its mapped port.")
-    void bottomSignallingPortAcceptsWebSocket() throws Exception {
-        assertWebSocketConnects(stack.wsPortBottom());
+    @DisplayName("Bottom-half WHEP endpoint answers preflight")
+    @Description("Verifies MediaMTX answers a WHEP OPTIONS request on the bottom-half tier-0 path.")
+    void bottomWhepEndpointReachable() throws Exception {
+        assertWhepEndpointReachable("bottom_t0");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -167,20 +145,15 @@ abstract class AbstractStaticEndpointTest {
         return get(path).body();
     }
 
-    private static final Pattern BUNDLE_SRC = Pattern.compile(
-            "src=['\"]([^'\"]*gstwebrtc-api[^'\"]*\\.js)['\"]");
-
-    private static String extractBundlePath(String html) {
-        Matcher m = BUNDLE_SRC.matcher(html);
-        return m.find() ? m.group(1) : null;
-    }
-
-    private void assertWebSocketConnects(int port) throws Exception {
-        CompletableFuture<WebSocket> future = client.newWebSocketBuilder()
-                .buildAsync(URI.create("ws://localhost:" + port + "/"),
-                        new WebSocket.Listener() {});
-        WebSocket ws = future.get(10, TimeUnit.SECONDS);
-        assertNotNull(ws, "WebSocket connection to port " + port + " returned null");
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "").join();
+    private void assertWhepEndpointReachable(String whepPath) throws Exception {
+        URI uri = URI.create("http://localhost:" + stack.webrtcPort()
+                + "/" + whepPath + "/whep");
+        HttpResponse<Void> r = client.send(
+                HttpRequest.newBuilder(uri)
+                           .method("OPTIONS", HttpRequest.BodyPublishers.noBody())
+                           .timeout(Duration.ofSeconds(10)).build(),
+                HttpResponse.BodyHandlers.discarding());
+        assertTrue(r.statusCode() == 200 || r.statusCode() == 204,
+                "WHEP OPTIONS for " + whepPath + " returned " + r.statusCode());
     }
 }

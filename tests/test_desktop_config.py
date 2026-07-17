@@ -96,20 +96,38 @@ def test_falls_back_to_full_frame_when_x_quiet():
     assert (s['cropLeft'], s['cropTop'], s['cropRight'], s['cropBottom']) == (0, 0, 0, 0)
 
 
-def test_signalling_port_offset_uses_index():
+def test_whep_paths_use_stream_key_and_tier_index():
     cfg = desktop_config.compute_config({
         'STREAM_WIDTH': '3840',
         'STREAM_HEIGHT': '1080',
-        'SIGNALLING_PORT': '9000',
         'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
-        # Pin to a single tier so this test isolates the legacy
-        # signallingPort fields from the ladder math (which is exercised in
-        # its own dedicated tests below).
         'WEBRTC_SCALE_LADDER': '1.0',
     })
-    assert cfg['fullSignallingPort'] == 9000
-    assert cfg['screens'][0]['signallingPort'] == 9001
-    assert cfg['screens'][1]['signallingPort'] == 9002
+    assert [t['whepPath'] for t in cfg['fullTiers']] == ['full_t0']
+    assert [t['whepPath'] for t in cfg['screens'][0]['tiers']] == ['left_t0']
+    assert [t['whepPath'] for t in cfg['screens'][1]['tiers']] == ['right_t0']
+
+
+def test_webrtc_port_default_and_override():
+    assert desktop_config.compute_config({
+        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
+    })['webrtcPort'] == 8889
+    assert desktop_config.compute_config({
+        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
+        'WEBRTC_PORT': '9889',
+    })['webrtcPort'] == 9889
+
+
+def test_deprecated_signalling_env_is_ignored():
+    # Legacy deployments still setting the WebSocket-signalling vars must
+    # not break — the values are ignored (a warning is printed to stderr).
+    cfg = desktop_config.compute_config({
+        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
+        'SIGNALLING_PORT': '9000',
+        'SIGNALLING_PORT_STRIDE': '100',
+    })
+    assert 'fullSignallingPort' not in cfg
+    assert all('signallingPort' not in t for t in cfg['fullTiers'])
 
 
 def test_invalid_desktop_splits_raises():
@@ -130,7 +148,10 @@ class TestScaleLadder:
     without standing up a real pipeline."""
 
     def test_default_ladder(self):
-        assert desktop_config._parse_scale_ladder({}) == [1.0, 0.75, 0.5, 0.25]
+        # Two tiers by default: unlike the old per-consumer webrtcsink
+        # encoders, every ladder entry is an always-on ffmpeg encode per
+        # stream, so the default ladder stays small.
+        assert desktop_config._parse_scale_ladder({}) == [1.0, 0.5]
 
     def test_explicit_ladder_sorts_descending(self):
         assert desktop_config._parse_scale_ladder(
@@ -212,60 +233,38 @@ class TestScaleLadder:
             'STREAM_HEIGHT': '1080',
             'DESKTOP_SPLITS': '1920x540+0+0;1920x540+0+540',
             'WEBRTC_SCALE_LADDER': '1.0,0.5',
-            'SIGNALLING_PORT': '8443',
-            'SIGNALLING_PORT_STRIDE': '100',
         })
         # Full stream tiers.
-        assert cfg['fullSignallingPort'] == 8443
         assert cfg['fullTiers'] == [
             {'scale': 1.0, 'width': 1920, 'height': 1080,
-             'signallingPort': 8443},
+             'whepPath': 'full_t0'},
             {'scale': 0.5, 'width': 960,  'height': 540,
-             'signallingPort': 8543},
+             'whepPath': 'full_t1'},
         ]
-        # Per-screen tiers: top is index 0 (stream 1), bottom is index 1
-        # (stream 2); each cropped region is 1920x540.
+        # Per-screen tiers: each cropped region is 1920x540.
         top, bottom = cfg['screens']
-        assert top['signallingPort'] == 8444
         assert top['tiers'] == [
             {'scale': 1.0, 'width': 1920, 'height': 540,
-             'signallingPort': 8444},
+             'whepPath': 'top_t0'},
             {'scale': 0.5, 'width': 960,  'height': 270,
-             'signallingPort': 8544},
+             'whepPath': 'top_t1'},
         ]
-        assert bottom['signallingPort'] == 8445
         assert bottom['tiers'] == [
             {'scale': 1.0, 'width': 1920, 'height': 540,
-             'signallingPort': 8445},
+             'whepPath': 'bottom_t0'},
             {'scale': 0.5, 'width': 960,  'height': 270,
-             'signallingPort': 8545},
+             'whepPath': 'bottom_t1'},
         ]
 
-    def test_port_stride_per_tier(self):
+    def test_whep_paths_unique_across_streams_and_tiers(self):
         cfg = desktop_config.compute_config({
             'STREAM_WIDTH': '3840',
             'STREAM_HEIGHT': '1080',
-            'SIGNALLING_PORT': '9000',
-            'SIGNALLING_PORT_STRIDE': '100',
             'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
             'WEBRTC_SCALE_LADDER': '1.0,0.5,0.25',
         })
-        # Tier 0 (1.0) keeps the legacy port; tiers 1+ shift by stride.
-        full_ports = [t['signallingPort'] for t in cfg['fullTiers']]
-        assert full_ports == [9000, 9100, 9200]
-        left_ports = [t['signallingPort'] for t in cfg['screens'][0]['tiers']]
-        right_ports = [t['signallingPort'] for t in cfg['screens'][1]['tiers']]
-        assert left_ports  == [9001, 9101, 9201]
-        assert right_ports == [9002, 9102, 9202]
-
-    def test_signalling_stride_collision_check(self):
-        # Stride must be larger than (full + screen count) to avoid having
-        # tier 1's allocation collide with tier 0 of another stream.
-        with pytest.raises(ValueError):
-            desktop_config.compute_config({
-                'STREAM_WIDTH': '1920',
-                'STREAM_HEIGHT': '1080',
-                'SIGNALLING_PORT_STRIDE': '2',
-                'DESKTOP_SPLITS': ('1920x270+0+0;1920x270+0+270;'
-                                   '1920x270+0+540;1920x270+0+810'),
-            })
+        paths = [t['whepPath'] for t in cfg['fullTiers']]
+        for s in cfg['screens']:
+            paths += [t['whepPath'] for t in s['tiers']]
+        assert len(paths) == len(set(paths))
+        assert paths[0] == 'full_t0'

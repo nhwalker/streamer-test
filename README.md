@@ -1,6 +1,16 @@
 # X11 Desktop Streaming via WebRTC
 
-Streams a Linux desktop (X11) to any modern web browser in real time, with sub-second latency and efficient video compression. Packaged as a single container image based on Red Hat UBI 10.
+Streams a Linux desktop (X11) to any modern web browser in real time, with
+sub-second latency and efficient video compression, while continuously
+recording the desktop to disk. Packaged as a single container image based on
+Red Hat UBI 10.
+
+The stack is **ffmpeg** (capture + encode) → **MediaMTX** (WebRTC/WHEP
+egress) → browser. There are **no source builds** — every component comes
+from a mirror-able RPM repository or a single vendored static binary.
+
+> Migrating from the GStreamer/webrtcsink version? See
+> [Migration from the GStreamer stack](#migration-from-the-gstreamer-stack).
 
 ---
 
@@ -15,7 +25,7 @@ Streams a Linux desktop (X11) to any modern web browser in real time, with sub-s
 7. [NVIDIA GPU encoding](#nvidia-gpu-encoding)
 8. [Configuration reference](#configuration-reference)
 9. [Verifying it works](#verifying-it-works)
-10. [Production upgrade path](#production-upgrade-path)
+10. [Migration from the GStreamer stack](#migration-from-the-gstreamer-stack)
 
 ---
 
@@ -25,75 +35,71 @@ Streams a Linux desktop (X11) to any modern web browser in real time, with sub-s
 Host desktop (X11)
       │  screen pixels
       ▼
- GStreamer pipeline  ──encodes──►  webrtcsink
-      │                                 │
-      │                        WebRTC signalling
-      │                                 │
-      ▼                                 ▼
- Container exposes               Browser opens
- two ports:                      http://host:8080
-   :8080  web page               and receives live
-   :8443  signalling             video stream
+   ffmpeg  ── one x11grab capture, fan-out to N H.264 encodes ──┐
+      │                                                          │
+      │ RTSP (localhost only)                                    │ fragmented-MP4
+      ▼                                                          ▼ segments
+   MediaMTX                                                 /archive-live
+      │                                                          │ rotate + rename
+      │ WebRTC (WHEP)                                            ▼
+      ▼                                                      /archive
+   Browser opens http://host:8080 and receives live video
 ```
 
-The desktop screen is captured as a stream of raw video frames, compressed using the VP9 codec, and delivered to the browser over WebRTC — the same protocol used by Google Meet and Zoom. The browser needs no plugin; WebRTC is built into every modern browser.
+The desktop screen is captured as a stream of raw video frames, compressed
+with H.264 (NVENC on the GPU when available, x264 otherwise), and delivered
+to the browser over WebRTC — the same protocol used by Google Meet and Zoom.
+The browser needs no plugin. In parallel, the same capture is encoded once
+more at archival quality and written to disk as rotating MP4 segments.
 
 ---
 
 ## Technology primer
 
-### GStreamer
+### ffmpeg
 
-GStreamer is a pipeline-based multimedia framework. You assemble a chain of *elements* — each one does one job — and GStreamer moves data between them:
+ffmpeg is the swiss-army knife of video processing. One ffmpeg process does
+everything on the capture side:
 
-```
-[capture] → [resize] → [encode] → [send]
-```
+- **`x11grab`** reads raw frames from the X11 display.
+- A **filter graph** (`-filter_complex`) crops per-monitor regions and
+  scales each resolution tier — one capture feeds every output.
+- **`h264_nvenc`** (GPU) or **`libx264`** (CPU) encodes each output.
+- The **RTSP muxer** publishes each live tier to MediaMTX over loopback;
+  the **segment muxer** writes the archive to disk.
 
-Elements are linked with `!` on the command line. For example:
+### WebRTC and WHEP
 
-```
-ximagesrc ! videoscale ! vp9enc ! ...
-```
+WebRTC is the browser-native standard for real-time media: low latency
+(typically under 500 ms), encrypted (DTLS-SRTP), no plugin required.
 
-### WebRTC
+**WHEP** (WebRTC-HTTP Egress Protocol) is the standard way for a browser to
+*receive* a WebRTC stream from a server: the page POSTs an SDP offer to an
+HTTP endpoint, gets the answer back in the response, and media flows over a
+normal `RTCPeerConnection`. No signalling WebSocket, no client library —
+the whole client is ~100 lines inlined in `index.html`.
 
-WebRTC (Web Real-Time Communication) is an open standard built into all modern browsers that enables peer-to-peer audio/video streaming. Key properties:
+### MediaMTX
 
-- **Low latency** — typically under 500 ms end-to-end
-- **Adaptive bitrate** — automatically adjusts quality to available bandwidth
-- **Encrypted** — all media is encrypted in transit (DTLS-SRTP)
-- **No plugin required** — supported natively in Chrome, Firefox, Safari, Edge
+[MediaMTX](https://github.com/bluenviron/mediamtx) is a zero-dependency
+media server distributed as one static Go binary. It ingests the RTSP
+streams ffmpeg publishes on loopback and re-serves each one to browsers via
+WHEP, handling all WebRTC negotiation (ICE/DTLS/SRTP). It never touches the
+GPU and never transcodes — it repackages compressed frames, so its CPU cost
+is trivial.
 
-WebRTC requires a **signalling server** to help the two peers (our GStreamer pipeline and the browser) find each other and agree on connection parameters. Once connected, media flows directly between them.
-
-### webrtcsink
-
-`webrtcsink` is a GStreamer *sink element* (a pipeline endpoint) from the [gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs) project — a collection of GStreamer plugins written in Rust. It handles the entire WebRTC stack:
-
-- Codec negotiation with the browser (decides on VP9, VP8, or H.264)
-- Encoding the video
-- Setting up the encrypted WebRTC connection
-- Sending the compressed video to one or more browser peers simultaneously
-
-From a pipeline perspective, `webrtcsink` is just another element you connect to — but internally it manages all the WebRTC complexity.
-
-### gst-plugins-rs
-
-The official GStreamer project ships additional plugins written in Rust, collected in the `gst-plugins-rs` repository. These are not yet packaged in most Linux distributions, so this project compiles them from source during the Docker build.
-
-### Signalling server
-
-Before two WebRTC peers can exchange video, they need to exchange a small amount of metadata:
-
-- **SDP** (Session Description Protocol) — describes what codecs and formats each side supports
-- **ICE candidates** — lists of network addresses through which each peer can be reached
-
-The signalling server (`gst-webrtc-signalling-server`) is a lightweight WebSocket server that acts as a message broker for this exchange. It does **not** carry video — only the setup handshake. Once the peers are connected, the server plays no further role.
+One consequence worth knowing: MediaMTX is a *passthrough*. It cannot ask
+ffmpeg for a keyframe, so a viewer joining mid-stream sees the first frame
+only when the next keyframe arrives. The encoders therefore run a 1-second
+keyframe interval (`LIVE_GOP`) — worst-case join delay is one second.
 
 ### UBI 10 (Universal Base Image)
 
-Red Hat's UBI 10 is a freely redistributable container base image derived from Red Hat Enterprise Linux 10. It provides a stable, enterprise-grade foundation with a consistent package set and long-term security support — suitable for production deployments. RHEL 10 ships GStreamer 1.24.x, which drives the version pinning for the Rust plugins described in the [Build process](#build-process) section.
+Red Hat's UBI 10 is a freely redistributable container base image derived
+from RHEL 10. Package repositories used: Rocky Linux 10 (BaseOS/AppStream/
+CRB), EPEL 10, and **RPM Fusion Free** — which ships the full ffmpeg build
+(NVENC, libx264, libopus, x11grab). All are mirror-able for air-gapped
+deployments.
 
 ---
 
@@ -109,75 +115,70 @@ graph TD
         X11 -->|"exposes"| sock
     end
 
-    subgraph container["Docker Container (UBI 10)"]
+    subgraph container["Container (UBI 10)"]
         direction TB
-        gst["GStreamer Pipeline\nximagesrc → encode → webrtcsink"]
-        sig["Signalling Server\ngst-webrtc-signalling-server\nws://0.0.0.0:8443"]
-        web["Web Server\npython3 http.server\nhttp://0.0.0.0:8080"]
-        html["/var/www/html/\nindex.html + gstwebrtc-api.js"]
+        ff["ffmpeg\nx11grab → filter graph →\nh264_nvenc / libx264"]
+        mtx["MediaMTX\nRTSP ingest (loopback)\nWHEP egress :8889"]
+        web["Web Server\npython3 web_server.py\nhttp://0.0.0.0:8080"]
+        arch["/archive-live → /archive\nfragmented-MP4 segments"]
 
-        gst <-->|"WebSocket\nSDP + ICE"| sig
-        web -->|"serves"| html
+        ff -->|"RTSP/TCP\nrtsp://127.0.0.1:8554/&lt;path&gt;"| mtx
+        ff -->|"segment muxer"| arch
+        web -->|"serves"| html["/var/www/html/index.html\n(inline WHEP client)"]
     end
 
     subgraph browser["Browser"]
-        page["index.html\n(gstwebrtc-api.js)"]
-        video["&lt;video&gt; element\nlive desktop stream"]
+        page["index.html"]
+        video["&lt;video&gt; element"]
         page -->|"renders"| video
     end
 
-    sock -->|"mounted ro\n-v /tmp/.X11-unix"| gst
+    sock -->|"mounted ro"| ff
     web -->|"HTTP :8080"| page
-    sig <-->|"WebSocket :8443\nSDP + ICE handshake"| page
-    gst -->|"WebRTC media\n(VP9 over UDP)"| video
+    mtx <-->|"WHEP: HTTP POST offer /\nSDP answer :8889"| page
+    mtx -->|"WebRTC media\n(SRTP over UDP :8189)"| video
 ```
 
-### Media flow (frame-by-frame)
+### Streams and tiers
+
+Every deployment serves one **full-frame** stream plus one stream per
+detected monitor (or per `DESKTOP_SPLITS` region). Each stream is encoded at
+a ladder of resolutions (default: 1.0 and 0.5 scale). Each (stream, tier)
+pair is one MediaMTX path:
+
+| Page | Tier paths (default ladder) |
+|---|---|
+| `/` (full frame) | `full_t0`, `full_t1` |
+| `/left` (or `/top`, `/screen1`, …) | `left_t0`, `left_t1` |
+
+The browser reads `/config.json`, picks the smallest tier whose pixel
+dimensions still cover its rendered video size, and connects to that tier's
+WHEP endpoint (`http://host:8889/<path>/whep`). Resizing across a tier
+boundary reconnects to the new tier (~250 ms blip).
+
+Unlike the previous webrtcsink design, **every tier is encoded
+continuously** — an unwatched tier still costs an encoder session. Keep the
+ladder short (see `WEBRTC_SCALE_LADDER`).
+
+### Media flow (viewer join)
 
 ```mermaid
 sequenceDiagram
-    participant X11 as X11 Display
-    participant GST as GStreamer Pipeline
-    participant SIG as Signalling Server
     participant BR as Browser
+    participant MTX as MediaMTX
+    participant FF as ffmpeg
 
-    BR->>SIG: Connect (WebSocket)
-    SIG-->>BR: Assign peer ID
+    FF->>MTX: RTSP ANNOUNCE + SETUP + RECORD (at startup)
+    Note over FF,MTX: publisher streams H.264 continuously
 
-    Note over GST,SIG: webrtcsink detects new peer
-    GST->>SIG: SDP Offer (codec list)
-    SIG->>BR: Forward SDP Offer
-    BR->>SIG: SDP Answer (chosen codec: VP9)
-    SIG->>GST: Forward SDP Answer
-
-    GST->>SIG: ICE candidates (network addresses)
-    SIG->>BR: Forward ICE candidates
-    BR->>SIG: ICE candidates
-    SIG->>GST: Forward ICE candidates
-
-    Note over GST,BR: WebRTC connection established (DTLS handshake)
-
-    loop Every frame (~33 ms at 30 fps)
-        X11->>GST: Raw pixels (via /tmp/.X11-unix)
-        GST->>GST: Scale to target resolution
-        GST->>GST: Encode with VP9
-        GST->>BR: Compressed frame (SRTP over UDP)
-        BR->>BR: Decode + display in &lt;video&gt;
+    BR->>MTX: HTTP POST /full_t0/whep (SDP offer)
+    MTX-->>BR: 201 Created (SDP answer + session Location)
+    Note over BR,MTX: ICE + DTLS handshake
+    MTX->>BR: SRTP media, starting at the next keyframe (≤ 1 s)
+    loop Every frame
+        FF->>MTX: RTP (compressed H.264, loopback)
+        MTX->>BR: SRTP (same bytes, repackaged)
     end
-```
-
-### GStreamer pipeline
-
-```mermaid
-flowchart LR
-    A["ximagesrc\nCaptures X11\nscreen pixels"] -->|"raw video"| B
-    B["videorate\nEnforces\ntarget FPS"] -->|"timed frames"| C
-    C["videoscale\nResizes to\ntarget resolution"] -->|"scaled frames"| D
-    D["videoconvert\nNormalises\npixel format"] -->|"I420 frames"| E
-    E["webrtcsink\nNegotiates codec\nEncodes + sends\nvia WebRTC"]
-
-    style A fill:#2a4a6b,color:#fff
-    style E fill:#3a5a2b,color:#fff
 ```
 
 ---
@@ -189,109 +190,67 @@ graph TD
     subgraph runtime["Runtime Container"]
         direction TB
         ep["/usr/local/bin/entrypoint.sh"]
-        pl["/usr/local/bin/pipeline.py"]
-        ss["/usr/local/bin/gst-webrtc-signalling-server"]
-        plug["/usr/local/lib/gstreamer-1.0/\nRust plugins (libgstrswebrtc.so, …)\nlibgstnvcodec.so"]
-        rep["/usr/lib64/gstreamer-1.0/\nlibgstwebrtc.so (replaced)\nlibgstdtls/sctp/srtp.so (replaced)"]
-        www["/var/www/html/\nindex.html\ngstwebrtc-api/gstwebrtc-api.js"]
-        sys["System GStreamer\n(gstreamer1-plugins-good\ngstreamer1-plugins-bad-free)"]
+        dc["desktop_config.py\n(writes /run/desktop-stream/config.json)"]
+        sc["stream_command.py\n(builds ffmpeg argv + mediamtx.yml)"]
+        pl["pipeline.py\n(spawns + supervises ffmpeg,\nfinalizes archive segments)"]
+        mtx["/usr/local/bin/mediamtx\n(vendored static binary)"]
+        ws["web_server.py\n(:8080, /config.json, /archive, /video)"]
 
-        ep -->|"starts"| ss
-        ep -->|"starts"| www
-        ep -->|"execs"| pl
-        pl -->|"gst-launch-1.0"| plug
-        plug -->|"uses"| rep
-        plug -->|"uses"| sys
+        ep -->|"1"| dc
+        ep -->|"2 (config via stream_command)"| mtx
+        ep -->|"3"| ws
+        ep -->|"4"| pl
+        pl -->|"argv from"| sc
     end
 ```
 
 ### Startup sequence
 
-```mermaid
-sequenceDiagram
-    participant D as Docker
-    participant E as entrypoint.sh
-    participant S as Signalling Server
-    participant W as Web Server (python3)
-    participant P as pipeline.py / gst-launch-1.0
-
-    D->>E: container start
-    E->>E: X11 pre-flight check\n(1-frame probe via ximagesrc)
-    E->>S: start in background (:8443)
-    E->>E: readiness probe (nc -z :8443, max 2s)
-    E->>W: start in background (:8080)
-    E->>P: exec (replaces shell)
-    P->>P: build gst-launch-1.0 command\nfrom env vars
-    P-->>D: gst-launch-1.0 running\n(foreground process)
-```
+1. **Pre-flight** — log GPU presence (`nvidia-smi`), verify the X display
+   is reachable with a one-frame ffmpeg grab.
+2. **`desktop_config.py`** — probe RandR for resolution/monitors, compute
+   the tier ladder, write `/run/desktop-stream/config.json`.
+3. **MediaMTX** — `stream_command.py` renders `mediamtx.yml` (loopback RTSP
+   ingest, WHEP on `WEBRTC_PORT`, everything else disabled, only the
+   configured paths allowed); readiness-probed before continuing.
+4. **`web_server.py`** — serves the page, `/config.json`, and the archive
+   endpoints.
+5. **`pipeline.py`** — probes `h264_nvenc` with a one-frame test encode,
+   builds the single ffmpeg command, and supervises it: if ffmpeg dies it
+   is restarted with backoff (MediaMTX tolerates the publisher dropping and
+   re-appearing; viewers see a short freeze, not a page error). The same
+   loop tails ffmpeg's segment list and publishes completed archive
+   segments under timestamped names.
 
 ---
 
 ## Build process
 
-The container uses a two-stage build to keep the final image small. The build stage (~5 GB, discarded after build) compiles everything from source. The runtime stage (~400 MB) contains only what is needed to run.
+Single-stage build, no compilation. The final image is ~600 MB and builds
+in a few minutes (package installs + one download).
 
-```mermaid
-flowchart TD
-    subgraph build["Build Stage (UBI 10 + Rust + Meson + Node.js)"]
-        direction TB
-        A["A: Install OS build deps\n(GStreamer 1.24 devel, meson, cmake,\nnpm, libsrtp-devel, libnice-devel)"]
-        A2["A2: Build usrsctp from source\n(cmake — not packaged in RHEL10/EPEL10)\n→ static lib linked into libgstsctp-1.0.so"]
-        B["B: Install Rust toolchain\n(rustup stable + cargo-c)"]
-        C["C: Clone + prefetch gst-plugins-rs @ 0.13.3\n(cargo fetch)"]
-        D["D: Build all Rust plugins\n(cargo cinstall each cdylib)\n→ /opt/gst-rs/lib/gstreamer-1.0/*.so"]
-        E["E: Build signalling server\n(cargo build --bin gst-webrtc-signalling-server)\n→ /opt/gst-webrtc-signalling-server"]
-        F["F: Build gstwebrtc-api JS bundle\n(npm install && npm run build)\n→ /opt/gstwebrtc-api/"]
-        G["G: Build GStreamer monorepo subset\n(meson: nvcodec + webrtcbin + dtls + sctp + srtp)\n→ /opt/gst-nvcodec/"]
+| Component | Source | Air-gap story |
+|---|---|---|
+| ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL10) | mirror the repo |
+| Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | mirror the repos |
+| MediaMTX | GitHub release binary, **pinned version + sha256** | vendor one tarball into the internal artifact store, pass `--build-arg MEDIAMTX_URL=…` |
+| Web page + WHEP client | inline in `service/web/index.html` | in-repo, no build step |
 
-        A --> A2
-        A --> B --> C --> D --> E
-        C --> F
-        A2 --> G
-        A --> G
-    end
+Two things to watch:
 
-    subgraph runtime["Runtime Stage (UBI 10)"]
-        direction TB
-        H["Install system GStreamer packages\n(plugins-good, plugins-bad-free,\nlibnice, libnice-gstreamer1, libsrtp)"]
-        I["COPY Rust plugins + nvcodec\n→ /usr/local/lib/gstreamer-1.0/\n(new — no system equivalent)"]
-        J["REPLACE system webrtcbin/dtls/sctp/srtp\n→ /usr/lib64/gstreamer-1.0/\n(overwrites broken RHEL10 builds)"]
-        K["COPY signalling server binary\n→ /usr/local/bin/"]
-        L["COPY gstwebrtc-api + index.html\n→ /var/www/html/"]
-        M["COPY entrypoint.sh + pipeline.py\n→ /usr/local/bin/"]
+- **Do not install EPEL's `ffmpeg-free`** — it conflicts with RPM Fusion's
+  `ffmpeg-libs` and lacks NVENC. The Containerfile asserts `h264_nvenc` and
+  `x11grab` are present at build time.
+- **MediaMTX cannot be built with `go install`** — its build requires
+  `go generate`, which downloads assets from GitHub. Vendoring the release
+  binary is the supported path (checksum-verified via `MEDIAMTX_SHA256`).
 
-        H --> I --> J --> K --> L --> M
-    end
-
-    D -->|"COPY .so files"| I
-    G -->|"COPY libgstnvcodec.so"| I
-    G -->|"COPY + overwrite"| J
-    E -->|"COPY binary"| K
-    F -->|"COPY dist/"| L
+```bash
+# Build (service and hub are independent)
+make service hub
+# or directly:
+podman build -t desktop-stream-service:ci service/
 ```
-
-### Why compile from source?
-
-Four distinct components require source builds; the reasons are different in each case.
-
-| Component | Why not use a package? |
-|---|---|
-| **gst-plugins-rs** (webrtcsink + all Rust plugins) | Never packaged for RHEL. No EPEL or Rocky equivalent exists. |
-| **usrsctp** | Not packaged in EPEL10 or Rocky 10. Required by GStreamer's SCTP plugin for WebRTC data channels. |
-| **GStreamer nvcodec** | NVIDIA hardware encoders are not included in any RHEL10 package. |
-| **GStreamer webrtcbin, dtls, sctp, srtp** | RHEL10's `gstreamer1-plugins-bad-free` is compiled **without libsrtp2** — DTLS-SRTP negotiation silently fails, making the packaged webrtcbin non-functional for WebRTC. |
-
-**The webrtcbin problem in detail.** Red Hat builds `gstreamer1-plugins-bad-free` without `libsrtp2` because libsrtp is absent from RHEL10's base repositories (it lives in EPEL10, which Red Hat does not depend on during package builds). Without SRTP support, webrtcbin cannot complete DTLS negotiation — every incoming WebRTC session is silently dropped. The pipeline starts and appears healthy but no browser ever receives a frame. Building webrtcbin from the GStreamer monorepo source with `-Dsrtp=enabled -Ddtls=enabled -Dsctp=enabled` (and usrsctp statically linked in via the preceding cmake step) produces a fully functional WebRTC stack. The resulting `.so` files are copied over their system counterparts in `/usr/lib64/gstreamer-1.0/`, along with the rebuilt `libgstwebrtc-1.0.so` and `libgstwebrtcnice-1.0.so` companion libraries that the RHEL10 package omits entirely (it was built without libnice).
-
-**usrsctp.** The user-space SCTP library is the SCTP implementation GStreamer's data-channel code links against. It is absent from both EPEL10 and Rocky 10. Building it as a static library (`-Dsctp_build_shared_lib=OFF`) means the rebuilt `libgstsctp-1.0.so` bundles everything it needs with no new runtime dependency.
-
-**gst-plugins-rs.** The `webrtcsink` element and the WebSocket signalling server both live here. The Rust toolchain makes the build straightforward: `cargo cinstall` compiles every `cdylib` target in the workspace and drops the resulting `.so` files into the GStreamer plugin search path. Plugins whose native library dependencies are unavailable in RHEL10 (e.g. `gst-plugin-csound`) are silently skipped by the build loop without failing the overall build.
-
-### Why pin to gst-plugins-rs 0.13.3?
-
-The Rust GStreamer bindings (`gstreamer-rs`) must match the C GStreamer version on the system. RHEL10/UBI10 ships GStreamer 1.24.x. `gst-plugins-rs` 0.13.x targets `gstreamer-rs 0.23`, which requires GStreamer ≥ 1.24 — a precise match. The tag is set via the `GST_PLUGINS_RS_TAG` build argument; bump it to `0.14.x` once RHEL10 ships GStreamer ≥ 1.26.
-
-The GStreamer monorepo is cloned at the exact version reported by `pkg-config --modversion gstreamer-1.0` in the builder, so the rebuilt plugins are always ABI-compatible with the system GStreamer libraries.
 
 ---
 
@@ -299,21 +258,12 @@ The GStreamer monorepo is cloned at the exact version reported by `pkg-config --
 
 ### Prerequisites
 
-- Docker on a Linux host with an active X11 display
+- Docker/Podman on a Linux host with an active X11 display
 - The host display must accept connections from the container
 
 ```bash
-# Allow the container to connect to the host X display
 xhost +local:docker
 ```
-
-### Build
-
-```bash
-docker build -t x11-webrtc-streamer .
-```
-
-The first build takes 20–40 minutes (Rust compilation). Subsequent builds use Docker layer cache and complete in seconds unless source dependencies change.
 
 ### Run
 
@@ -322,17 +272,20 @@ docker run --rm \
   --network=host \
   -e DISPLAY=:0 \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  x11-webrtc-streamer
+  -v /srv/archive:/archive \
+  desktop-stream-service:ci
 ```
 
 Then open **http://localhost:8080** in a browser.
 
 > **Why `--network=host`?**
-> WebRTC uses UDP for media. When the browser and container are on the same machine, `--network=host` lets both sides discover the same host network interfaces during ICE negotiation, so they connect directly without needing a STUN relay server. Without `--network=host`, you must supply a STUN server (see `GST_WEBRTC_STUN_SERVER` below).
+> WebRTC media flows over UDP. With host networking, MediaMTX advertises
+> the host's real interface addresses as ICE candidates and browsers
+> connect directly. Without it, publish `-p 8080:8080 -p 8889:8889
+> -p 8189:8189/udp` and set `-e WEBRTC_ADDITIONAL_HOSTS=<host-ip>` so
+> MediaMTX advertises an address viewers can actually reach.
 
 ### Using Xauthority (alternative to xhost)
-
-If you prefer not to use `xhost`, mount the X authority file instead:
 
 ```bash
 docker run --rm \
@@ -341,225 +294,174 @@ docker run --rm \
   -e XAUTHORITY=/root/.Xauthority \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v "$HOME/.Xauthority:/root/.Xauthority:ro" \
-  x11-webrtc-streamer
+  desktop-stream-service:ci
 ```
 
 ---
 
 ## NVIDIA GPU encoding
 
-When the container runs on a host with an NVIDIA GPU and [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), it can use NVENC hardware encoding for H.264 and H.265. This offloads video encoding from the CPU to the GPU's dedicated encoder, freeing CPU cores and often improving quality at the same bitrate.
-
-### How it works
-
-The container image includes the GStreamer `nvcodec` plugin, which provides `nvh264enc` and `nvh265enc` encoder elements. The plugin uses `dlopen` to load NVIDIA driver libraries at runtime:
-
-- **With a GPU** (`--gpus all`): nvidia-container-toolkit injects the NVIDIA driver libraries (`libcuda.so`, `libnvidia-encode.so`). The nvcodec plugin loads successfully, and `webrtcsink` automatically prefers the hardware encoders over software ones.
-- **Without a GPU**: The plugin cannot load the NVIDIA libraries, so GStreamer silently skips it. Everything works exactly as before (VP9/VP8 software encoding).
-
-### Prerequisites
-
-- NVIDIA GPU with NVENC support (Kepler or newer — GTX 600+, Tesla T4/A10/L4, etc.)
-- NVIDIA driver installed on the host
-- [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed and configured
-
-### Running with GPU
+With an NVIDIA GPU and
+[nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+(or Podman CDI injection), all encodes run on the GPU's NVENC hardware:
 
 ```bash
 docker run --rm --gpus all \
   --network=host \
   -e DISPLAY=:0 \
-  -e STREAM_CODEC=h264 \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  x11-webrtc-streamer
+  desktop-stream-service:ci
 ```
 
-H.265 is also supported (better compression, but limited browser support — see note below):
+- `pipeline.py` probes `h264_nvenc` once at startup with a one-frame test
+  encode; if the driver libraries aren't injected it falls back to
+  `libx264` automatically. The startup log shows which path was chosen
+  (`Pipeline mode: GPU (h264_nvenc)` / `CPU (libx264)`).
+- **Session budget**: every (stream, tier) pair plus the archive is one
+  concurrent NVENC session. Consumer GeForce GPUs allow 8 concurrent
+  sessions; datacenter GPUs are unrestricted. The default 2-tier ladder
+  with two monitors uses 7 sessions.
+- Capture and scaling run on the CPU (the RPM Fusion ffmpeg build has no
+  CUDA scale filters); only encoding is offloaded.
 
-```bash
-docker run --rm --gpus all \
-  --network=host \
-  -e DISPLAY=:0 \
-  -e STREAM_CODEC=h265 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  x11-webrtc-streamer
-```
-
-> **H.265 browser support**: H.265 (HEVC) over WebRTC is supported in Chrome and Edge but **not in Firefox**. Use H.264 for maximum browser compatibility, or VP9 if you don't need GPU encoding.
-
-### Verifying GPU encoding
-
-```bash
-# Check that the nvcodec plugin loaded and nvh264enc is available
-docker run --rm --gpus all x11-webrtc-streamer \
-  gst-inspect-1.0 nvh264enc
-
-# During streaming, monitor GPU encoder utilization on the host
-nvidia-smi dmon -s u -d 1
-```
-
-The container logs will also show GPU detection at startup:
-```
-[entrypoint] NVIDIA GPU detected:
-  Tesla T4, 535.129.03, 15360 MiB
-[pipeline] NVIDIA NVENC detected: hardware encoding available (nvh264enc, nvh265enc)
-```
+Verify: `nvidia-smi dmon -s u -d 1` on the host while streaming, or check
+the startup log.
 
 ---
 
 ## Configuration reference
 
-All settings are environment variables passed to `docker run -e`:
+All settings are environment variables passed to `docker run -e`.
+
+### Capture and streams
 
 | Variable | Default | Description |
 |---|---|---|
 | `DISPLAY` | `:0` | X11 display to capture |
-| `DESKTOP_NAME` | `desktop` | Label shown in the page header; also used as the archive filename prefix |
-| `STREAM_CODEC` | `vp9` | Video codec: `vp9`, `vp8`, `h264`, or `h265`\* |
-| `STREAM_WIDTH` | _(native)_ | Capture width.  Leaving this unset reads the X server's native width via `xrandr` |
-| `STREAM_HEIGHT` | _(native)_ | Capture height.  Leaving this unset reads the X server's native height via `xrandr` |
+| `DESKTOP_NAME` | `desktop` | Page-header label; also the archive filename prefix |
+| `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
-| `DESKTOP_SPLITS` | _(empty)_ | Per-screen regions in `WxH+X+Y;WxH+X+Y` form.  Unset triggers `xrandr --listmonitors` auto-detection |
-| `SIGNALLING_HOST` | `0.0.0.0` | Network interface for the signalling server |
-| `SIGNALLING_PORT` | `8443` | Base port for the WebSocket signalling servers.  Each (stream, tier) pair uses `SIGNALLING_PORT + stream_index + SIGNALLING_PORT_STRIDE * tier_index`.  The full stream is stream 0; screens 1..N follow in name order |
-| `SIGNALLING_PORT_STRIDE` | `100` | Per-tier port spacing.  Tier 0 of each stream keeps the legacy port; tier 1 lands at +100, tier 2 at +200, etc. |
-| `WEBRTC_SCALE_LADDER` | `1.0,0.75,0.5,0.25` | Comma-separated fractional scales for the per-stream `webrtcsink` ladder.  Each browser auto-picks the smallest tier whose pixel dimensions still meet its rendered video size, so a viewer rendering at 540 px wide pulls a 1/2-scale stream instead of forcing the encoder to deliver source-resolution frames.  Accepts decimals (`0.5`), ints (`1`), and ratios (`1/3`); values must be in `(0, 1.0]`.  The `1.0` tier is always included |
-| `WEB_PORT` | `8080` | Port for the HTTP page server |
-| `GST_WEBRTC_STUN_SERVER` | _(empty)_ | STUN server URI, e.g. `stun://stun.l.google.com:19302` |
-| `GST_WEBRTC_TURN_SERVER` | _(empty)_ | TURN relay URI, e.g. `turn://user:pass@host:3478` — applied per-consumer via the `add-turn-server` signal |
+| `DESKTOP_SPLITS` | _(auto)_ | Per-screen regions `WxH+X+Y;…`; unset auto-detects monitors via RandR |
+| `WEBRTC_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the per-stream tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
 
-### Why a ladder?
+### Live encoding
 
-Encoding source-resolution frames for a browser that's rendering the
-`<video>` element at half size wastes bandwidth and encoder CPU — the
-extra pixels get thrown away on the client. The `webrtcsink` ladder
-sends each viewer the smallest pre-scaled feed that still meets their
-display size, so a 540 px viewer pulls a 540 px stream and a fullscreen
-1080 px viewer pulls the full 1080 px feed. `webrtcsink` only constructs
-its per-consumer encoder when a consumer actually subscribes, so a tier
-nobody is watching costs zero encoder CPU. When the browser resizes
-across a tier boundary it closes its session and reopens against the
-new tier; this is a brief (~250 ms) reconnect, not a permanent latency
-hit.
+| Variable | Default | Description |
+|---|---|---|
+| `LIVE_CQ` | `18` | Constant-quality target (H.264 QP scale; 18 ≈ visually lossless) |
+| `LIVE_MAXRATE` | `8M` | Hard bitrate cap for the full-res tier — **set this to the worst-case provisioned per-viewer bandwidth**. Smaller tiers are capped proportionally to pixel count |
+| `LIVE_BUFSIZE` | 2× maxrate | VBV buffer; smaller = smoother bitrate, larger = more motion detail |
+| `LIVE_GOP` | = framerate | Keyframe interval in frames. This is also the worst-case viewer join delay (MediaMTX cannot request keyframes from the publisher) — keep it at ~1 s |
 
-\* H.264 and H.265 use NVENC hardware encoding when a GPU is available (`--gpus all`). Without a GPU, H.264 falls back to software encoding via `gstreamer1-plugins-ugly` (x264), which is included in the runtime stage via RPM Fusion Free. H.265 WebRTC is supported in Chrome/Edge but not Firefox.
+There is no congestion-control feedback loop to the encoder (the old
+per-viewer REMB adaptation was a webrtcsink feature): the encode is shared
+by all viewers of a tier and holds constant quality under the `LIVE_MAXRATE`
+cap. On a provisioned network, cap at the provisioned rate and motion
+bursts appear as brief clarity dips instead of packet loss. See the
+rate-control decision record in `service/stream_command.py` (including the
+fixed-CBR alternative and when to prefer it).
 
-### Example: 720p stream
+### Ports / MediaMTX
 
-```bash
-docker run --rm --network=host \
-  -e DISPLAY=:0 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  -e STREAM_WIDTH=1280 \
-  -e STREAM_HEIGHT=720 \
-  x11-webrtc-streamer
-```
+| Variable | Default | Description |
+|---|---|---|
+| `WEB_PORT` | `8080` | HTTP page server |
+| `WEBRTC_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
+| `WEBRTC_UDP_PORT` | `8189` | MediaMTX ICE/UDP media port (browser-facing) |
+| `MEDIAMTX_RTSP_PORT` | `8554` | Loopback-only RTSP ingest (ffmpeg → MediaMTX) |
+| `WEBRTC_ADDITIONAL_HOSTS` | _(empty)_ | Comma-separated extra IPs/hostnames to advertise as ICE candidates (needed when not on host networking, or behind NAT) |
 
-### Example: access the stream from another machine
+### Archive
 
-When the browser is not on the same host as the container, remove `--network=host` and provide a STUN server so both sides can discover each other's public IP:
+| Variable | Default | Description |
+|---|---|---|
+| `ARCHIVE_DIR` | `/archive` | Completed, timestamp-named segments |
+| `ARCHIVE_LIVE_DIR` | `/archive-live` | In-progress segment (readable mid-write — fragmented MP4 with moov up front) |
+| `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration |
+| `ARCHIVE_QUALITY` | `visually-lossless` | `visually-lossless` (constant QP), `lossless` (NVENC lossless tune / x264 QP 0), or `legacy` (fixed-bitrate VBR) |
+| `ARCHIVE_QP` | `18` | QP for `visually-lossless` mode |
+| `ARCHIVE_BITRATE` | `6000` | kbps, `legacy` mode only |
+| `ARCHIVE_MAX_BYTES` / `ARCHIVE_MAX_AGE_DAYS` | `0` | Size/age-based purge; 0 = unlimited |
+| `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
+| `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
 
-```bash
-docker run --rm \
-  -p 8080:8080 \
-  -p 8443:8443 \
-  -e DISPLAY=:0 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  -e GST_WEBRTC_STUN_SERVER=stun://stun.l.google.com:19302 \
-  x11-webrtc-streamer
-```
+### Deprecated (ignored with a warning)
 
-Then open `http://<server-ip>:8080?stun=stun.l.google.com:19302` in the browser (the `?stun=` parameter tells the browser's WebRTC stack to use the same STUN server).
+`STREAM_CODEC` (live codec is always H.264), `SIGNALLING_HOST`,
+`SIGNALLING_PORT`, `SIGNALLING_PORT_STRIDE`, `GST_WEBRTC_STUN_SERVER`,
+`GST_WEBRTC_TURN_SERVER`, `WEBRTC_MIN_BITRATE`, `WEBRTC_START_BITRATE`,
+`WEBRTC_MAX_BITRATE`.
+
+### Page URL parameters
+
+| Parameter | Effect |
+|---|---|
+| `?tier=N` | Pin tier index N (0 = full resolution); disables auto-switching |
+| `?whep=<url>` | Pin a specific WHEP endpoint URL; disables auto-switching |
+| `?stun=host:port` | Add a STUN server for ICE |
+| `?turn_uri=…&turn_user=…&turn_cred=…` | Add a TURN relay for ICE |
 
 ---
 
 ## Verifying it works
 
-**1 — Check the plugin loaded correctly:**
+**1 — Encoders and capture present in the image:**
 
 ```bash
-docker run --rm x11-webrtc-streamer gst-inspect-1.0 webrtcsink
+docker run --rm --entrypoint ffmpeg desktop-stream-service:ci \
+  -hide_banner -encoders | grep -E 'h264_nvenc|libx264'
 ```
 
-Expected: a long property list including `video-caps` and `signaller`.
-
-**2 — Smoke test without X11 (synthetic video):**
-
-```bash
-docker run --rm --network=host x11-webrtc-streamer \
-  gst-launch-1.0 videotestsrc pattern=ball \
-  ! webrtcsink run-signalling-server=true run-web-server=true
-```
-
-Open `https://localhost:9090` (accept the self-signed certificate warning). A bouncing ball should appear.
-
-**3 — Full X11 stream:**
+**2 — Full X11 stream:**
 
 ```bash
 xhost +local:docker
 docker run --rm --network=host \
   -e DISPLAY=:0 \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  x11-webrtc-streamer
+  desktop-stream-service:ci
 # Open http://localhost:8080
 ```
 
-**4 — Performance check:**
+**3 — WHEP endpoint answers:**
 
 ```bash
-docker stats <container-name>
+curl -i -X OPTIONS http://localhost:8889/full_t0/whep   # expect 2xx
 ```
 
-VP9 software encoding at 1080p30 typically uses 100–200% CPU (1–2 cores) on modern hardware. If CPU is a concern, reduce resolution or switch to VP8 (`STREAM_CODEC=vp8`), which is cheaper to encode.
+**4 — Archive is being written:**
+
+```bash
+ls /srv/archive          # timestamped *_to_*.mp4 after the first rotation
+```
+
+**5 — Automated suites:** `pytest tests/` (unit + container integration)
+and `./gradlew test` in `functional-tests/` (browser-driven color/archive
+verification) — both run in CI on every push.
 
 ---
 
-## Production upgrade path
+## Migration from the GStreamer stack
 
-The PoC uses simple in-process components for convenience. Each can be swapped independently for production:
+The previous version captured with GStreamer (`ximagesrc` → CUDA convert/
+scale → `webrtcsink`) and required building gst-plugins-rs (Rust), usrsctp,
+and a patched gst-plugins-bad from source, plus a WebSocket signalling
+server per tier. All of that is gone:
 
-```mermaid
-flowchart LR
-    subgraph poc["PoC (this repo)"]
-        A1["ximagesrc\n(X11 capture)"]
-        B1["webrtcsink"]
-        C1["gst-webrtc-signalling-server\n(embedded WebSocket)"]
-        D1["python3 http.server\n(serves index.html)"]
-    end
+| Before | After |
+|---|---|
+| `base/` builder image (~5 GB, 20–40 min Rust/meson builds) | none — single-stage `service/Containerfile` |
+| gst-plugins-rs pin ↔ GStreamer version matching | n/a |
+| `gst-webrtc-signalling-server`, one port per (stream × tier), 8443+N | one WHEP port (`8889/tcp`) + one media port (`8189/udp`) |
+| gstwebrtc-api npm bundle | inline WHEP client in `index.html` |
+| VP9 default codec, per-viewer encoders, REMB adaptation to 80 Mbps | H.264, one shared encode per tier, constant quality capped at `LIVE_MAXRATE` |
+| splitmuxsink/mp4mux archive (moov at EOS; mdat-walker remux to serve the active segment) | ffmpeg segment muxer fMP4 (moov up front; active segment served by plain copy) |
+| Lazy per-consumer encoders (idle tiers free) | every tier always encoded → default ladder reduced to `1.0,0.5` |
 
-    subgraph prod["Production options"]
-        A2["pipewiresrc\n(Wayland / PipeWire)"]
-        B2["webrtcsink + WHIP signaller\n(HTTP-based, RFC standard)"]
-        C2["LiveKit / Janus / mediasoup\n(SFU — scales to 1000s of viewers)"]
-        D2["nginx / CDN\n(serves web page)"]
-    end
+Operational notes:
 
-    A1 -.->|"swap source element"| A2
-    B1 -.->|"change signaller= property"| B2
-    C1 -.->|"replace binary"| C2
-    D1 -.->|"replace web server"| D2
-```
-
-### Signalling server (Day 2)
-
-Deploy `gst-webrtc-signalling-server` as its own container. Set `SIGNALLING_PORT` in the streaming container to point at it. No other changes needed.
-
-### WHIP (standard WebRTC ingest)
-
-[WHIP](https://www.ietf.org/archive/id/draft-ietf-wish-whip-01.txt) is an HTTP-based WebRTC ingest standard supported by Cloudflare Stream, Janus, LiveKit, and others. Switch `webrtcsink` to use it by changing a single property — no pipeline restructuring:
-
-```bash
-# In pipeline.py, replace the signaller properties with:
-webrtcsink signaller::uri="https://your-sfu.example.com/whip/ingest" \
-           signaller=whipsink
-```
-
-### Scaling to many viewers
-
-`webrtcsink` manages multiple browser peers natively. For very large deployments (hundreds of simultaneous viewers), introduce a Selective Forwarding Unit (SFU) such as LiveKit or Janus between `webrtcsink` and the browsers. The SFU receives one stream from the container and fans it out to viewers, reducing upstream bandwidth from the capture host.
-
-### H.264 / H.265 hardware encoding
-
-The container image includes the GStreamer nvcodec plugin. When run with `--gpus all` (requires nvidia-container-toolkit on the host), NVENC hardware encoding is used automatically. Set `STREAM_CODEC=h264` or `STREAM_CODEC=h265` at runtime.
-
-For software H.264 encoding without a GPU, add EPEL and `gstreamer1-plugins-ugly` to the runtime stage of the Dockerfile. For VAAPI hardware encoding on Intel/AMD GPUs, pass `--device /dev/dri` to `docker run`.
+- Firewalls: close 8443–8751/tcp, open 8889/tcp + 8189/udp.
+- Any dashboards or scripts reading `/config.json` should switch from
+  `signallingPort` fields to `whepPath` + `webrtcPort`.
+- Archive file naming, `/archive` and `/video` endpoints, and purge
+  behaviour are unchanged.
