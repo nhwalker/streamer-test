@@ -8,7 +8,6 @@ import os
 import sys
 import time
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
 from archive_purge import purge_archive  # noqa: E402

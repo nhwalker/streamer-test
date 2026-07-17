@@ -77,7 +77,7 @@ WebRTC is the browser-native standard for real-time media: low latency
 *receive* a WebRTC stream from a server: the page POSTs an SDP offer to an
 HTTP endpoint, gets the answer back in the response, and media flows over a
 normal `RTCPeerConnection`. No signalling WebSocket, no client library —
-the whole client is ~100 lines inlined in `index.html`.
+the whole client lives in `service/web/app.js` — plain same-origin JS, no build step.
 
 ### MediaMTX
 
@@ -124,7 +124,7 @@ graph TD
 
         ff -->|"RTSP/TCP\nrtsp://127.0.0.1:8554/&lt;path&gt;"| mtx
         ff -->|"segment muxer"| arch
-        web -->|"serves"| html["/var/www/html/index.html\n(inline WHEP client)"]
+        web -->|"serves"| html["/var/www/html\n(index.html + app.js WHEP client)"]
     end
 
     subgraph browser["Browser"]
@@ -158,7 +158,7 @@ boundary reconnects to the new tier (~250 ms blip).
 
 Unlike the previous webrtcsink design, **every tier is encoded
 continuously** — an unwatched tier still costs an encoder session. Keep the
-ladder short (see `WEBRTC_SCALE_LADDER`).
+ladder short (see `LIVE_SCALE_LADDER`).
 
 ### Media flow (viewer join)
 
@@ -211,7 +211,7 @@ graph TD
 2. **`desktop_config.py`** — probe RandR for resolution/monitors, compute
    the tier ladder, write `/run/desktop-stream/config.json`.
 3. **MediaMTX** — `stream_command.py` renders `mediamtx.yml` (loopback RTSP
-   ingest, WHEP on `WEBRTC_PORT`, everything else disabled, only the
+   ingest, WHEP on `WHEP_PORT`, everything else disabled, only the
    configured paths allowed); readiness-probed before continuing.
 4. **`web_server.py`** — serves the page, `/config.json`, and the archive
    endpoints.
@@ -234,7 +234,7 @@ in a few minutes (package installs + one download).
 | ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL10) | mirror the repo |
 | Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | mirror the repos |
 | MediaMTX | GitHub release binary, **pinned version + sha256** | vendor one tarball into the internal artifact store, pass `--build-arg MEDIAMTX_URL=…` |
-| Web page + WHEP client | inline in `service/web/index.html` | in-repo, no build step |
+| Web page + WHEP client | `service/web/` (index.html, style.css, app.js) | in-repo, no build step |
 
 Two things to watch:
 
@@ -342,7 +342,7 @@ All settings are environment variables passed to `docker run -e`.
 | `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
 | `DESKTOP_SPLITS` | _(auto)_ | Per-screen regions `WxH+X+Y;…`; unset auto-detects monitors via RandR |
-| `WEBRTC_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the per-stream tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
+| `LIVE_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the per-stream tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
 
 ### Live encoding
 
@@ -366,7 +366,8 @@ fixed-CBR alternative and when to prefer it).
 | Variable | Default | Description |
 |---|---|---|
 | `WEB_PORT` | `8080` | HTTP page server |
-| `WEBRTC_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
+| `WEB_DIR` | `/var/www/html` | Static file root for the page server (set by the image; rarely changed) |
+| `WHEP_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
 | `WEBRTC_UDP_PORT` | `8189` | MediaMTX ICE/UDP media port (browser-facing) |
 | `MEDIAMTX_RTSP_PORT` | `8554` | Loopback-only RTSP ingest (ffmpeg → MediaMTX) |
 | `WEBRTC_ADDITIONAL_HOSTS` | _(empty)_ | Comma-separated extra IPs/hostnames to advertise as ICE candidates (needed when not on host networking, or behind NAT) |
@@ -383,7 +384,18 @@ fixed-CBR alternative and when to prefer it).
 | `ARCHIVE_BITRATE` | `6000` | kbps, `legacy` mode only |
 | `ARCHIVE_MAX_BYTES` / `ARCHIVE_MAX_AGE_DAYS` | `0` | Size/age-based purge; 0 = unlimited |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
+| `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output encode quality (QP); tracks the archive quality so there is no second knob to tune |
 | `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
+
+### Renamed (old name still honoured, warns at startup)
+
+| Old name | New name |
+|---|---|
+| `WEBRTC_PORT` | `WHEP_PORT` |
+| `WEBRTC_SCALE_LADDER` | `LIVE_SCALE_LADDER` |
+
+When both are set, the new name wins.  The old names will be removed in a
+future release; migrate at your convenience.
 
 ### Deprecated (ignored with a warning)
 
@@ -435,8 +447,9 @@ curl -i -X OPTIONS http://localhost:8889/full_t0/whep   # expect 2xx
 ls /srv/archive          # timestamped *_to_*.mp4 after the first rotation
 ```
 
-**5 — Automated suites:** `pytest tests/` (unit + container integration)
-and `./gradlew test` in `functional-tests/` (browser-driven color/archive
+**5 — Automated suites:** `make test` (pure-Python unit tests) and
+`make functional` (browser-driven container integration in
+`functional-tests/`, including color/archive
 verification) — both run in CI on every push.
 
 ---
@@ -453,7 +466,7 @@ server per tier. All of that is gone:
 | `base/` builder image (~5 GB, 20–40 min Rust/meson builds) | none — single-stage `service/Containerfile` |
 | gst-plugins-rs pin ↔ GStreamer version matching | n/a |
 | `gst-webrtc-signalling-server`, one port per (stream × tier), 8443+N | one WHEP port (`8889/tcp`) + one media port (`8189/udp`) |
-| gstwebrtc-api npm bundle | inline WHEP client in `index.html` |
+| gstwebrtc-api npm bundle | same-origin WHEP client in `app.js` |
 | VP9 default codec, per-viewer encoders, REMB adaptation to 80 Mbps | H.264, one shared encode per tier, constant quality capped at `LIVE_MAXRATE` |
 | splitmuxsink/mp4mux archive (moov at EOS; mdat-walker remux to serve the active segment) | ffmpeg segment muxer fMP4 (moov up front; active segment served by plain copy) |
 | Lazy per-consumer encoders (idle tiers free) | every tier always encoded → default ladder reduced to `1.0,0.5` |

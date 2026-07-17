@@ -19,7 +19,7 @@ filter_complex):
            -> archive           -> h264 -> fragmented-MP4 segments
 
 MediaMTX repackages each RTSP path as WebRTC and serves browsers via
-WHEP at  http://<host>:<WEBRTC_PORT>/<path>/whep .
+WHEP at  http://<host>:<WHEP_PORT>/<path>/whep .
 
 Environment variables consumed here (all optional):
 
@@ -40,7 +40,8 @@ Environment variables consumed here (all optional):
                   viewer joining mid-stream sees nothing until the next
                   keyframe — the GOP length IS the worst-case join time.
   MEDIAMTX_RTSP_PORT       localhost RTSP ingest port            (8554)
-  WEBRTC_PORT              MediaMTX WHEP/HTTP port               (8889)
+  WHEP_PORT                MediaMTX WHEP/HTTP port               (8889)
+                           (deprecated alias: WEBRTC_PORT)
   WEBRTC_UDP_PORT          MediaMTX ICE/UDP media port           (8189)
   WEBRTC_ADDITIONAL_HOSTS  comma-separated extra IPs/hostnames to
                            advertise in ICE candidates (for viewers that
@@ -75,7 +76,7 @@ Environment variables consumed here (all optional):
 DEFAULT_LIVE_CQ      = 18
 DEFAULT_LIVE_MAXRATE = '8M'
 DEFAULT_RTSP_PORT    = 8554
-DEFAULT_WEBRTC_PORT  = 8889
+DEFAULT_WHEP_PORT    = 8889
 DEFAULT_WEBRTC_UDP   = 8189
 
 # Never cap a tier below this, no matter how small its pixel count —
@@ -288,12 +289,14 @@ def build_mediamtx_config(config, env):
     """Render the MediaMTX YAML for this deployment.
 
     RTSP ingest binds to loopback only (the publisher is the co-located
-    ffmpeg); WHEP is served on WEBRTC_PORT.  Every other protocol and the
+    ffmpeg); WHEP is served on WHEP_PORT.  Every other protocol and the
     API are disabled.  Paths are enumerated explicitly so unknown publish
     or read attempts are rejected.
     """
+    from desktop_config import resolve_env_alias
+
     rtsp_port  = int(env.get('MEDIAMTX_RTSP_PORT', str(DEFAULT_RTSP_PORT)))
-    webrtc     = int(env.get('WEBRTC_PORT', str(DEFAULT_WEBRTC_PORT)))
+    webrtc     = int(resolve_env_alias(env, 'WHEP_PORT') or DEFAULT_WHEP_PORT)
     webrtc_udp = int(env.get('WEBRTC_UDP_PORT', str(DEFAULT_WEBRTC_UDP)))
     extra_hosts = [
         h.strip() for h in (env.get('WEBRTC_ADDITIONAL_HOSTS') or '').split(',')

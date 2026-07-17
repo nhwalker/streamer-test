@@ -31,10 +31,11 @@ Inputs (environment variables, evaluated once at container start):
   DESKTOP_SPLITS    Semicolon-separated 'WxH+X+Y' regions.  Empty triggers
                     RandR auto-detection of the connected monitors.
 
-  WEBRTC_PORT       MediaMTX WHEP/HTTP port surfaced to the browser via
+  WHEP_PORT         MediaMTX WHEP/HTTP port surfaced to the browser via
                     /config.json.  Default: 8889.
+                    (Deprecated alias: WEBRTC_PORT.)
 
-  WEBRTC_SCALE_LADDER  Comma-separated fractional scales for the per-stream
+  LIVE_SCALE_LADDER    Comma-separated fractional scales for the per-stream
                        tier ladder.  Each browser auto-picks the smallest
                        tier whose dimensions still meet its rendered video
                        size.  Unlike the old per-consumer webrtcsink
@@ -46,6 +47,7 @@ Inputs (environment variables, evaluated once at container start):
                        ratios (``"1/3"``).  Values must be in (0, 1.0]; the
                        ``1.0`` tier is always included.  Default:
                        ``"1.0,0.5"``.
+                       (Deprecated alias: WEBRTC_SCALE_LADDER.)
 
   SIGNALLING_PORT / SIGNALLING_PORT_STRIDE
                        Deprecated (pre-MediaMTX WebSocket signalling).
@@ -58,6 +60,13 @@ import json
 import os
 import re
 import sys
+
+# Imported under the old private names so existing monkeypatch call sites
+# (tests patch desktop_config._query_x_*) keep working.
+from x11 import (
+    query_x_monitors as _query_x_monitors,
+    query_x_screen as _query_x_screen,
+)
 
 CONFIG_PATH_DEFAULT = '/run/desktop-stream/config.json'
 
@@ -77,7 +86,7 @@ _TIER_MAX_COUNT     = 8
 # Dedup tolerance — two scales that differ by less than this are the same.
 _SCALE_EPS          = 1e-6
 
-_DEFAULT_WEBRTC_PORT = 8889
+_DEFAULT_WHEP_PORT = 8889
 
 _DEPRECATED_ENV = ('SIGNALLING_PORT', 'SIGNALLING_PORT_STRIDE',
                    'SIGNALLING_HOST', 'STREAM_CODEC',
@@ -85,9 +94,37 @@ _DEPRECATED_ENV = ('SIGNALLING_PORT', 'SIGNALLING_PORT_STRIDE',
                    'WEBRTC_MIN_BITRATE', 'WEBRTC_START_BITRATE',
                    'WEBRTC_MAX_BITRATE')
 
+# Renamed variables: new primary name -> deprecated alias.  The old names
+# date from the GStreamer/webrtcsink stack; they keep working (with a
+# startup warning) until deployments migrate.  Removal is a future,
+# separately-announced change.
+_ENV_ALIASES = {
+    'WHEP_PORT':         'WEBRTC_PORT',
+    'LIVE_SCALE_LADDER': 'WEBRTC_SCALE_LADDER',
+}
+
+
+def resolve_env_alias(env, new_name):
+    """Return the raw string value for a renamed env var, or None when unset.
+
+    The new name wins when both are set.  Setting only the deprecated old
+    name still works but prints a warning naming the replacement.
+    """
+    old_name = _ENV_ALIASES[new_name]
+    new_val = (env.get(new_name) or '').strip()
+    if new_val:
+        return new_val
+    old_val = (env.get(old_name) or '').strip()
+    if old_val:
+        print(f'[desktop_config] WARNING: {old_name} is deprecated; '
+              f'use {new_name}. The value {old_val!r} is still honoured.',
+              file=sys.stderr)
+        return old_val
+    return None
+
 
 def _parse_scale_ladder(env):
-    """Parse the comma-separated WEBRTC_SCALE_LADDER env var.
+    """Parse the comma-separated LIVE_SCALE_LADDER env var.
 
     Returns a list of unique floats sorted descending, always including
     ``1.0``.  Each entry must be in (0, 1.0]; we reject values outside that
@@ -95,7 +132,8 @@ def _parse_scale_ladder(env):
     ``"1,5"`` meaning ``[1.0, 5.0]``) surfaces as an error instead of being
     silently saturated.
     """
-    raw = (env.get('WEBRTC_SCALE_LADDER') or _DEFAULT_SCALE_LADDER).strip()
+    raw = (resolve_env_alias(env, 'LIVE_SCALE_LADDER')
+           or _DEFAULT_SCALE_LADDER).strip()
     if not raw:
         raw = _DEFAULT_SCALE_LADDER
     out = []
@@ -111,12 +149,12 @@ def _parse_scale_ladder(env):
                 value = float(piece)
         except (ValueError, ZeroDivisionError) as exc:
             raise ValueError(
-                f'WEBRTC_SCALE_LADDER entry {piece!r} is not a number or '
+                f'LIVE_SCALE_LADDER entry {piece!r} is not a number or '
                 f'ratio: {exc}'
             ) from exc
         if not (0 < value <= 1.0):
             raise ValueError(
-                f'WEBRTC_SCALE_LADDER entry {piece!r} = {value} is outside '
+                f'LIVE_SCALE_LADDER entry {piece!r} = {value} is outside '
                 f'(0, 1.0]'
             )
         out.append(value)
@@ -133,7 +171,7 @@ def _parse_scale_ladder(env):
 
     if len(dedup) > _TIER_MAX_COUNT:
         raise ValueError(
-            f'WEBRTC_SCALE_LADDER has {len(dedup)} entries; max is '
+            f'LIVE_SCALE_LADDER has {len(dedup)} entries; max is '
             f'{_TIER_MAX_COUNT}'
         )
     return dedup
@@ -175,96 +213,6 @@ def _parse_region(s):
     if w <= 0 or h <= 0:
         raise ValueError(f'invalid region {s!r}: width and height must be positive')
     return {'x': x, 'y': y, 'width': w, 'height': h}
-
-
-def _open_xdisplay(display_name):
-    """Return an open Xlib.display.Display, or None if Xlib/X server unavailable."""
-    try:
-        from Xlib import display as xdisplay  # noqa: WPS433 - lazy import is intentional
-    except ImportError as exc:
-        print(f'[desktop_config] WARNING: python-xlib unavailable ({exc}); '
-              'cannot auto-detect screen geometry.', file=sys.stderr)
-        return None
-    try:
-        return xdisplay.Display(display_name)
-    except Exception as exc:  # DisplayConnectionError, DisplayNameError, ...
-        print(f'[desktop_config] WARNING: cannot open X display {display_name!r} '
-              f'({exc}); cannot auto-detect screen geometry.', file=sys.stderr)
-        return None
-
-
-def _query_x_screen(display_name):
-    """Return (width, height) of the X server's root window, or None on failure."""
-    d = _open_xdisplay(display_name)
-    if d is None:
-        return None
-    try:
-        s = d.screen()
-        return s.width_in_pixels, s.height_in_pixels
-    except Exception as exc:
-        print(f'[desktop_config] WARNING: X screen query failed ({exc}); '
-              'cannot auto-detect screen size.', file=sys.stderr)
-        return None
-    finally:
-        try:
-            d.close()
-        except Exception:
-            pass
-
-
-def _query_x_monitors(display_name):
-    """Return a list of monitor regions ({'x','y','width','height'}) via RandR.
-
-    Tries XRRGetMonitors (RandR 1.5) first; falls back to enumerating active
-    CRTCs.  Returns [] when no usable data is available — the caller chooses
-    its own fallback strategy.
-    """
-    d = _open_xdisplay(display_name)
-    if d is None:
-        return []
-    try:
-        root = d.screen().root
-        # RandR 1.5: one entry per logical monitor (handles cloned outputs).
-        try:
-            res = root.xrandr_get_monitors()
-            regions = [
-                {'x': m.x, 'y': m.y,
-                 'width': m.width_in_pixels, 'height': m.height_in_pixels}
-                for m in res.monitors
-                if m.width_in_pixels > 0 and m.height_in_pixels > 0
-            ]
-            if regions:
-                return regions
-        except Exception as exc:
-            print(f'[desktop_config] xrandr_get_monitors failed ({exc}); '
-                  'trying CRTC enumeration.', file=sys.stderr)
-
-        # Fallback: enumerate active CRTCs from the screen resources.
-        try:
-            res = root.xrandr_get_screen_resources_current()
-        except Exception as exc:
-            print(f'[desktop_config] xrandr_get_screen_resources_current '
-                  f'failed ({exc}); cannot enumerate monitors.',
-                  file=sys.stderr)
-            return []
-
-        regions = []
-        for crtc_id in res.crtcs:
-            try:
-                info = d.xrandr_get_crtc_info(crtc_id, res.config_timestamp)
-            except Exception:
-                continue
-            if info.width > 0 and info.height > 0:
-                regions.append({
-                    'x': info.x, 'y': info.y,
-                    'width': info.width, 'height': info.height,
-                })
-        return regions
-    finally:
-        try:
-            d.close()
-        except Exception:
-            pass
 
 
 def _name_regions(regions):
@@ -334,7 +282,7 @@ def compute_config(env=None):
     for var in _DEPRECATED_ENV:
         if (env.get(var) or '').strip():
             print(f'[desktop_config] WARNING: {var} is deprecated and '
-                  'ignored — WebRTC is served by MediaMTX on WEBRTC_PORT '
+                  'ignored — WebRTC is served by MediaMTX on WHEP_PORT '
                   '(default 8889).', file=sys.stderr)
 
     display   = env.get('DISPLAY', ':0')
@@ -354,7 +302,8 @@ def compute_config(env=None):
         width  = int(width_raw)  if width_raw  else native_w
         height = int(height_raw) if height_raw else native_h
 
-    webrtc_port = int(env.get('WEBRTC_PORT', str(_DEFAULT_WEBRTC_PORT)))
+    webrtc_port = int(resolve_env_alias(env, 'WHEP_PORT')
+                      or _DEFAULT_WHEP_PORT)
     framerate   = int((env.get('STREAM_FRAMERATE')   or  '30').strip())
     scales      = _parse_scale_ladder(env)
 

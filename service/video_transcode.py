@@ -11,7 +11,7 @@ that exactly covers the requested time window:
     so web players can begin decoding from the first received bytes
 
 All files in the stage directory must have timestamps in their filenames
-(as produced by stage_segments in web_server.py).  Files without recognized
+(as produced by stage_segments in archive_export.py).  Files without recognized
 timestamps are ignored.
 
 Requires: ffmpeg and ffprobe available in PATH.
@@ -21,13 +21,13 @@ Public API:
                        fill_color_argb, output_path,
                        default_width, default_height)
 """
-import functools
 import json
 import os
 import subprocess
 from dataclasses import dataclass
 
 from archive_times import parse_segment_times
+from encoders import nvenc_works as _nvenc_works
 
 _DEFAULT_FPS = '25/1'
 
@@ -36,21 +36,6 @@ _DEFAULT_FPS = '25/1'
 # stay in sync without a second knob to tune; can be overridden with VIDEO_QP.
 # Lower is better; 18 is the conventional visually-lossless threshold for H.264.
 _VIDEO_QP = int(os.environ.get('VIDEO_QP', os.environ.get('ARCHIVE_QP', '18')))
-
-
-@functools.lru_cache(maxsize=None)
-def _nvenc_works():
-    """Return True if h264_nvenc can actually encode (GPU present and functional)."""
-    try:
-        r = subprocess.run(
-            ['ffmpeg', '-hide_banner',
-             '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.04',
-             '-frames:v', '1', '-c:v', 'h264_nvenc', '-f', 'null', '-'],
-            capture_output=True, timeout=15,
-        )
-        return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
 
 
 def _detect_encoder_args():

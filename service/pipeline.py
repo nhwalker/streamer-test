@@ -58,6 +58,7 @@ from archive_encoder import archive_encoder_args
 from archive_finalize import SegmentFinalizer, next_segment_number
 from archive_purge import purge_archive
 from desktop_config import load_config
+from encoders import nvenc_works
 from stream_command import build_ffmpeg_command, live_gop
 
 ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')
@@ -77,23 +78,6 @@ _FINALIZE_POLL_SEC         = 0.5
 # Graceful-stop budget: SIGINT lets ffmpeg flush the last segment + list
 # entry; escalate to SIGKILL if it wedges.
 _STOP_GRACE_SEC            = 10.0
-
-
-def _nvenc_works():
-    """True when h264_nvenc can actually encode (driver libs injected)."""
-    try:
-        r = subprocess.run(
-            ['ffmpeg', '-hide_banner',
-             '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.04',
-             '-frames:v', '1', '-c:v', 'h264_nvenc', '-f', 'null', '-'],
-            capture_output=True, timeout=15,
-        )
-        return r.returncode == 0
-    except FileNotFoundError:
-        print('[service] ERROR: ffmpeg not found in PATH', file=sys.stderr)
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        return False
 
 
 def _print_summary(config, use_nvenc, archive_pattern):
@@ -132,7 +116,7 @@ def main():
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
     os.makedirs(ARCHIVE_LIVE_DIR, exist_ok=True)
 
-    use_nvenc = _nvenc_works()
+    use_nvenc = nvenc_works(require_ffmpeg=True)
     archive_pattern   = os.path.join(ARCHIVE_LIVE_DIR, f'{desktop_name}-%05d.mp4')
     segment_list_path = os.path.join(ARCHIVE_LIVE_DIR, 'segments.csv')
 

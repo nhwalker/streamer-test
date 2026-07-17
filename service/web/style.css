@@ -1,0 +1,107 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/*
+  Quality palette — shared between the gumball and per-metric value
+  colours.  When a metric's value falls into a tier its text adopts the
+  corresponding colour; this lets the user trace which component is
+  keeping the overall gumball below bright-green.
+*/
+:root {
+  --c-lossless:   #7CFC00;  /* lawn green — best */
+  --c-vlossless:  #4caf50;  /* mid green */
+  --c-good:       #43a047;  /* darker green, still legible on #1a1a1a */
+  --c-yellow:     #ffc107;
+  --c-red:        #f44336;
+}
+
+html, body { height: 100%; }
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: #111;
+  color: #ddd;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+}
+
+#header {
+  flex: 0 0 auto;
+  padding: 0.25em 1em;
+  line-height: 2.2;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+  Each readout stays as a single non-breaking unit (the embedded &nbsp;
+  pairs already prevent breaks within a metric).  Allowing the header
+  itself to wrap lets a row of metrics flow onto a second line on
+  narrow viewports instead of being clipped by overflow:hidden.
+*/
+#header .metric { display: inline-block; }
+
+#m-health {
+  display: inline-block;
+  width: 0.7em;
+  height: 0.7em;
+  border-radius: 50%;
+  margin-right: 0.4em;
+  background: #555;
+  vertical-align: middle;
+  transition: background-color 0.3s;
+}
+/*
+  Five-tier health gumball, brightest = best:
+    lossless           → near-zero QP, full res/fps, no faults
+    visually-lossless  → low QP, full res/fps, no faults  (today's "green")
+    good               → no faults but quality not measured / not at top
+    yellow             → degraded
+    red                → broken
+*/
+#m-health.lossless          { background: var(--c-lossless); }
+#m-health.visually-lossless { background: var(--c-vlossless); }
+#m-health.good              { background: var(--c-good); }
+#m-health.yellow            { background: var(--c-yellow); }
+#m-health.red               { background: var(--c-red); }
+
+/* Per-metric value colour, applied via JS to the <span id="m-..."> nodes. */
+.q-lossless          { color: var(--c-lossless); }
+.q-visually-lossless { color: var(--c-vlossless); }
+.q-good              { color: var(--c-good); }
+.q-yellow            { color: var(--c-yellow); }
+.q-red               { color: var(--c-red); }
+
+#video-area {
+  flex: 1 1 0;
+  min-height: 0;
+  position: relative;
+  background: #000;
+}
+
+#status {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 0.75em 1.25em;
+  background: rgba(255,255,255,0.07);
+  border-radius: 6px;
+  max-width: min(480px, calc(100% - 2em));
+  text-align: center;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  z-index: 1;
+}
+
+#status.error { color: #f88; background: rgba(255,80,80,0.12); }
+#status.hidden { display: none; }
+
+video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}

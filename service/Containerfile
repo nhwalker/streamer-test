@@ -82,8 +82,8 @@ RUN curl -fsSL -o /tmp/mediamtx.tar.gz "${MEDIAMTX_URL}" \
     && /usr/local/bin/mediamtx --version
 
 # ── Web page ─────────────────────────────────────────────────────────────────
-# The WHEP client is inlined in index.html — no JS build step, no bundle.
-COPY web/index.html /var/www/html/index.html
+# Static page + stylesheet + WHEP client script — no JS build step, no bundle.
+COPY web/ /var/www/html/
 
 # ── Application scripts ───────────────────────────────────────────────────────
 COPY entrypoint.sh        /usr/local/bin/entrypoint.sh
@@ -91,16 +91,16 @@ COPY pipeline.py          /usr/local/bin/pipeline.py
 COPY stream_command.py    /usr/local/bin/stream_command.py
 COPY web_server.py        /usr/local/bin/web_server.py
 COPY archive_encoder.py   /usr/local/bin/archive_encoder.py
+COPY archive_export.py    /usr/local/bin/archive_export.py
 COPY archive_finalize.py  /usr/local/bin/archive_finalize.py
 COPY archive_purge.py     /usr/local/bin/archive_purge.py
 COPY archive_times.py     /usr/local/bin/archive_times.py
+COPY encoders.py          /usr/local/bin/encoders.py
 COPY video_transcode.py   /usr/local/bin/video_transcode.py
 COPY desktop_config.py    /usr/local/bin/desktop_config.py
+COPY x11.py               /usr/local/bin/x11.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
-             /usr/local/bin/stream_command.py /usr/local/bin/web_server.py \
-             /usr/local/bin/archive_encoder.py /usr/local/bin/archive_finalize.py \
-             /usr/local/bin/archive_purge.py /usr/local/bin/archive_times.py \
-             /usr/local/bin/video_transcode.py /usr/local/bin/desktop_config.py
+             /usr/local/bin/stream_command.py /usr/local/bin/web_server.py
 
 # ── Default archive volumes ───────────────────────────────────────────────────
 # /archive holds completed (timestamp-named) segments.
@@ -122,7 +122,6 @@ ENV DISPLAY=:0 \
     ARCHIVE_BITRATE=6000 \
     WEB_PORT=8080 \
     MEDIAMTX_RTSP_PORT=8554 \
-    WEBRTC_PORT=8889 \
     WEBRTC_UDP_PORT=8189 \
     WEBRTC_ADDITIONAL_HOSTS="" \
     LIVE_CQ=18 \
