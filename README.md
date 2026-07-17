@@ -366,6 +366,7 @@ fixed-CBR alternative and when to prefer it).
 | Variable | Default | Description |
 |---|---|---|
 | `WEB_PORT` | `8080` | HTTP page server |
+| `WEB_DIR` | `/var/www/html` | Static file root for the page server (set by the image; rarely changed) |
 | `WEBRTC_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
 | `WEBRTC_UDP_PORT` | `8189` | MediaMTX ICE/UDP media port (browser-facing) |
 | `MEDIAMTX_RTSP_PORT` | `8554` | Loopback-only RTSP ingest (ffmpeg → MediaMTX) |
@@ -383,6 +384,7 @@ fixed-CBR alternative and when to prefer it).
 | `ARCHIVE_BITRATE` | `6000` | kbps, `legacy` mode only |
 | `ARCHIVE_MAX_BYTES` / `ARCHIVE_MAX_AGE_DAYS` | `0` | Size/age-based purge; 0 = unlimited |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
+| `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output encode quality (QP); tracks the archive quality so there is no second knob to tune |
 | `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
 
 ### Deprecated (ignored with a warning)
