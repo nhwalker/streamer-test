@@ -396,6 +396,5 @@ variables that are now ignored with a warning.
 
 | Suite | What it covers |
 |---|---|
-| `tests/` unit tests | config/tier math, ffmpeg argv builders, MediaMTX config, finalizer CSV handling, archive staging/zip, `/video` timeline assembly |
-| `tests/` container tests (Docker + Selenium) | endpoint availability, WHEP reachability, real browser playback (red-frame check), per-screen crop correctness (two-tone Xvfb), metrics population, archive rotation |
-| `functional-tests/` (Java + Selenium) | end-to-end color-flip recording: live feed shows flips, `/archive` zip and `/video` render them, evidence capture via Allure |
+| `tests/` (pytest, pure Python) | unit tests only: config/tier math, env-var aliases, ffmpeg argv builders, MediaMTX config, finalizer CSV handling, archive staging/zip, `/video` timeline assembly. No containers, no browser — `make test` |
+| `functional-tests/` (Java + Selenium + testcontainers) | all container/browser integration coverage: endpoint availability, `/config.json` shape, WHEP reachability for every tier, junk-offer rejection, real browser playback, per-screen crop correctness (two-tone Xvfb), metrics population, end-to-end color-flip recording (live + `/archive` + `/video`), hub endpoints, evidence capture via Allure — `make functional` |

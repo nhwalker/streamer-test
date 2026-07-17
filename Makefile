@@ -1,7 +1,7 @@
 # service and hub build independently — no shared base image, no source
 # compilation (the GStreamer/Rust build stage was removed in the ffmpeg +
 # MediaMTX rewrite).
-.PHONY: all service hub clean lint test
+.PHONY: all service hub clean lint test functional
 
 SERVICE_TAG ?= desktop-stream-service:ci
 HUB_TAG     ?= desktop-stream-hub:ci
@@ -22,10 +22,11 @@ lint:
 	ruff check service/ tests/ hub/
 	mypy --ignore-missing-imports service/
 
-# Unit tests only. The container/browser integration tests live in
-# functional-tests/ (Java) and need a docker daemon; see that directory.
+# Unit tests (pure Python, no containers or browser).
 test:
-	python3 -m pytest tests/ \
-		--ignore=tests/test_archive.py \
-		--ignore=tests/test_container.py \
-		--ignore=tests/test_hub.py
+	python3 -m pytest tests/
+
+# Container/browser integration tests (Java). Needs a docker daemon, Xvfb,
+# x11-apps, and Chrome on the host; builds the images first.
+functional: service hub
+	cd functional-tests && SERVICE_IMAGE=$(SERVICE_TAG) HUB_IMAGE=$(HUB_TAG) ./gradlew test

@@ -150,24 +150,15 @@ jobs:
           path: ${{ matrix.tarball }}
           retention-days: 1
 
+  # Pure-Python unit tests — no containers, no browser, no TURN relay.
+  # All container/browser integration coverage lives in the Java
+  # functional-test job below.
   test:
     runs-on: ubuntu-latest
-    needs: [build, build-hub]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            xvfb \
-            google-chrome-stable \
-            x11-utils \
-            x11-apps \
-            imagemagick \
-            coturn
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -179,79 +170,13 @@ jobs:
       - name: Install Python test dependencies
         run: pip install -r tests/requirements.txt
 
-      - name: Download service image
-        uses: actions/download-artifact@v4
-        with:
-          name: service-image
-          path: /tmp/artifacts/service
-          merge-multiple: false
-
-      - name: Download hub image
-        uses: actions/download-artifact@v4
-        with:
-          name: hub-image
-          path: /tmp/artifacts/hub
-          merge-multiple: false
-
-      - name: Load images into Docker
-        run: |
-          SERVICE_LOADED=$(docker load -i /tmp/artifacts/service/desktop-stream-service.tar \
-                           | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${SERVICE_LOADED}" desktop-stream-service:ci
-
-          HUB_LOADED=$(docker load -i /tmp/artifacts/hub/desktop-stream-hub.tar \
-                       | grep "Loaded image:" | head -1 | awk '{print $NF}')
-          docker tag "${HUB_LOADED}" desktop-stream-hub:ci
-
-          docker images | grep -E '^(desktop-stream-service|desktop-stream-hub)\s+ci\s'
-
-      - name: Start local TURN relay
-        run: |
-          # Loopback TURN so WebRTC ICE relay candidates are 127.0.0.1
-          # (Azure VMs block same-IP UDP hairpin on the external interface).
-          turnserver \
-            --listening-port=3478 \
-            --listening-ip=127.0.0.1 \
-            --relay-ip=127.0.0.1 \
-            --lt-cred-mech \
-            --user=ci:ci \
-            --realm=test.local \
-            --no-tls \
-            --no-dtls \
-            --allow-loopback-peers \
-            --no-cli \
-            --verbose \
-            --log-file=/tmp/turnserver.log &
-          for i in $(seq 1 20); do
-            if ss -ulnp 2>/dev/null | grep -q ':3478 '; then
-              echo "TURN server ready on UDP 3478"; break
-            fi
-            sleep 0.5
-          done
-
-      - name: Run integration tests
-        env:
-          # conftest.py reads these to pick which images to run against.
-          SERVICE_IMAGE: "desktop-stream-service:ci"
-          HUB_IMAGE:     "desktop-stream-hub:ci"
-          # Browser side: index.html reads these from URL params.  (The
-          # server side needs no relay — MediaMTX advertises loopback via
-          # WEBRTC_ADDITIONAL_HOSTS in conftest.py.)
-          WEBRTC_TURN_SERVER: "turn:127.0.0.1:3478"
-          WEBRTC_TURN_USER: "ci"
-          WEBRTC_TURN_CRED: "ci"
+      - name: Run unit tests
         run: pytest tests/ -v --tb=short
-
-      - name: Show TURN server log
-        if: always()
-        run: |
-          echo "=== coturn log ==="
-          cat /tmp/turnserver.log 2>/dev/null || echo "(no log file)"
 
   functional-test:
     name: Java functional tests
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build, build-hub]
 
     steps:
       - name: Checkout
@@ -280,13 +205,23 @@ jobs:
           name: service-image
           path: /tmp/artifacts/service
 
-      - name: Load image into Docker
+      - name: Download hub image
+        uses: actions/download-artifact@v4
+        with:
+          name: hub-image
+          path: /tmp/artifacts/hub
+
+      - name: Load images into Docker
         run: |
           SERVICE_LOADED=$(docker load -i /tmp/artifacts/service/desktop-stream-service.tar \
                            | grep "Loaded image:" | head -1 | awk '{print $NF}')
           docker tag "${SERVICE_LOADED}" desktop-stream-service:ci
 
-          docker images | grep -E '^desktop-stream-service\s+ci\s'
+          HUB_LOADED=$(docker load -i /tmp/artifacts/hub/desktop-stream-hub.tar \
+                       | grep "Loaded image:" | head -1 | awk '{print $NF}')
+          docker tag "${HUB_LOADED}" desktop-stream-hub:ci
+
+          docker images | grep -E '^(desktop-stream-service|desktop-stream-hub)\s+ci\s'
 
       - name: Start local TURN relay
         run: |
@@ -314,6 +249,7 @@ jobs:
         working-directory: functional-tests
         env:
           SERVICE_IMAGE:          "desktop-stream-service:ci"
+          HUB_IMAGE:              "desktop-stream-hub:ci"
           GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
         run: ./gradlew test
 

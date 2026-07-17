@@ -12,6 +12,8 @@ import java.nio.file.*;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -91,7 +93,7 @@ public final class ServiceStack {
     private final Process              xvfbProcess;
     private final GenericContainer<?>  service;
     private final Path                 archiveDir;
-    private volatile Process           colorWindow;
+    private final List<Process>        colorWindows = new CopyOnWriteArrayList<>();
     private final AtomicBoolean        stopped = new AtomicBoolean(false);
 
     // ── Construction / start ─────────────────────────────────────────────────
@@ -221,10 +223,27 @@ public final class ServiceStack {
      */
     public void setDesktopColor(String hexColor) throws IOException {
         stopColorWindow();
-        colorWindow = new ProcessBuilder(
+        colorWindows.add(launchColorWindow("1280x720+0+0", hexColor));
+    }
+
+    /**
+     * Paints the top and bottom halves of the Xvfb display in two different
+     * colors — one full-width window per half.  Used by the split-crop tests
+     * to prove /top and /bottom really serve their own half of the frame
+     * (a missing or wrong crop y-offset would deliver the other color).
+     */
+    public void setDesktopTwoTone(String topHex, String bottomHex) throws IOException {
+        stopColorWindow();
+        colorWindows.add(launchColorWindow("1280x360+0+0",   topHex));
+        colorWindows.add(launchColorWindow("1280x360+0+360", bottomHex));
+    }
+
+    private static Process launchColorWindow(String geometry, String hexColor)
+            throws IOException {
+        return new ProcessBuilder(
                 "xlogo",
                 "-display", ":99",
-                "-geometry", "1280x720+0+0",
+                "-geometry", geometry,
                 "-bg", hexColor,
                 "-fg", hexColor,
                 "-bw", "0")
@@ -233,11 +252,12 @@ public final class ServiceStack {
                 .start();
     }
 
-    /** Terminates the color window launched by {@link #setDesktopColor}, if any. */
+    /** Terminates any color windows launched by {@link #setDesktopColor} /
+     *  {@link #setDesktopTwoTone}. */
     public void stopColorWindow() {
-        Process p = colorWindow;
-        colorWindow = null;
-        if (p != null) {
+        List<Process> procs = List.copyOf(colorWindows);
+        colorWindows.clear();
+        for (Process p : procs) {
             p.destroy();
             try {
                 if (!p.waitFor(2, TimeUnit.SECONDS)) p.destroyForcibly();

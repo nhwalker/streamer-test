@@ -447,8 +447,9 @@ curl -i -X OPTIONS http://localhost:8889/full_t0/whep   # expect 2xx
 ls /srv/archive          # timestamped *_to_*.mp4 after the first rotation
 ```
 
-**5 — Automated suites:** `pytest tests/` (unit + container integration)
-and `./gradlew test` in `functional-tests/` (browser-driven color/archive
+**5 — Automated suites:** `make test` (pure-Python unit tests) and
+`make functional` (browser-driven container integration in
+`functional-tests/`, including color/archive
 verification) — both run in CI on every push.
 
 ---
