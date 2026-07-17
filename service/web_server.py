@@ -181,35 +181,44 @@ class Router(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        try:
-            self._transcode_video(start_ts, end_ts)
-        finally:
-            _video_slots.release()
-
-    def _transcode_video(self, start_ts, end_ts):
-        stage_tmp  = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
+        # The slot covers only the expensive part (staging + ffmpeg
+        # encode).  Streaming the finished file to the client is I/O-bound
+        # and must not count against the CPU budget — a slow download
+        # would otherwise hold a transcode slot for its whole duration.
+        stage_tmp  = None
         output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
+        output_path = os.path.join(output_tmp.name, 'video.mp4')
         try:
-            output_path = os.path.join(output_tmp.name, 'video.mp4')
-            transcode_to_video(
-                stage_tmp.name, start_ts, end_ts,
-                VIDEO_FILL_COLOR, output_path,
-                default_width=VIDEO_DEFAULT_WIDTH,
-                default_height=VIDEO_DEFAULT_HEIGHT,
-            )
-            video_size = os.path.getsize(output_path)
-            self.send_response(200)
-            self.send_header('Content-Type', 'video/mp4')
-            self.send_header('Content-Disposition', 'attachment; filename="video.mp4"')
-            self.send_header('Content-Length', str(video_size))
-            self.end_headers()
-            with open(output_path, 'rb') as fh:
-                shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
-        except Exception as exc:
-            print(f'[video] transcode error: {exc}', flush=True)
-            self.send_error(500, 'Internal server error')
+            try:
+                stage_tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR,
+                                           start_ts, end_ts)
+                transcode_to_video(
+                    stage_tmp.name, start_ts, end_ts,
+                    VIDEO_FILL_COLOR, output_path,
+                    default_width=VIDEO_DEFAULT_WIDTH,
+                    default_height=VIDEO_DEFAULT_HEIGHT,
+                )
+            except Exception as exc:
+                print(f'[video] transcode error: {exc}', flush=True)
+                self.send_error(500, 'Internal server error')
+                return
+            finally:
+                _video_slots.release()
+
+            try:
+                video_size = os.path.getsize(output_path)
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Content-Disposition', 'attachment; filename="video.mp4"')
+                self.send_header('Content-Length', str(video_size))
+                self.end_headers()
+                with open(output_path, 'rb') as fh:
+                    shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client went away mid-download; nothing to salvage
         finally:
-            stage_tmp.cleanup()
+            if stage_tmp is not None:
+                stage_tmp.cleanup()
             output_tmp.cleanup()
 
     def log_message(self, fmt, *args):
