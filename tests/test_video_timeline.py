@@ -23,7 +23,7 @@ import time
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from video_transcode import _build_timeline, TimelineItem  # noqa: E402
+from video_transcode import _build_timeline  # noqa: E402
 
 SEGMENT_SEC = 600
 

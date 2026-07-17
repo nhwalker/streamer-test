@@ -19,7 +19,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from conftest import (
     CROP_HEIGHT, STREAM_WIDTH,
-    WEBRTC_PORT, TWO_TONE_WEBRTC_PORT,
+    WEBRTC_PORT,
 )
 
 

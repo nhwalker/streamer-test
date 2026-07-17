@@ -6,7 +6,6 @@ import datetime
 import os
 import sys
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
 from archive_times import format_timestamp, parse_segment_times, renamed_segment_path  # noqa: E402
@@ -129,7 +128,7 @@ class TestParseSegmentTimes:
         assert times is not None
 
     def test_start_before_end(self):
-        name = f'stream_20240115-100000.000_to_20240115-101000.000.mkv'
+        name = 'stream_20240115-100000.000_to_20240115-101000.000.mkv'
         start, end = parse_segment_times(name)
         assert start < end
 

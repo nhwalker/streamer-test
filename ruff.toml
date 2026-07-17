@@ -1,0 +1,10 @@
+# Lint-only configuration. The ruff *formatter* is deliberately not used:
+# the codebase uses hand-aligned assignment/dict tables in several modules
+# and reformatting them would destroy intentional readability. Run
+# `make lint` (ruff check) locally; CI enforces the same.
+target-version = "py311"
+
+[lint]
+# Default rule set (E4/E7/E9 pycodestyle errors + pyflakes F) — correctness
+# focused, no style churn.
+select = ["E4", "E7", "E9", "F"]

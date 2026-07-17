@@ -1,5 +1,5 @@
-pytest>=8.0
-testcontainers>=4.8
-selenium>=4.20
-webdriver-manager>=4.0
-requests>=2.31
+pytest==9.1.1
+testcontainers==4.14.2
+selenium==4.46.0
+webdriver-manager==4.1.2
+requests==2.33.1

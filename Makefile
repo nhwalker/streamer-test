@@ -1,7 +1,7 @@
 # service and hub build independently — no shared base image, no source
 # compilation (the GStreamer/Rust build stage was removed in the ffmpeg +
 # MediaMTX rewrite).
-.PHONY: all service hub clean
+.PHONY: all service hub clean lint test
 
 SERVICE_TAG ?= desktop-stream-service:ci
 HUB_TAG     ?= desktop-stream-hub:ci
@@ -17,3 +17,15 @@ hub:
 
 clean:
 	podman rmi -f $(SERVICE_TAG) $(HUB_TAG) 2>/dev/null || true
+
+lint:
+	ruff check service/ tests/ hub/
+	mypy --ignore-missing-imports service/
+
+# Unit tests only. The container/browser integration tests live in
+# functional-tests/ (Java) and need a docker daemon; see that directory.
+test:
+	python3 -m pytest tests/ \
+		--ignore=tests/test_archive.py \
+		--ignore=tests/test_container.py \
+		--ignore=tests/test_hub.py
