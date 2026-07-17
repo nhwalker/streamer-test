@@ -214,7 +214,7 @@ def test_mediamtx_config_enumerates_exactly_the_tier_paths():
 
 
 def test_mediamtx_config_port_and_hosts_overrides():
-    cfg, env = _cfg(WEBRTC_PORT='9889', WEBRTC_UDP_PORT='9189',
+    cfg, env = _cfg(WHEP_PORT='9889', WEBRTC_UDP_PORT='9189',
                     WEBRTC_ADDITIONAL_HOSTS='10.1.2.3, stream.example')
     yml = build_mediamtx_config(cfg, env)
     assert 'webrtcAddress: :9889' in yml

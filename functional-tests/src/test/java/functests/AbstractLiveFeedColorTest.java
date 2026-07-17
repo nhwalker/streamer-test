@@ -632,10 +632,10 @@ abstract class AbstractLiveFeedColorTest implements RecordedBrowserTest {
 
     /** Converts a turn:// URL (CI relay) to browser query params, or returns "". */
     static String buildTurnParams() {
-        String gstTurn = System.getProperty("GST_WEBRTC_TURN_SERVER", "");
-        if (gstTurn.isEmpty()) return "";
+        String turn = System.getProperty("WEBRTC_TURN_SERVER", "");
+        if (turn.isEmpty()) return "";
         try {
-            URI uri = URI.create(gstTurn.replace("turn://", "http://"));
+            URI uri = URI.create(turn.replace("turn://", "http://"));
             String userInfo = uri.getUserInfo();
             int sep = userInfo.indexOf(':');
             String user = userInfo.substring(0, sep);

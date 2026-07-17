@@ -41,7 +41,6 @@ Environment variables consumed here (all optional):
                   keyframe — the GOP length IS the worst-case join time.
   MEDIAMTX_RTSP_PORT       localhost RTSP ingest port            (8554)
   WHEP_PORT                MediaMTX WHEP/HTTP port               (8889)
-                           (deprecated alias: WEBRTC_PORT)
   WEBRTC_UDP_PORT          MediaMTX ICE/UDP media port           (8189)
   WEBRTC_ADDITIONAL_HOSTS  comma-separated extra IPs/hostnames to
                            advertise in ICE candidates (for viewers that
@@ -293,10 +292,8 @@ def build_mediamtx_config(config, env):
     API are disabled.  Paths are enumerated explicitly so unknown publish
     or read attempts are rejected.
     """
-    from desktop_config import resolve_env_alias
-
     rtsp_port  = int(env.get('MEDIAMTX_RTSP_PORT', str(DEFAULT_RTSP_PORT)))
-    webrtc     = int(resolve_env_alias(env, 'WHEP_PORT') or DEFAULT_WHEP_PORT)
+    webrtc     = int(env.get('WHEP_PORT') or DEFAULT_WHEP_PORT)
     webrtc_udp = int(env.get('WEBRTC_UDP_PORT', str(DEFAULT_WEBRTC_UDP)))
     extra_hosts = [
         h.strip() for h in (env.get('WEBRTC_ADDITIONAL_HOSTS') or '').split(',')
