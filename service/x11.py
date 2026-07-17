@@ -15,7 +15,7 @@ import sys
 def _open_xdisplay(display_name):
     """Return an open Xlib.display.Display, or None if Xlib/X server unavailable."""
     try:
-        from Xlib import display as xdisplay  # noqa: WPS433 - lazy import is intentional
+        from Xlib import display as xdisplay  # lazy import is intentional
     except ImportError as exc:
         print(f'[desktop_config] WARNING: python-xlib unavailable ({exc}); '
               'cannot auto-detect screen geometry.', file=sys.stderr)

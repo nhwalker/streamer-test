@@ -8,13 +8,10 @@ mock subprocess.run so we can exercise every branch without ffmpeg present.
 The expectation: every preferred branch is quality-targeted (CRF / NVENC
 constqp), so a near-lossless archive isn't quietly downgraded on download.
 """
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-import video_transcode  # noqa: E402
+import video_transcode
 
 
 def _stub_encoders_listing(monkeypatch, encoders_text, nvenc_works=False):

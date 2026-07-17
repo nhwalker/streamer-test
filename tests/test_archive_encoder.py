@@ -6,13 +6,10 @@ ffmpeg argv fragments pipeline.py appends to the archive output for each
 quality mode — they fail when someone changes a mode's intent (e.g. drops
 the lossless tune or the constant-QP rate control).
 """
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from archive_encoder import archive_encoder_args, VALID_ARCHIVE_QUALITIES  # noqa: E402
+from archive_encoder import archive_encoder_args, VALID_ARCHIVE_QUALITIES
 
 
 def _opt(args, name):

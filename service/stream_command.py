@@ -201,7 +201,8 @@ def build_filter_complex(config):
             )
             pre = ''  # crop already applied before the split
             chains = [(o, t, lbl, '')
-                      for o, t, lbl in zip(split_outs, tiers, tier_labels)]
+                      for o, t, lbl in zip(split_outs, tiers, tier_labels,
+                                           strict=True)]
 
         for src_lbl, tier, out_lbl, chain_pre in chains:
             base_w = crop[0] if crop else width

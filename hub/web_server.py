@@ -10,7 +10,7 @@ Environment variables:
   WEB_DIR   Static file root   (default: /etc/hub/web)
 """
 import os
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 WEB_DIR = os.environ.get('WEB_DIR', '/etc/hub/web')
 
@@ -30,4 +30,4 @@ class Router(SimpleHTTPRequestHandler):
 
 if __name__ == '__main__':
     port = int(os.environ.get('WEB_PORT', '8080'))
-    HTTPServer(('', port), Router).serve_forever()
+    ThreadingHTTPServer(('', port), Router).serve_forever()

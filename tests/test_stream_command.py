@@ -2,14 +2,11 @@
 Unit tests for stream_command.py — the pure ffmpeg-argv / MediaMTX-config
 builders.  No ffmpeg, Docker, or X server required.
 """
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from desktop_config import compute_config  # noqa: E402
-from stream_command import (  # noqa: E402
+from desktop_config import compute_config
+from stream_command import (
     build_ffmpeg_command,
     build_filter_complex,
     build_mediamtx_config,

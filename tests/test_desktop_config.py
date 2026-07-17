@@ -1,16 +1,13 @@
 """
 Unit tests for desktop_config.compute_config().
 
-xrandr is invoked through subprocess so we monkey-patch the helpers that
-wrap it.  No Docker / GStreamer / X server required.
+The X probes (x11.py, python-xlib) are monkey-patched, so no X server —
+and no Docker — is required.
 """
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-import desktop_config  # noqa: E402
+import desktop_config
 
 
 @pytest.fixture(autouse=True)
@@ -31,13 +28,10 @@ def test_explicit_desktop_splits_horizontal_pair():
     names = [s['name'] for s in cfg['screens']]
     assert names == ['left', 'right']
     left, right = cfg['screens']
-    assert left['x'] == 0
-    assert right['x'] == 1920
-    # Explicit DESKTOP_SPLITS: trims computed from configured frame dims.
-    assert (left['cropLeft'], left['cropTop'], left['cropRight'], left['cropBottom']) \
-        == (0, 0, 1920, 0)
-    assert (right['cropLeft'], right['cropTop'], right['cropRight'], right['cropBottom']) \
-        == (1920, 0, 0, 0)
+    assert (left['x'], left['y'], left['width'], left['height']) \
+        == (0, 0, 1920, 1080)
+    assert (right['x'], right['y'], right['width'], right['height']) \
+        == (1920, 0, 1920, 1080)
 
 
 def test_explicit_desktop_splits_three_screens_use_screen_n():
@@ -93,7 +87,6 @@ def test_falls_back_to_full_frame_when_x_quiet():
     assert [s['name'] for s in cfg['screens']] == ['screen1']
     s = cfg['screens'][0]
     assert (s['x'], s['y'], s['width'], s['height']) == (0, 0, 1280, 720)
-    assert (s['cropLeft'], s['cropTop'], s['cropRight'], s['cropBottom']) == (0, 0, 0, 0)
 
 
 def test_whep_paths_use_stream_key_and_tier_index():
@@ -116,6 +109,16 @@ def test_whep_port_default_and_override():
         'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
         'WHEP_PORT': '9889',
     })['webrtcPort'] == 9889
+
+
+def test_out_of_frame_region_warns(capsys):
+    # Regions are used verbatim by the ffmpeg crop, so one that exceeds the
+    # capture frame is a misconfiguration — flagged loudly, not clamped.
+    desktop_config.compute_config({
+        'STREAM_WIDTH': '1920', 'STREAM_HEIGHT': '1080',
+        'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
+    })
+    assert 'does not fit the 1920x1080 capture frame' in capsys.readouterr().err
 
 
 def test_invalid_desktop_splits_raises():

@@ -83,7 +83,6 @@ _SCALE_EPS          = 1e-6
 _DEFAULT_WHEP_PORT = 8889
 
 
-
 def _parse_scale_ladder(env):
     """Parse the comma-separated LIVE_SCALE_LADDER env var.
 
@@ -203,33 +202,37 @@ def _name_regions(regions):
     return [(r, f'screen{i + 1}') for i, r in enumerate(ordered)]
 
 
-def _crops_from_region(region, frame_w, frame_h):
-    """Compute crop edge trims that select *region* out of frame_w x frame_h."""
-    return {
-        'left':   max(0, region['x']),
-        'top':    max(0, region['y']),
-        'right':  max(0, frame_w - region['x'] - region['width']),
-        'bottom': max(0, frame_h - region['y'] - region['height']),
-    }
+def _regions_from_env(env, frame_w, frame_h, display):
+    """Return the screen-split regions for this deployment.
 
-
-def _splits_from_env(env, frame_w, frame_h, display):
-    """Return list of {'region': ..., 'crop': ...} dicts for the configured splits."""
+    DESKTOP_SPLITS wins when set; otherwise RandR monitor auto-detection;
+    otherwise one full-frame region.  Regions that do not fit inside the
+    configured frame are warned about, not clamped: the ffmpeg crop runs in
+    the frame's coordinate space, so an out-of-bounds region (typically
+    STREAM_WIDTH/HEIGHT set below native while splits are auto-detected in
+    native pixels) will fail loudly at pipeline start.
+    """
     raw = (env.get('DESKTOP_SPLITS') or '').strip()
     if raw:
         regions = [_parse_region(s) for s in raw.split(';') if s.strip()]
-        return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
-                for r in regions]
+    else:
+        regions = _query_x_monitors(display)
+    if not regions:
+        print('[desktop_config] WARNING: no monitor geometry available; '
+              'falling back to a single full-frame screen.', file=sys.stderr)
+        return [{'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}]
 
-    regions = _query_x_monitors(display)
-    if regions:
-        return [{'region': r, 'crop': _crops_from_region(r, frame_w, frame_h)}
-                for r in regions]
-
-    print('[desktop_config] WARNING: no monitor geometry available; '
-          'falling back to a single full-frame screen.', file=sys.stderr)
-    full = {'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}
-    return [{'region': full, 'crop': {'left': 0, 'top': 0, 'right': 0, 'bottom': 0}}]
+    for r in regions:
+        if (r['x'] < 0 or r['y'] < 0
+                or r['x'] + r['width'] > frame_w
+                or r['y'] + r['height'] > frame_h):
+            print(f'[desktop_config] WARNING: region '
+                  f"{r['width']}x{r['height']}+{r['x']}+{r['y']} does not "
+                  f'fit the {frame_w}x{frame_h} capture frame; its ffmpeg '
+                  'crop will fail. Set DESKTOP_SPLITS in frame coordinates '
+                  'or leave STREAM_WIDTH/HEIGHT at native size.',
+                  file=sys.stderr)
+    return regions
 
 
 def compute_config(env=None):
@@ -260,12 +263,8 @@ def compute_config(env=None):
     framerate   = int((env.get('STREAM_FRAMERATE')   or  '30').strip())
     scales      = _parse_scale_ladder(env)
 
-    splits = _splits_from_env(env, width, height, display)
-    named = _name_regions([s['region'] for s in splits])
-
-    # Pair each named region back with its crop info.  _name_regions may
-    # reorder the regions, so look them up by identity from the original list.
-    region_to_crop = {id(s['region']): s['crop'] for s in splits}
+    regions = _regions_from_env(env, width, height, display)
+    named = _name_regions(regions)
 
     def _tier_list_with_paths(tiers, stream_key):
         # whepPath is the single stream identifier shared by the ffmpeg
@@ -287,7 +286,6 @@ def compute_config(env=None):
 
     screens = []
     for region, name in named:
-        crop = region_to_crop[id(region)]
         screen_tiers = _tier_list_with_paths(
             _compute_tiers(region['width'], region['height'], scales),
             name,
@@ -299,10 +297,6 @@ def compute_config(env=None):
             'y':               region['y'],
             'width':           region['width'],
             'height':          region['height'],
-            'cropLeft':        crop['left'],
-            'cropTop':         crop['top'],
-            'cropRight':       crop['right'],
-            'cropBottom':      crop['bottom'],
             'tiers':           screen_tiers,
         })
 

@@ -5,12 +5,10 @@ No Docker containers or GStreamer required — these manipulate real files in
 a temporary directory and verify deletion behaviour directly.
 """
 import os
-import sys
 import time
 
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from archive_purge import purge_archive  # noqa: E402
+from archive_purge import purge_archive
 
 
 def _make_segment(directory, index, size=1024, age_seconds=0):

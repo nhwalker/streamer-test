@@ -17,13 +17,11 @@ Each item has:
   output_start_s – seconds from the start of the output where this clip begins
 """
 import os
-import sys
 import time
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from video_transcode import _build_timeline  # noqa: E402
+from video_transcode import _build_timeline
 
 SEGMENT_SEC = 600
 

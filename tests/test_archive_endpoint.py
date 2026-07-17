@@ -1,29 +1,25 @@
 """
-Unit tests for parse_timestamp(), stage_segments(), and zip_segments()
-in web_server.py.
+Unit tests for the /archive//video building blocks: parse_duration and
+parse_timestamp (archive_times.py), stage_segments and zip_segments
+(archive_export.py).
 
-No Docker, GStreamer, or live HTTP server required.
-
-The active-segment branch of stage_segments streams the live fragmented-
-MP4 into the stage dir via os.sendfile.  These tests inject a fake copy
-callable so they remain self-contained — they don't depend on the
-sendfile syscall succeeding on whatever odd fds the test fixtures use.
+No Docker or live HTTP server required.  The active-segment branch of
+stage_segments byte-copies the live fragmented MP4 into the stage dir;
+these tests inject a fake copy callable so they stay self-contained.
 """
 import datetime
 import os
-import sys
 import time
 import zipfile
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from archive_export import (  # noqa: E402
+from archive_export import (
     _copy_active_to_stage,
     stage_segments,
     zip_segments,
 )
-from archive_times import parse_duration, parse_timestamp  # noqa: E402
+from archive_times import parse_duration, parse_timestamp
 
 # Reference UTC epoch for 2024-01-15 10:30:00 UTC
 _REF_DT  = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
