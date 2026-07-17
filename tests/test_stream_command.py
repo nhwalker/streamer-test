@@ -155,9 +155,13 @@ def test_command_archive_writes_readable_fragmented_mp4():
     cfg, env = _cfg()
     cmd = _cmd(cfg, env, archive_args=['-c:v', 'h264_nvenc', '-qp', '18'])
     s = ' '.join(cmd)
-    # In-progress readability depends on empty_moov (moov atom up front);
-    # frag_keyframe keeps one fragment per GOP.
-    assert 'movflags=+frag_keyframe+empty_moov+default_base_moof' in s
+    # In-progress readability needs BOTH empty_moov (moov atom up front)
+    # AND per-packet flushing — without flush_packets the muxer's 256 KB
+    # AVIO buffer keeps the on-disk active file at a bare `ftyp` for most
+    # of a low-bitrate segment's lifetime.  frag_keyframe keeps one
+    # fragment per GOP.
+    assert ('movflags=+frag_keyframe+empty_moov+default_base_moof'
+            ':flush_packets=1') in s
     assert '-segment_time 600' in s
     assert '-segment_list /live/segments.csv' in s
     assert cmd[-1] == '/live/stream-%05d.mp4'

@@ -167,7 +167,7 @@ The archive:
 -map [v_arch] <encoder args>
 -f segment -segment_time $ARCHIVE_SEGMENT_SEC -reset_timestamps 1
 -segment_format mp4
--segment_format_options movflags=+frag_keyframe+empty_moov+default_base_moof
+-segment_format_options movflags=+frag_keyframe+empty_moov+default_base_moof:flush_packets=1
 -segment_list $ARCHIVE_LIVE_DIR/segments.csv -segment_list_type csv
 -segment_start_number <first free number>
 $ARCHIVE_LIVE_DIR/<prefix>-%05d.mp4
@@ -183,6 +183,14 @@ The `movflags` triple is what makes the archive simple:
 - `frag_keyframe` closes one fragment per keyframe → 1-second fragments.
 - `default_base_moof` keeps the fragments standards-conformant for
   browsers' MSE parsers.
+- `flush_packets=1` forces the bytes onto disk as they are produced.
+  Without it, the muxer's 256 KB AVIO buffer keeps the on-disk active
+  file at a bare `ftyp` for most of a low-bitrate segment's lifetime
+  (a static desktop encodes at a few KB/s).  It must live inside
+  `segment_format_options`: the segment muxer opens its own files, so a
+  top-level `-flush_packets` never reaches them.  As a second line of
+  defence, the active-segment copy in `web_server.py` verifies a
+  complete moov before staging and skips the file otherwise.
 
 ### Process supervision and back pressure
 

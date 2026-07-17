@@ -18,7 +18,13 @@ import zipfile
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from web_server import parse_duration, parse_timestamp, stage_segments, zip_segments  # noqa: E402
+from web_server import (  # noqa: E402
+    _copy_active_to_stage,
+    parse_duration,
+    parse_timestamp,
+    stage_segments,
+    zip_segments,
+)
 
 # Reference UTC epoch for 2024-01-15 10:30:00 UTC
 _REF_DT  = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
@@ -363,6 +369,64 @@ class TestStageSegmentsRenamed:
         with stage_segments(archive, live, now - 1300, now + 1,
                             _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 2
+
+
+# ── _copy_active_to_stage (real copy implementation) ─────────────────────────
+
+def _box(typ, body=b''):
+    """Minimal ISO-BMFF box: 4-byte size + 4-byte type + body."""
+    return (8 + len(body)).to_bytes(4, 'big') + typ + body
+
+
+class TestCopyActiveToStage:
+    """The real byte-copy gate: only files with a complete moov are staged.
+
+    The archive's ffmpeg output writes ftyp+moov the moment a segment
+    opens (empty_moov + flush_packets), but right at rotation — or if a
+    build ever loses the flush option — the on-disk file can be a bare
+    ftyp, which would make downstream ffmpeg fail with "moov atom not
+    found".  Those files must be rejected with OSError so the caller
+    skips the active segment instead of failing the whole request.
+    """
+
+    def _run_copy(self, tmp_path, content):
+        src = tmp_path / 'active.mp4'
+        src.write_bytes(content)
+        dst = str(tmp_path / 'staged.mp4')
+        fd = os.open(str(src), os.O_RDONLY)
+        try:
+            _copy_active_to_stage(fd, dst)
+        finally:
+            os.close(fd)
+        return dst
+
+    def test_full_fmp4_prefix_is_copied_verbatim(self, tmp_path):
+        content = (_box(b'ftyp', b'iso5' * 4) + _box(b'moov', b'\x00' * 700)
+                   + _box(b'moof', b'\x00' * 64) + _box(b'mdat', b'\x01' * 900))
+        dst = self._run_copy(tmp_path, content)
+        with open(dst, 'rb') as fh:
+            assert fh.read() == content
+
+    def test_truncated_trailing_fragment_still_copied(self, tmp_path):
+        # A partial trailing box (mid-write) is fine — players ignore it.
+        content = (_box(b'ftyp') + _box(b'moov', b'\x00' * 700)
+                   + _box(b'mdat', b'\x01' * 900)[:400])
+        dst = self._run_copy(tmp_path, content)
+        assert os.path.getsize(dst) == len(content)
+
+    def test_ftyp_only_file_rejected(self, tmp_path):
+        with pytest.raises(OSError, match='moov'):
+            self._run_copy(tmp_path, _box(b'ftyp', b'iso5' * 4))
+
+    def test_empty_file_rejected(self, tmp_path):
+        with pytest.raises(OSError):
+            self._run_copy(tmp_path, b'')
+
+    def test_incomplete_moov_rejected(self, tmp_path):
+        # moov header present but its body extends past EOF (mid-flush).
+        content = _box(b'ftyp') + _box(b'moov', b'\x00' * 700)[:100]
+        with pytest.raises(OSError, match='moov'):
+            self._run_copy(tmp_path, content)
 
 
 # ── zip_segments ──────────────────────────────────────────────────────────────

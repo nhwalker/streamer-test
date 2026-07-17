@@ -114,34 +114,65 @@ def parse_timestamp(s):
     return dt.timestamp()
 
 
+def _has_complete_moov(head):
+    """True when a complete top-level moov box lies within `head`.
+
+    The archive writes moov immediately after ftyp (movflags empty_moov),
+    so scanning the first few KB is sufficient.  Walks top-level box
+    headers (4-byte big-endian size + 4-byte type).
+    """
+    off = 0
+    while off + 8 <= len(head):
+        size = int.from_bytes(head[off:off + 4], 'big')
+        if size < 8:
+            return False
+        if head[off + 4:off + 8] == b'moov':
+            return off + size <= len(head)
+        off += size
+    return False
+
+
 def _copy_active_to_stage(src_fd, dst):
     """Byte-copy the in-progress archive segment to dst.
 
     The live segment is fragmented MP4 written with
-    `movflags=+frag_keyframe+empty_moov` — the moov atom sits at the
-    front of the file from the first write, so the in-progress file is
-    directly parseable by browsers/ffprobe.  A trailing fragment that is
-    truncated mid-write is simply ignored by players, so a plain copy of
-    whatever bytes exist right now is a valid, playable MP4.
+    `movflags=+frag_keyframe+empty_moov` and per-packet flushing — the
+    moov atom sits at the front of the on-disk file from the moment the
+    segment opens, so the in-progress file is directly parseable by
+    browsers/ffprobe.  A trailing fragment that is truncated mid-write is
+    simply ignored by players, so a plain copy of whatever bytes exist
+    right now is a valid, playable MP4.
+
+    The moov check guards the race right at segment rotation (and any
+    residual write buffering): a copy without a complete moov would make
+    downstream ffmpeg fail with "moov atom not found", so such a file is
+    rejected here and the caller skips the active segment instead of
+    failing the whole request.
 
     Reading via the supplied fd rather than the path means our
     descriptor pins the inode: even if the finalizer renames the file
     away from live_dir mid-read, we keep reading the same bytes we
     opened.  The caller owns src_fd; we do not close it.
 
-    Raises OSError when the file has no content yet (caller skips it).
+    Raises OSError when the file carries no parseable video yet.
     """
     os.lseek(src_fd, 0, os.SEEK_SET)
-    total = 0
+    head = b''
+    while len(head) < 64 * 1024:
+        chunk = os.read(src_fd, 64 * 1024 - len(head))
+        if not chunk:
+            break
+        head += chunk
+    if not _has_complete_moov(head):
+        raise OSError('active segment has no moov yet '
+                      '(segment just rotated or nothing flushed)')
     with open(dst, 'wb') as out:
+        out.write(head)
         while True:
             chunk = os.read(src_fd, 1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
-            total += len(chunk)
-    if total == 0:
-        raise OSError('active segment is empty')
 
 
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,

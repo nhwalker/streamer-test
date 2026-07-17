@@ -51,9 +51,11 @@ PIPPID=""
 trap 'echo "[service] Shutting down..."; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; kill "${MTXPID}" 2>/dev/null; exit' \
      EXIT INT TERM
 
-# Readiness probe -- wait up to 5 s for the RTSP listener.
+# Readiness probe -- wait up to 30 s for the RTSP listener.  MediaMTX
+# itself starts in milliseconds; the generous budget covers CPU-starved
+# hosts (e.g. CI runners already saturated by another encoder stack).
 READY=0
-for i in $(seq 1 50); do
+for i in $(seq 1 300); do
     if nc -z 127.0.0.1 "${MEDIAMTX_RTSP_PORT}" 2>/dev/null; then
         READY=1
         break
@@ -61,7 +63,7 @@ for i in $(seq 1 50); do
     sleep 0.1
 done
 if [ "${READY}" -eq 0 ]; then
-    echo "[service] ERROR: MediaMTX did not become ready within 5 s."
+    echo "[service] ERROR: MediaMTX did not become ready within 30 s."
     exit 1
 fi
 echo "[service] MediaMTX ready."

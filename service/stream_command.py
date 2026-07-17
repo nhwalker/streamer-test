@@ -257,6 +257,15 @@ def build_ffmpeg_command(config, env, use_nvenc, archive_args,
     # fragment per keyframe) so the in-progress file is parseable
     # mid-write; sequential names in the live dir, rotation recorded in
     # the CSV segment list consumed by archive_finalize.py.
+    #
+    # flush_packets=1 is load-bearing: without it the muxer's 256 KB AVIO
+    # buffer means the on-disk active file is just a bare `ftyp` until
+    # a quarter-megabyte accumulates — at static-desktop bitrates that is
+    # most of a segment's lifetime, and /archive's active-segment serve
+    # would find no moov.  With it, ftyp+moov hit the disk when the
+    # segment opens and every fragment lands as it completes.  It must
+    # live INSIDE segment_format_options: the segment muxer opens its own
+    # files, so a top-level -flush_packets never reaches them.
     cmd += ['-map', '[v_arch]']
     cmd += list(archive_args)
     cmd += [
@@ -265,7 +274,8 @@ def build_ffmpeg_command(config, env, use_nvenc, archive_args,
         '-reset_timestamps', '1',
         '-segment_format', 'mp4',
         '-segment_format_options',
-        'movflags=+frag_keyframe+empty_moov+default_base_moof',
+        'movflags=+frag_keyframe+empty_moov+default_base_moof'
+        ':flush_packets=1',
         '-segment_list', segment_list_path,
         '-segment_list_type', 'csv',
         '-segment_start_number', str(segment_start_number),
