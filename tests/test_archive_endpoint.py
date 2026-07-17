@@ -406,11 +406,21 @@ class TestCopyActiveToStage:
     def test_truncated_trailing_fragment_is_trimmed(self, tmp_path):
         # A partial trailing box (mid-write) is dropped from the staged
         # copy so downstream ffmpeg (/video) always sees a clean fMP4.
-        complete = _box(b'ftyp') + _box(b'moov', b'\x00' * 700)
+        complete = (_box(b'ftyp') + _box(b'moov', b'\x00' * 700)
+                    + _box(b'moof', b'\x00' * 64) + _box(b'mdat', b'\x01' * 300))
         content = complete + _box(b'mdat', b'\x01' * 900)[:400]
         dst = self._run_copy(tmp_path, content)
         with open(dst, 'rb') as fh:
             assert fh.read() == complete
+
+    def test_fragmentless_copy_rejected(self, tmp_path):
+        # ftyp+moov with the first fragment still incomplete: the trimmed
+        # copy would contain zero frames (empty_moov holds no samples), so
+        # the active segment is skipped rather than fed to ffmpeg.
+        content = (_box(b'ftyp') + _box(b'moov', b'\x00' * 700)
+                   + _box(b'mdat', b'\x01' * 900)[:400])
+        with pytest.raises(OSError, match='fragment'):
+            self._run_copy(tmp_path, content)
 
     def test_ftyp_only_file_rejected(self, tmp_path):
         with pytest.raises(OSError, match='moov'):
@@ -511,22 +521,34 @@ class TestTruncateToCompleteBoxes:
         data = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
                 + _box(b'moof') + _box(b'mdat', b'z' * 100))
         p = self._write(tmp_path, data)
-        _truncate_to_complete_boxes(p)
+        assert _truncate_to_complete_boxes(p) is True
         assert open(p, 'rb').read() == data
 
     def test_partial_trailing_box_dropped(self, tmp_path):
         from archive_export import _truncate_to_complete_boxes
-        good = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24) + _box(b'moof')
+        good = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+                + _box(b'moof') + _box(b'mdat', b'q' * 40))
         partial = (100).to_bytes(4, 'big') + b'mdat' + b'z' * 20  # claims 100, has 28
         p = self._write(tmp_path, good + partial)
-        _truncate_to_complete_boxes(p)
+        assert _truncate_to_complete_boxes(p) is True
         assert open(p, 'rb').read() == good
+
+    def test_trailing_moof_without_mdat_dropped(self, tmp_path):
+        # The exact CI failure shape: the cut fell inside the first mdat,
+        # leaving a complete moof whose sample data is missing.  The bare
+        # moof must go too — ffmpeg rejects a moof with no mdat behind it.
+        from archive_export import _truncate_to_complete_boxes
+        prefix = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+        cut = prefix + _box(b'moof', b'm' * 32) + b'\x00\x00\x82' # partial mdat
+        p = self._write(tmp_path, cut)
+        assert _truncate_to_complete_boxes(p) is False
+        assert open(p, 'rb').read() == prefix
 
     def test_bare_header_fragment_dropped(self, tmp_path):
         from archive_export import _truncate_to_complete_boxes
         good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
         p = self._write(tmp_path, good + b'\x00\x00')  # 2 stray bytes
-        _truncate_to_complete_boxes(p)
+        assert _truncate_to_complete_boxes(p) is False  # no fragment kept
         assert open(p, 'rb').read() == good
 
     def test_size_zero_box_stops_walk(self, tmp_path):
@@ -534,12 +556,13 @@ class TestTruncateToCompleteBoxes:
         good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
         weird = (0).to_bytes(4, 'big') + b'mdat' + b'z' * 40  # size 0 = "to EOF"
         p = self._write(tmp_path, good + weird)
-        _truncate_to_complete_boxes(p)
+        assert _truncate_to_complete_boxes(p) is False
         assert open(p, 'rb').read() == good
 
     def test_staged_copy_is_truncated_end_to_end(self, tmp_path):
         """_copy_active_to_stage applies the trim to what it writes."""
-        good = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24) + _box(b'mdat', b'z' * 16)
+        good = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+                + _box(b'moof', b'q' * 8) + _box(b'mdat', b'z' * 16))
         partial = (64).to_bytes(4, 'big') + b'moof' + b'w' * 10
         src = tmp_path / 'active.mp4'
         src.write_bytes(good + partial)
