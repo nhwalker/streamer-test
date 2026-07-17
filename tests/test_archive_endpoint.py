@@ -33,7 +33,8 @@ def _fake_copy(content_marker=b'copied-mp4'):
 
     The stub takes (src_fd, dst) and writes content_marker into dst.
     Successful copies return None; failures raise OSError.  The real
-    function streams bytes via os.sendfile; tests never need that.
+    function byte-copies from the fd after a moov check; tests never
+    need that.
     """
     def _stub(src_fd, dst):
         with open(dst, 'wb') as fh:

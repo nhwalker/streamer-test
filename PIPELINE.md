@@ -189,7 +189,7 @@ The `movflags` triple is what makes the archive simple:
   (a static desktop encodes at a few KB/s).  It must live inside
   `segment_format_options`: the segment muxer opens its own files, so a
   top-level `-flush_packets` never reaches them.  As a second line of
-  defence, the active-segment copy in `web_server.py` verifies a
+  defence, the active-segment copy in `archive_export.py` verifies a
   complete moov before staging and skips the file otherwise.
 
 ### Process supervision and back pressure
@@ -316,7 +316,8 @@ were free.
 
 ## Browser client
 
-`service/web/index.html` is self-contained (no JS bundle, no build step).
+`service/web/` is three static files — `index.html`, `style.css`, and the
+WHEP client `app.js` — served same-origin; no bundle, no build step.
 
 ### Connection (WHEP)
 
@@ -360,7 +361,7 @@ Each configured screen path (`/top`, `/left`, `/screen1`, …) serves
 
 The runtime config: `desktopName`, `width`, `height`, `framerate`,
 `webrtcPort`, `fullTiers` (scale/width/height/whepPath), and `screens`
-(name, path, geometry, crop trims, tiers).
+(name, path, geometry, tiers).
 
 ### `GET /archive?start=<ts>&end=<ts>` / `GET /archive?last=<duration>`
 
@@ -395,5 +396,5 @@ for the authoritative table.
 
 | Suite | What it covers |
 |---|---|
-| `tests/` (pytest, pure Python) | unit tests only: config/tier math, env-var aliases, ffmpeg argv builders, MediaMTX config, finalizer CSV handling, archive staging/zip, `/video` timeline assembly. No containers, no browser — `make test` |
+| `tests/` (pytest, pure Python) | unit tests only: config/tier math, ffmpeg argv builders, MediaMTX config, finalizer CSV handling, archive staging/zip, `/video` timeline assembly. No containers, no browser — `make test` |
 | `functional-tests/` (Java + Selenium + testcontainers) | all container/browser integration coverage: endpoint availability, `/config.json` shape, WHEP reachability for every tier, junk-offer rejection, real browser playback, per-screen crop correctness (two-tone Xvfb), metrics population, end-to-end color-flip recording (live + `/archive` + `/video`), hub endpoints, evidence capture via Allure — `make functional` |

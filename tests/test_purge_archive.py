@@ -1,7 +1,7 @@
 """
 Unit tests for purge_archive() in archive_purge.py.
 
-No Docker containers or GStreamer required — these manipulate real files in
+No Docker required — these manipulate real files in
 a temporary directory and verify deletion behaviour directly.
 """
 import os
