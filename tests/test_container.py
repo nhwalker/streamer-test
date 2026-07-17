@@ -36,13 +36,17 @@ class TestServiceAvailability:
         r = requests.get(f"http://localhost:{http_port}/", timeout=10)
         assert "<video" in r.text, "index.html must contain a <video> element"
 
-    def test_html_has_inline_whep_client(self, streaming_container):
-        """The WHEP client is inlined — no external JS bundle to break."""
+    def test_html_references_whep_client(self, streaming_container):
+        """The WHEP client is a same-origin static script — no build step,
+        no external bundle."""
         http_port, _ = streaming_container
         r = requests.get(f"http://localhost:{http_port}/", timeout=10)
-        assert "/whep" in r.text, "index.html must build WHEP endpoint URLs"
-        assert "RTCPeerConnection" in r.text, (
-            "index.html must contain the inline WebRTC client"
+        assert 'src="/app.js"' in r.text, "index.html must load /app.js"
+        js = requests.get(f"http://localhost:{http_port}/app.js", timeout=10)
+        assert js.status_code == 200
+        assert "/whep" in js.text, "app.js must build WHEP endpoint URLs"
+        assert "RTCPeerConnection" in js.text, (
+            "app.js must contain the WebRTC client"
         )
 
     def test_whep_endpoint_reachable(self, streaming_container):

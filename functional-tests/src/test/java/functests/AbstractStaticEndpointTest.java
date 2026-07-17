@@ -51,14 +51,17 @@ abstract class AbstractStaticEndpointTest {
     }
 
     @Test
-    @DisplayName("GET / contains the inline WHEP client")
-    @Description("Verifies the root page HTML carries the inline WHEP/WebRTC client (no external JS bundle).")
-    void rootBodyContainsInlineWhepClient() throws Exception {
+    @DisplayName("GET / references the WHEP client script")
+    @Description("Verifies the root page loads the same-origin WHEP/WebRTC client script (no build step, no external bundle).")
+    void rootBodyReferencesWhepClient() throws Exception {
         String html = body("/");
-        assertTrue(html.contains("/whep"),
-                "Expected the page to build WHEP endpoint URLs");
-        assertTrue(html.contains("RTCPeerConnection"),
-                "Expected the inline WebRTC client in the root page");
+        assertTrue(html.contains("src=\"/app.js\""),
+                "Expected the page to load /app.js");
+        String js = body("/app.js");
+        assertTrue(js.contains("/whep"),
+                "Expected app.js to build WHEP endpoint URLs");
+        assertTrue(js.contains("RTCPeerConnection"),
+                "Expected the WebRTC client in app.js");
     }
 
     // ── GET /top ──────────────────────────────────────────────────────────────

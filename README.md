@@ -77,7 +77,7 @@ WebRTC is the browser-native standard for real-time media: low latency
 *receive* a WebRTC stream from a server: the page POSTs an SDP offer to an
 HTTP endpoint, gets the answer back in the response, and media flows over a
 normal `RTCPeerConnection`. No signalling WebSocket, no client library —
-the whole client is ~100 lines inlined in `index.html`.
+the whole client lives in `service/web/app.js` — plain same-origin JS, no build step.
 
 ### MediaMTX
 
@@ -124,7 +124,7 @@ graph TD
 
         ff -->|"RTSP/TCP\nrtsp://127.0.0.1:8554/&lt;path&gt;"| mtx
         ff -->|"segment muxer"| arch
-        web -->|"serves"| html["/var/www/html/index.html\n(inline WHEP client)"]
+        web -->|"serves"| html["/var/www/html\n(index.html + app.js WHEP client)"]
     end
 
     subgraph browser["Browser"]
@@ -234,7 +234,7 @@ in a few minutes (package installs + one download).
 | ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL10) | mirror the repo |
 | Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | mirror the repos |
 | MediaMTX | GitHub release binary, **pinned version + sha256** | vendor one tarball into the internal artifact store, pass `--build-arg MEDIAMTX_URL=…` |
-| Web page + WHEP client | inline in `service/web/index.html` | in-repo, no build step |
+| Web page + WHEP client | `service/web/` (index.html, style.css, app.js) | in-repo, no build step |
 
 Two things to watch:
 
@@ -455,7 +455,7 @@ server per tier. All of that is gone:
 | `base/` builder image (~5 GB, 20–40 min Rust/meson builds) | none — single-stage `service/Containerfile` |
 | gst-plugins-rs pin ↔ GStreamer version matching | n/a |
 | `gst-webrtc-signalling-server`, one port per (stream × tier), 8443+N | one WHEP port (`8889/tcp`) + one media port (`8189/udp`) |
-| gstwebrtc-api npm bundle | inline WHEP client in `index.html` |
+| gstwebrtc-api npm bundle | same-origin WHEP client in `app.js` |
 | VP9 default codec, per-viewer encoders, REMB adaptation to 80 Mbps | H.264, one shared encode per tier, constant quality capped at `LIVE_MAXRATE` |
 | splitmuxsink/mp4mux archive (moov at EOS; mdat-walker remux to serve the active segment) | ffmpeg segment muxer fMP4 (moov up front; active segment served by plain copy) |
 | Lazy per-consumer encoders (idle tiers free) | every tier always encoded → default ladder reduced to `1.0,0.5` |
