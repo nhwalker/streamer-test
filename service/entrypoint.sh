@@ -86,7 +86,9 @@ python3 /usr/local/bin/web_server.py &
 WEBPID=$!
 
 # ── Access info ──────────────────────────────────────────────────────────────
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# `|| true` guards set -e/pipefail: hostname may be missing from the image
+# or fail entirely; ${HOST_IP:-} then also covers empty output.
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
 HOST_IP="${HOST_IP:-localhost}"
 echo ""
 echo "┌─────────────────────────────────────────────────────┐"
