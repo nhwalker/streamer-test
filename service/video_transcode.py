@@ -11,7 +11,7 @@ that exactly covers the requested time window:
     so web players can begin decoding from the first received bytes
 
 All files in the stage directory must have timestamps in their filenames
-(as produced by stage_segments in web_server.py).  Files without recognized
+(as produced by stage_segments in archive_export.py).  Files without recognized
 timestamps are ignored.
 
 Requires: ffmpeg and ffprobe available in PATH.
