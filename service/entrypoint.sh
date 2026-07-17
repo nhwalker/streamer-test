@@ -64,6 +64,14 @@ for i in $(seq 1 300); do
 done
 if [ "${READY}" -eq 0 ]; then
     echo "[service] ERROR: MediaMTX did not become ready within 30 s."
+    if kill -0 "${MTXPID}" 2>/dev/null; then
+        echo "[service] MediaMTX process is still running but not accepting RTSP connections."
+    else
+        echo "[service] MediaMTX process has EXITED (see its log lines above — likely a config or port-bind error)."
+    fi
+    echo "[service] ---- generated mediamtx.yml ----"
+    cat /run/desktop-stream/mediamtx.yml
+    echo "[service] ---- end mediamtx.yml ----"
     exit 1
 fi
 echo "[service] MediaMTX ready."

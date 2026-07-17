@@ -313,9 +313,17 @@ def build_mediamtx_config(config, env):
         f'rtspAddress: 127.0.0.1:{rtsp_port}',
         'rtspTransports: [tcp]',
         '',
+        # Every unused protocol must be EXPLICITLY off: MediaMTX enables
+        # them (and binds their listeners) by default, and a default-on
+        # listener we forgot to disable means two instances on one host
+        # collide on that port and the second dies with a bind error —
+        # exactly what happened with MoQ's :8892 before it was listed
+        # here.  When bumping the MediaMTX version, diff its default
+        # mediamtx.yml for newly-added protocols and extend this list.
         'rtmp: no',
         'hls: no',
         'srt: no',
+        'moq: no',
         '',
         'webrtc: yes',
         f'webrtcAddress: :{webrtc}',

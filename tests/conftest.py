@@ -225,6 +225,24 @@ def archive_live_dir(tmp_path_factory):
     return str(path)
 
 
+def _wait_for_logs_or_dump(container, pattern, timeout):
+    """wait_for_logs, but re-raise startup timeouts with the FULL container log.
+
+    testcontainers' TimeoutError includes only the last few log lines,
+    which hides the actual startup error (e.g. a MediaMTX port-bind
+    failure logged 30 lines earlier).
+    """
+    try:
+        wait_for_logs(container, pattern, timeout=timeout)
+    except TimeoutError as exc:
+        stdout, stderr = container.get_logs()
+        raise TimeoutError(
+            f"did not see {pattern!r} within {timeout}s.\n"
+            f"===== container stdout =====\n{stdout.decode(errors='replace')}\n"
+            f"===== container stderr =====\n{stderr.decode(errors='replace')}"
+        ) from exc
+
+
 # ── Service ──────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def _service(xvfb_display, archive_dir, archive_live_dir):
@@ -263,8 +281,8 @@ def streaming_container(_service):
     webrtc_port = WEBRTC_PORT
 
     # MediaMTX comes up before the web server in entrypoint.sh.
-    wait_for_logs(_service, "MediaMTX ready", timeout=60)
-    wait_for_logs(_service, "web server on port", timeout=10)
+    _wait_for_logs_or_dump(_service, "MediaMTX ready", timeout=60)
+    _wait_for_logs_or_dump(_service, "web server on port", timeout=10)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -504,8 +522,8 @@ def streaming_container_two_tone(_service_two_tone):
     http_port   = TWO_TONE_HTTP_PORT
     webrtc_port = TWO_TONE_WEBRTC_PORT
 
-    wait_for_logs(_service_two_tone, "MediaMTX ready", timeout=60)
-    wait_for_logs(_service_two_tone, "web server on port", timeout=10)
+    _wait_for_logs_or_dump(_service_two_tone, "MediaMTX ready", timeout=60)
+    _wait_for_logs_or_dump(_service_two_tone, "web server on port", timeout=10)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:

@@ -264,7 +264,9 @@ rtspTransports: [tcp]
 rtmp: no
 hls: no
 srt: no
-api: no
+moq: no                         # every default-on protocol must be listed —
+api: no                         # an unlisted one keeps its default listener
+                                # bound and collides across instances
 
 webrtc: yes
 webrtcAddress: :8889            # WHEP + ICE over HTTP

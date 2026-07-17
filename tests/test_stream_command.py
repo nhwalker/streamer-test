@@ -190,9 +190,14 @@ def test_mediamtx_config_binds_rtsp_to_loopback_only():
 
 
 def test_mediamtx_config_disables_everything_but_rtsp_and_webrtc():
+    # Default-on protocols left unlisted keep their default listeners
+    # bound — two instances on one host then collide on those ports and
+    # the second dies at startup (this bit us with MoQ's :8892).  Every
+    # protocol MediaMTX ships enabled must appear here as 'no'.
     cfg, env = _cfg()
     yml = build_mediamtx_config(cfg, env)
-    for line in ('api: no', 'rtmp: no', 'hls: no', 'srt: no'):
+    for line in ('api: no', 'metrics: no', 'pprof: no', 'playback: no',
+                 'rtmp: no', 'hls: no', 'srt: no', 'moq: no'):
         assert line in yml
     assert 'webrtc: yes' in yml
     assert 'webrtcAddress: :8889' in yml
