@@ -494,6 +494,9 @@ function stopMetrics() {
   window._activeTier  = null;
 
   const WHEP_RETRY_MS = 2000;
+  // How long a 'disconnected' peer connection may try to self-heal before
+  // we tear it down and re-offer.
+  const DISCONNECT_GRACE_MS = 3000;
 
   function teardownCurrent() {
     connectSeq += 1;              // invalidate in-flight attempts
@@ -560,14 +563,41 @@ function stopMetrics() {
       }
     });
 
+    // 'disconnected' is frequently a transient ICE blip that self-heals in
+    // a second or two; tearing down immediately converts it into a full
+    // re-offer cycle (black frame + keyframe wait).  Give it a short grace
+    // period and only reconnect if it doesn't recover.  'failed'/'closed'
+    // are terminal and reconnect immediately.
+    let graceTimer = null;
+    const reconnect = () => {
+      setStatus('Stream ended. Reconnecting…');
+      video.srcObject = null;
+      stopMetrics();
+      try { pc.close(); } catch (_) {}
+      scheduleRetry(tier, seq, WHEP_RETRY_MS);
+    };
     pc.addEventListener('connectionstatechange', () => {
       if (pc !== currentPc || seq !== connectSeq) return;
-      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
-        setStatus('Stream ended. Reconnecting…');
-        video.srcObject = null;
-        stopMetrics();
-        try { pc.close(); } catch (_) {}
-        scheduleRetry(tier, seq, WHEP_RETRY_MS);
+      const state = pc.connectionState;
+      if (state === 'connected' && graceTimer != null) {
+        clearTimeout(graceTimer);   // the blip healed itself
+        graceTimer = null;
+      } else if (state === 'disconnected') {
+        if (graceTimer == null) {
+          graceTimer = setTimeout(() => {
+            graceTimer = null;
+            if (pc !== currentPc || seq !== connectSeq) return;
+            if (['disconnected', 'failed'].includes(pc.connectionState)) {
+              reconnect();
+            }
+          }, DISCONNECT_GRACE_MS);
+        }
+      } else if (['failed', 'closed'].includes(state)) {
+        if (graceTimer != null) {
+          clearTimeout(graceTimer);
+          graceTimer = null;
+        }
+        reconnect();
       }
     });
 

@@ -302,7 +302,9 @@ tier ladder from `LIVE_SCALE_LADDER` (default `1.0,0.5`):
   `whepPath`.
 - Screen naming is unchanged: two side-by-side monitors are `left`/`right`,
   stacked are `top`/`bottom`, otherwise `screen1..N` in reading order.
-  Regions come from `DESKTOP_SPLITS` or RandR auto-detection.
+  Regions come from `DESKTOP_SPLITS` (frame coordinates, verbatim) or RandR
+  auto-detection (native pixels, scaled into the configured frame with
+  even-snapped shared edges).
 
 **Cost model:** every tier is a continuously-running encode (one NVENC
 session or one x264 instance each) plus the archive. Example budget with
@@ -332,8 +334,9 @@ WHEP client `app.js` — served same-origin; no bundle, no build step.
 4. A `404` means the path exists but nothing is publishing (ffmpeg still
    starting or restarting) — the client polls every 2 s.
 5. Teardown DELETEs the WHEP session URL (from the `Location` header) and
-   closes the peer connection; connection failure/disconnect triggers
-   automatic reconnect to the same tier.
+   closes the peer connection.  `failed`/`closed` reconnect immediately;
+   `disconnected` gets a 3 s grace period first, since it is usually a
+   transient ICE blip that self-heals without a re-offer.
 
 ### Metrics ("gumball")
 
@@ -377,8 +380,10 @@ so a rotation mid-copy cannot corrupt the download.
 One faststart MP4 covering exactly the window: segments are laid on a
 solid-color base track at their true temporal offsets (gaps filled with
 `VIDEO_FILL_COLOR`), re-encoded at `VIDEO_QP` (defaults to `ARCHIVE_QP`).
-Windows over 12 hours are rejected. Unchanged from the previous stack
-(`video_transcode.py` always used ffmpeg).
+Windows over 12 hours are rejected. At most `VIDEO_MAX_CONCURRENT`
+(default 2) transcodes run at once — each is a full ffmpeg encode that
+competes with the live encoders — and overflow requests receive
+`503` + `Retry-After`.
 
 Timestamps accept Unix epoch or ISO 8601 (UTC assumed when no timezone);
 durations are `30s` / `60m` / `1.5h`.

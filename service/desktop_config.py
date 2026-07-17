@@ -22,6 +22,9 @@ Inputs (environment variables, evaluated once at container start):
 
   STREAM_WIDTH      Capture width.  Empty = native screen width via xrandr.
   STREAM_HEIGHT     Capture height. Empty = native screen height via xrandr.
+                    When set differently from native, auto-detected monitor
+                    regions are scaled into the frame; explicit
+                    DESKTOP_SPLITS values are frame coordinates.
 
   STREAM_FRAMERATE  Target frames-per-second.  Drives ffmpeg's x11grab
                     -framerate and is surfaced in /config.json so the
@@ -202,37 +205,73 @@ def _name_regions(regions):
     return [(r, f'screen{i + 1}') for i, r in enumerate(ordered)]
 
 
+def _scale_regions_to_frame(regions, frame_w, frame_h):
+    """Map native-pixel monitor regions into the configured capture frame.
+
+    The capture graph scales the native root window to frame_w x frame_h
+    before cropping, so RandR regions (native pixels) must be scaled by the
+    same ratio to select the right pixels.  The native extent is the
+    regions' bounding box — monitors tile the X root window from origin 0,
+    so no extra X query is needed.
+
+    Edges (not sizes) are scaled and snapped to even coordinates: adjacent
+    monitors share a scaled edge, so seams stay gap- and overlap-free, and
+    even edges make every region dimension even (H.264 4:2:0 needs even
+    crop sizes).  When the bounding box already equals the frame the
+    mapping is the identity.
+    """
+    native_w = max(r['x'] + r['width'] for r in regions)
+    native_h = max(r['y'] + r['height'] for r in regions)
+    if (native_w, native_h) == (frame_w, frame_h):
+        return regions
+
+    def _snap(value, ratio):
+        return 2 * round(value * ratio / 2)
+
+    sx = frame_w / native_w
+    sy = frame_h / native_h
+    scaled = []
+    for r in regions:
+        x1, y1 = _snap(r['x'], sx), _snap(r['y'], sy)
+        x2 = _snap(r['x'] + r['width'], sx)
+        y2 = _snap(r['y'] + r['height'], sy)
+        scaled.append({'x': x1, 'y': y1,
+                       'width': max(2, x2 - x1), 'height': max(2, y2 - y1)})
+    return scaled
+
+
 def _regions_from_env(env, frame_w, frame_h, display):
     """Return the screen-split regions for this deployment.
 
-    DESKTOP_SPLITS wins when set; otherwise RandR monitor auto-detection;
-    otherwise one full-frame region.  Regions that do not fit inside the
-    configured frame are warned about, not clamped: the ffmpeg crop runs in
-    the frame's coordinate space, so an out-of-bounds region (typically
-    STREAM_WIDTH/HEIGHT set below native while splits are auto-detected in
-    native pixels) will fail loudly at pipeline start.
+    DESKTOP_SPLITS wins when set and is taken verbatim (documented as
+    frame coordinates); otherwise RandR monitor auto-detection, scaled
+    from native pixels into the frame; otherwise one full-frame region.
+
+    Explicit regions that do not fit inside the configured frame are
+    warned about, not clamped: the ffmpeg crop runs in the frame's
+    coordinate space, so an out-of-bounds region will fail loudly at
+    pipeline start.
     """
     raw = (env.get('DESKTOP_SPLITS') or '').strip()
     if raw:
         regions = [_parse_region(s) for s in raw.split(';') if s.strip()]
-    else:
-        regions = _query_x_monitors(display)
+        for r in regions:
+            if (r['x'] < 0 or r['y'] < 0
+                    or r['x'] + r['width'] > frame_w
+                    or r['y'] + r['height'] > frame_h):
+                print(f'[desktop_config] WARNING: region '
+                      f"{r['width']}x{r['height']}+{r['x']}+{r['y']} does "
+                      f'not fit the {frame_w}x{frame_h} capture frame; its '
+                      'ffmpeg crop will fail. DESKTOP_SPLITS is in frame '
+                      'coordinates.', file=sys.stderr)
+        return regions
+
+    regions = _query_x_monitors(display)
     if not regions:
         print('[desktop_config] WARNING: no monitor geometry available; '
               'falling back to a single full-frame screen.', file=sys.stderr)
         return [{'x': 0, 'y': 0, 'width': frame_w, 'height': frame_h}]
-
-    for r in regions:
-        if (r['x'] < 0 or r['y'] < 0
-                or r['x'] + r['width'] > frame_w
-                or r['y'] + r['height'] > frame_h):
-            print(f'[desktop_config] WARNING: region '
-                  f"{r['width']}x{r['height']}+{r['x']}+{r['y']} does not "
-                  f'fit the {frame_w}x{frame_h} capture frame; its ffmpeg '
-                  'crop will fail. Set DESKTOP_SPLITS in frame coordinates '
-                  'or leave STREAM_WIDTH/HEIGHT at native size.',
-                  file=sys.stderr)
-    return regions
+    return _scale_regions_to_frame(regions, frame_w, frame_h)
 
 
 def compute_config(env=None):

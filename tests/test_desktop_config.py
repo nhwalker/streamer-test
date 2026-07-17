@@ -111,6 +111,44 @@ def test_whep_port_default_and_override():
     })['webrtcPort'] == 9889
 
 
+def test_randr_regions_scale_to_downscaled_frame(monkeypatch):
+    # Native 3840x1080 (two side-by-side monitors), capture downscaled to
+    # 1920x540: regions scale by the same ratio so crops select the right
+    # pixels in the scaled frame.
+    monkeypatch.setattr(desktop_config, '_query_x_monitors',
+                        lambda _d: [
+                            {'x': 0,    'y': 0, 'width': 1920, 'height': 1080},
+                            {'x': 1920, 'y': 0, 'width': 1920, 'height': 1080},
+                        ])
+    cfg = desktop_config.compute_config({
+        'STREAM_WIDTH': '1920', 'STREAM_HEIGHT': '540',
+    })
+    left, right = cfg['screens']
+    assert (left['x'], left['y'], left['width'], left['height']) \
+        == (0, 0, 960, 540)
+    assert (right['x'], right['y'], right['width'], right['height']) \
+        == (960, 0, 960, 540)
+
+
+def test_randr_region_scaling_keeps_seams_and_even_dims(monkeypatch):
+    # Awkward ratio (1/3 width, 2/3 height): adjacent monitors must still
+    # share their seam exactly, and every region dimension stays even.
+    monkeypatch.setattr(desktop_config, '_query_x_monitors',
+                        lambda _d: [
+                            {'x': 0,    'y': 0, 'width': 1920, 'height': 1080},
+                            {'x': 1920, 'y': 0, 'width': 1920, 'height': 1080},
+                        ])
+    cfg = desktop_config.compute_config({
+        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
+    })
+    left, right = cfg['screens']
+    assert left['x'] + left['width'] == right['x']          # shared seam
+    assert right['x'] + right['width'] == 1280              # spans the frame
+    for s in (left, right):
+        assert s['width'] % 2 == 0 and s['height'] % 2 == 0
+        assert s['height'] == 720
+
+
 def test_out_of_frame_region_warns(capsys):
     # Regions are used verbatim by the ffmpeg crop, so one that exceeds the
     # capture frame is a misconfiguration — flagged loudly, not clamped.

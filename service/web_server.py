@@ -59,6 +59,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -76,6 +77,14 @@ VIDEO_FILL_COLOR     = int(os.environ.get('VIDEO_FILL_COLOR', '0xFF000000'), 16)
 VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
 VIDEO_DEFAULT_HEIGHT = int(os.environ.get('VIDEO_DEFAULT_HEIGHT', '1080'))
 VIDEO_MAX_SEC        = 12 * 3600
+VIDEO_MAX_CONCURRENT = int(os.environ.get('VIDEO_MAX_CONCURRENT', '2'))
+VIDEO_RETRY_AFTER_SEC = 15
+
+# Each /video request is a full ffmpeg re-encode that competes with the
+# always-on live encoders for CPU (and NVENC sessions, where the budget is
+# tight).  Beyond the cap, requests get 503 + Retry-After instead of
+# degrading the live stream.
+_video_slots = threading.BoundedSemaphore(VIDEO_MAX_CONCURRENT)
 
 CONFIG = load_config()
 CONFIG_JSON = json.dumps(CONFIG).encode('utf-8')
@@ -162,29 +171,54 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'requested range exceeds 12-hour maximum')
             return
 
-        stage_tmp  = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
-        output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
-        try:
-            output_path = os.path.join(output_tmp.name, 'video.mp4')
-            transcode_to_video(
-                stage_tmp.name, start_ts, end_ts,
-                VIDEO_FILL_COLOR, output_path,
-                default_width=VIDEO_DEFAULT_WIDTH,
-                default_height=VIDEO_DEFAULT_HEIGHT,
-            )
-            video_size = os.path.getsize(output_path)
-            self.send_response(200)
-            self.send_header('Content-Type', 'video/mp4')
-            self.send_header('Content-Disposition', 'attachment; filename="video.mp4"')
-            self.send_header('Content-Length', str(video_size))
+        if not _video_slots.acquire(blocking=False):
+            self.send_response(503, 'Busy')
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Retry-After', str(VIDEO_RETRY_AFTER_SEC))
+            body = (f'{VIDEO_MAX_CONCURRENT} /video transcodes already '
+                    'running; retry shortly\n').encode('utf-8')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            with open(output_path, 'rb') as fh:
-                shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
-        except Exception as exc:
-            print(f'[video] transcode error: {exc}', flush=True)
-            self.send_error(500, 'Internal server error')
+            self.wfile.write(body)
+            return
+        # The slot covers only the expensive part (staging + ffmpeg
+        # encode).  Streaming the finished file to the client is I/O-bound
+        # and must not count against the CPU budget — a slow download
+        # would otherwise hold a transcode slot for its whole duration.
+        stage_tmp  = None
+        output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
+        output_path = os.path.join(output_tmp.name, 'video.mp4')
+        try:
+            try:
+                stage_tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR,
+                                           start_ts, end_ts)
+                transcode_to_video(
+                    stage_tmp.name, start_ts, end_ts,
+                    VIDEO_FILL_COLOR, output_path,
+                    default_width=VIDEO_DEFAULT_WIDTH,
+                    default_height=VIDEO_DEFAULT_HEIGHT,
+                )
+            except Exception as exc:
+                print(f'[video] transcode error: {exc}', flush=True)
+                self.send_error(500, 'Internal server error')
+                return
+            finally:
+                _video_slots.release()
+
+            try:
+                video_size = os.path.getsize(output_path)
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Content-Disposition', 'attachment; filename="video.mp4"')
+                self.send_header('Content-Length', str(video_size))
+                self.end_headers()
+                with open(output_path, 'rb') as fh:
+                    shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client went away mid-download; nothing to salvage
         finally:
-            stage_tmp.cleanup()
+            if stage_tmp is not None:
+                stage_tmp.cleanup()
             output_tmp.cleanup()
 
     def log_message(self, fmt, *args):
