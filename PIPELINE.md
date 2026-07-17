@@ -334,8 +334,9 @@ WHEP client `app.js` — served same-origin; no bundle, no build step.
 4. A `404` means the path exists but nothing is publishing (ffmpeg still
    starting or restarting) — the client polls every 2 s.
 5. Teardown DELETEs the WHEP session URL (from the `Location` header) and
-   closes the peer connection; connection failure/disconnect triggers
-   automatic reconnect to the same tier.
+   closes the peer connection.  `failed`/`closed` reconnect immediately;
+   `disconnected` gets a 3 s grace period first, since it is usually a
+   transient ICE blip that self-heals without a re-offer.
 
 ### Metrics ("gumball")
 
