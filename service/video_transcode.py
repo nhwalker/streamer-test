@@ -21,6 +21,7 @@ Public API:
                        fill_color_argb, output_path,
                        default_width, default_height)
 """
+import functools
 import json
 import os
 import subprocess
@@ -66,7 +67,9 @@ def _detect_encoder_args():
     return ['-c:v', 'ffv1']
 
 
-_ENCODER_ARGS = _detect_encoder_args()
+# Lazy so that merely importing this module never spawns ffmpeg probes —
+# only the first actual transcode pays for encoder detection.
+_encoder_args = functools.lru_cache(maxsize=None)(_detect_encoder_args)
 
 
 @dataclass
@@ -206,7 +209,7 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
         )
 
     cmd += ['-filter_complex', ';'.join(filters)]
-    cmd += ['-map', '[out]'] + _ENCODER_ARGS
+    cmd += ['-map', '[out]', *_encoder_args()]
     cmd += ['-movflags', '+faststart', output_path]
 
     result = subprocess.run(cmd, capture_output=True)

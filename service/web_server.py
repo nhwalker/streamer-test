@@ -51,7 +51,6 @@ Environment variables:
                        segments (timestamp-named, fragmented MP4)
   ARCHIVE_LIVE_DIR     Directory the in-progress .mp4   (/archive-live)
                        fragmented-MP4 segment is being written into
-  ARCHIVE_SEGMENT_SEC  Nominal segment duration         (600)
   VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
   VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
   VIDEO_DEFAULT_HEIGHT Output height when no segments   (1080)
@@ -73,7 +72,6 @@ from video_transcode import transcode_to_video
 WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
 ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_LIVE_DIR     = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
-ARCHIVE_SEGMENT_SEC  = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
 VIDEO_FILL_COLOR     = int(os.environ.get('VIDEO_FILL_COLOR', '0xFF000000'), 16)
 VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
 VIDEO_DEFAULT_HEIGHT = int(os.environ.get('VIDEO_DEFAULT_HEIGHT', '1080'))

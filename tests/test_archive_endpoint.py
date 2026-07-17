@@ -1,29 +1,25 @@
 """
-Unit tests for parse_timestamp(), stage_segments(), and zip_segments()
-in web_server.py.
+Unit tests for the /archive//video building blocks: parse_duration and
+parse_timestamp (archive_times.py), stage_segments and zip_segments
+(archive_export.py).
 
-No Docker, GStreamer, or live HTTP server required.
-
-The active-segment branch of stage_segments streams the live fragmented-
-MP4 into the stage dir via os.sendfile.  These tests inject a fake copy
-callable so they remain self-contained — they don't depend on the
-sendfile syscall succeeding on whatever odd fds the test fixtures use.
+No Docker or live HTTP server required.  The active-segment branch of
+stage_segments byte-copies the live fragmented MP4 into the stage dir;
+these tests inject a fake copy callable so they stay self-contained.
 """
 import datetime
 import os
-import sys
 import time
 import zipfile
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from archive_export import (  # noqa: E402
+from archive_export import (
     _copy_active_to_stage,
     stage_segments,
     zip_segments,
 )
-from archive_times import parse_duration, parse_timestamp  # noqa: E402
+from archive_times import parse_duration, parse_timestamp
 
 # Reference UTC epoch for 2024-01-15 10:30:00 UTC
 _REF_DT  = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
@@ -37,7 +33,8 @@ def _fake_copy(content_marker=b'copied-mp4'):
 
     The stub takes (src_fd, dst) and writes content_marker into dst.
     Successful copies return None; failures raise OSError.  The real
-    function streams bytes via os.sendfile; tests never need that.
+    function byte-copies from the fd after a moov check; tests never
+    need that.
     """
     def _stub(src_fd, dst):
         with open(dst, 'wb') as fh:
@@ -406,12 +403,24 @@ class TestCopyActiveToStage:
         with open(dst, 'rb') as fh:
             assert fh.read() == content
 
-    def test_truncated_trailing_fragment_still_copied(self, tmp_path):
-        # A partial trailing box (mid-write) is fine — players ignore it.
+    def test_truncated_trailing_fragment_is_trimmed(self, tmp_path):
+        # A partial trailing box (mid-write) is dropped from the staged
+        # copy so downstream ffmpeg (/video) always sees a clean fMP4.
+        complete = (_box(b'ftyp') + _box(b'moov', b'\x00' * 700)
+                    + _box(b'moof', b'\x00' * 64) + _box(b'mdat', b'\x01' * 300))
+        content = complete + _box(b'mdat', b'\x01' * 900)[:400]
+        dst = self._run_copy(tmp_path, content)
+        with open(dst, 'rb') as fh:
+            assert fh.read() == complete
+
+    def test_fragmentless_copy_rejected(self, tmp_path):
+        # ftyp+moov with the first fragment still incomplete: the trimmed
+        # copy would contain zero frames (empty_moov holds no samples), so
+        # the active segment is skipped rather than fed to ffmpeg.
         content = (_box(b'ftyp') + _box(b'moov', b'\x00' * 700)
                    + _box(b'mdat', b'\x01' * 900)[:400])
-        dst = self._run_copy(tmp_path, content)
-        assert os.path.getsize(dst) == len(content)
+        with pytest.raises(OSError, match='fragment'):
+            self._run_copy(tmp_path, content)
 
     def test_ftyp_only_file_rejected(self, tmp_path):
         with pytest.raises(OSError, match='moov'):
@@ -494,3 +503,73 @@ class TestStageAndZip:
                 assert content in [zf.read(n) for n in names]
         finally:
             tmp.cleanup()
+
+
+# ── _truncate_to_complete_boxes ───────────────────────────────────────────────
+
+class TestTruncateToCompleteBoxes:
+    """The staged active-segment copy must always end on a complete
+    top-level box so /video's ffmpeg never sees a mid-fragment cut."""
+
+    def _write(self, tmp_path, data):
+        p = tmp_path / 'staged.mp4'
+        p.write_bytes(data)
+        return str(p)
+
+    def test_complete_file_untouched(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        data = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+                + _box(b'moof') + _box(b'mdat', b'z' * 100))
+        p = self._write(tmp_path, data)
+        assert _truncate_to_complete_boxes(p) is True
+        assert open(p, 'rb').read() == data
+
+    def test_partial_trailing_box_dropped(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        good = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+                + _box(b'moof') + _box(b'mdat', b'q' * 40))
+        partial = (100).to_bytes(4, 'big') + b'mdat' + b'z' * 20  # claims 100, has 28
+        p = self._write(tmp_path, good + partial)
+        assert _truncate_to_complete_boxes(p) is True
+        assert open(p, 'rb').read() == good
+
+    def test_trailing_moof_without_mdat_dropped(self, tmp_path):
+        # The exact CI failure shape: the cut fell inside the first mdat,
+        # leaving a complete moof whose sample data is missing.  The bare
+        # moof must go too — ffmpeg rejects a moof with no mdat behind it.
+        from archive_export import _truncate_to_complete_boxes
+        prefix = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+        cut = prefix + _box(b'moof', b'm' * 32) + b'\x00\x00\x82' # partial mdat
+        p = self._write(tmp_path, cut)
+        assert _truncate_to_complete_boxes(p) is False
+        assert open(p, 'rb').read() == prefix
+
+    def test_bare_header_fragment_dropped(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
+        p = self._write(tmp_path, good + b'\x00\x00')  # 2 stray bytes
+        assert _truncate_to_complete_boxes(p) is False  # no fragment kept
+        assert open(p, 'rb').read() == good
+
+    def test_size_zero_box_stops_walk(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
+        weird = (0).to_bytes(4, 'big') + b'mdat' + b'z' * 40  # size 0 = "to EOF"
+        p = self._write(tmp_path, good + weird)
+        assert _truncate_to_complete_boxes(p) is False
+        assert open(p, 'rb').read() == good
+
+    def test_staged_copy_is_truncated_end_to_end(self, tmp_path):
+        """_copy_active_to_stage applies the trim to what it writes."""
+        good = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+                + _box(b'moof', b'q' * 8) + _box(b'mdat', b'z' * 16))
+        partial = (64).to_bytes(4, 'big') + b'moof' + b'w' * 10
+        src = tmp_path / 'active.mp4'
+        src.write_bytes(good + partial)
+        dst = str(tmp_path / 'staged.mp4')
+        fd = os.open(str(src), os.O_RDONLY)
+        try:
+            _copy_active_to_stage(fd, dst)
+        finally:
+            os.close(fd)
+        assert open(dst, 'rb').read() == good

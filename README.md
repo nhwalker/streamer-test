@@ -1,35 +1,18 @@
 # X11 Desktop Streaming via WebRTC
 
-Streams a Linux desktop (X11) to any modern web browser in real time, with
-sub-second latency and efficient video compression, while continuously
-recording the desktop to disk. Packaged as a single container image based on
-Red Hat UBI 10.
-
-The stack is **ffmpeg** (capture + encode) → **MediaMTX** (WebRTC/WHEP
-egress) → browser. There are **no source builds** — every component comes
-from a mirror-able RPM repository or a single vendored static binary.
+Streams a Linux desktop (X11) to any modern browser with sub-second latency
+while continuously recording it to disk. One container image (Red Hat
+UBI 10), no source builds: **ffmpeg** (capture + encode) → **MediaMTX**
+(WebRTC/WHEP egress) → browser.
 
 > Migrating from the GStreamer/webrtcsink version? See
 > [Migration from the GStreamer stack](#migration-from-the-gstreamer-stack).
+> Internals (filter graph, encoders, archive lifecycle, HTTP API) are in
+> [PIPELINE.md](PIPELINE.md).
 
 ---
 
-## Table of Contents
-
-1. [How it works — the 30-second version](#how-it-works--the-30-second-version)
-2. [Technology primer](#technology-primer)
-3. [Architecture](#architecture)
-4. [Container internals](#container-internals)
-5. [Build process](#build-process)
-6. [Running the container](#running-the-container)
-7. [NVIDIA GPU encoding](#nvidia-gpu-encoding)
-8. [Configuration reference](#configuration-reference)
-9. [Verifying it works](#verifying-it-works)
-10. [Migration from the GStreamer stack](#migration-from-the-gstreamer-stack)
-
----
-
-## How it works — the 30-second version
+## How it works
 
 ```
 Host desktop (X11)
@@ -46,66 +29,27 @@ Host desktop (X11)
    Browser opens http://host:8080 and receives live video
 ```
 
-The desktop screen is captured as a stream of raw video frames, compressed
-with H.264 (NVENC on the GPU when available, x264 otherwise), and delivered
-to the browser over WebRTC — the same protocol used by Google Meet and Zoom.
-The browser needs no plugin. In parallel, the same capture is encoded once
-more at archival quality and written to disk as rotating MP4 segments.
+One ffmpeg process does all media work: `x11grab` captures the display, a
+filter graph crops per-monitor regions and scales each resolution tier, and
+`h264_nvenc` (GPU) or `libx264` (CPU) encodes every output — live tiers to
+RTSP on loopback, the archive to disk. [MediaMTX](https://github.com/bluenviron/mediamtx)
+(a single static Go binary) re-serves each RTSP path to browsers as WebRTC.
+The browser page POSTs an SDP offer to an HTTP endpoint (**WHEP**), gets
+the answer back, and media flows over a plain `RTCPeerConnection` — no
+signalling WebSocket, no client library; the whole client is
+`service/web/app.js`, served same-origin with no build step.
 
----
+Two consequences worth knowing:
 
-## Technology primer
-
-### ffmpeg
-
-ffmpeg is the swiss-army knife of video processing. One ffmpeg process does
-everything on the capture side:
-
-- **`x11grab`** reads raw frames from the X11 display.
-- A **filter graph** (`-filter_complex`) crops per-monitor regions and
-  scales each resolution tier — one capture feeds every output.
-- **`h264_nvenc`** (GPU) or **`libx264`** (CPU) encodes each output.
-- The **RTSP muxer** publishes each live tier to MediaMTX over loopback;
-  the **segment muxer** writes the archive to disk.
-
-### WebRTC and WHEP
-
-WebRTC is the browser-native standard for real-time media: low latency
-(typically under 500 ms), encrypted (DTLS-SRTP), no plugin required.
-
-**WHEP** (WebRTC-HTTP Egress Protocol) is the standard way for a browser to
-*receive* a WebRTC stream from a server: the page POSTs an SDP offer to an
-HTTP endpoint, gets the answer back in the response, and media flows over a
-normal `RTCPeerConnection`. No signalling WebSocket, no client library —
-the whole client lives in `service/web/app.js` — plain same-origin JS, no build step.
-
-### MediaMTX
-
-[MediaMTX](https://github.com/bluenviron/mediamtx) is a zero-dependency
-media server distributed as one static Go binary. It ingests the RTSP
-streams ffmpeg publishes on loopback and re-serves each one to browsers via
-WHEP, handling all WebRTC negotiation (ICE/DTLS/SRTP). It never touches the
-GPU and never transcodes — it repackages compressed frames, so its CPU cost
-is trivial.
-
-One consequence worth knowing: MediaMTX is a *passthrough*. It cannot ask
-ffmpeg for a keyframe, so a viewer joining mid-stream sees the first frame
-only when the next keyframe arrives. The encoders therefore run a 1-second
-keyframe interval (`LIVE_GOP`) — worst-case join delay is one second.
-
-### UBI 10 (Universal Base Image)
-
-Red Hat's UBI 10 is a freely redistributable container base image derived
-from RHEL 10. Package repositories used: Rocky Linux 10 (BaseOS/AppStream/
-CRB), EPEL 10, and **RPM Fusion Free** — which ships the full ffmpeg build
-(NVENC, libx264, libopus, x11grab). All are mirror-able for air-gapped
-deployments.
-
----
+- **MediaMTX is a passthrough** — it never transcodes and cannot ask ffmpeg
+  for a keyframe, so a joining viewer waits for the next keyframe. The
+  encoders run a 1-second keyframe interval (`LIVE_GOP`); that interval is
+  the worst-case join delay.
+- **Every tier is an always-on encode.** Unlike webrtcsink's per-viewer
+  encoders, an unwatched tier still costs an encoder session — keep the
+  ladder short (`LIVE_SCALE_LADDER`, default `1.0,0.5`).
 
 ## Architecture
-
-### System overview
 
 ```mermaid
 graph TD
@@ -139,133 +83,63 @@ graph TD
     mtx -->|"WebRTC media\n(SRTP over UDP :8189)"| video
 ```
 
-### Streams and tiers
-
 Every deployment serves one **full-frame** stream plus one stream per
-detected monitor (or per `DESKTOP_SPLITS` region). Each stream is encoded at
-a ladder of resolutions (default: 1.0 and 0.5 scale). Each (stream, tier)
-pair is one MediaMTX path:
+detected monitor (or per `DESKTOP_SPLITS` region), each at a ladder of
+resolutions. Each (stream, tier) pair is one MediaMTX path:
 
 | Page | Tier paths (default ladder) |
 |---|---|
 | `/` (full frame) | `full_t0`, `full_t1` |
 | `/left` (or `/top`, `/screen1`, …) | `left_t0`, `left_t1` |
 
-The browser reads `/config.json`, picks the smallest tier whose pixel
-dimensions still cover its rendered video size, and connects to that tier's
-WHEP endpoint (`http://host:8889/<path>/whep`). Resizing across a tier
-boundary reconnects to the new tier (~250 ms blip).
+The browser reads `/config.json`, picks the smallest tier that still covers
+its rendered video size, and connects to that tier's WHEP endpoint
+(`http://host:8889/<path>/whep`). Resizing across a tier boundary
+reconnects (~250 ms blip).
 
-Unlike the previous webrtcsink design, **every tier is encoded
-continuously** — an unwatched tier still costs an encoder session. Keep the
-ladder short (see `LIVE_SCALE_LADDER`).
+### Startup sequence (entrypoint.sh)
 
-### Media flow (viewer join)
-
-```mermaid
-sequenceDiagram
-    participant BR as Browser
-    participant MTX as MediaMTX
-    participant FF as ffmpeg
-
-    FF->>MTX: RTSP ANNOUNCE + SETUP + RECORD (at startup)
-    Note over FF,MTX: publisher streams H.264 continuously
-
-    BR->>MTX: HTTP POST /full_t0/whep (SDP offer)
-    MTX-->>BR: 201 Created (SDP answer + session Location)
-    Note over BR,MTX: ICE + DTLS handshake
-    MTX->>BR: SRTP media, starting at the next keyframe (≤ 1 s)
-    loop Every frame
-        FF->>MTX: RTP (compressed H.264, loopback)
-        MTX->>BR: SRTP (same bytes, repackaged)
-    end
-```
-
----
-
-## Container internals
-
-```mermaid
-graph TD
-    subgraph runtime["Runtime Container"]
-        direction TB
-        ep["/usr/local/bin/entrypoint.sh"]
-        dc["desktop_config.py\n(writes /run/desktop-stream/config.json)"]
-        sc["stream_command.py\n(builds ffmpeg argv + mediamtx.yml)"]
-        pl["pipeline.py\n(spawns + supervises ffmpeg,\nfinalizes archive segments)"]
-        mtx["/usr/local/bin/mediamtx\n(vendored static binary)"]
-        ws["web_server.py\n(:8080, /config.json, /archive, /video)"]
-
-        ep -->|"1"| dc
-        ep -->|"2 (config via stream_command)"| mtx
-        ep -->|"3"| ws
-        ep -->|"4"| pl
-        pl -->|"argv from"| sc
-    end
-```
-
-### Startup sequence
-
-1. **Pre-flight** — log GPU presence (`nvidia-smi`), verify the X display
-   is reachable with a one-frame ffmpeg grab.
-2. **`desktop_config.py`** — probe RandR for resolution/monitors, compute
-   the tier ladder, write `/run/desktop-stream/config.json`.
+1. **Pre-flight** — log GPU presence, verify the X display with a one-frame
+   ffmpeg grab.
+2. **`desktop_config.py`** — probe RandR, compute the tier ladder, write
+   `/run/desktop-stream/config.json` (shared by all processes).
 3. **MediaMTX** — `stream_command.py` renders `mediamtx.yml` (loopback RTSP
-   ingest, WHEP on `WHEP_PORT`, everything else disabled, only the
-   configured paths allowed); readiness-probed before continuing.
-4. **`web_server.py`** — serves the page, `/config.json`, and the archive
-   endpoints.
-5. **`pipeline.py`** — probes `h264_nvenc` with a one-frame test encode,
-   builds the single ffmpeg command, and supervises it: if ffmpeg dies it
-   is restarted with backoff (MediaMTX tolerates the publisher dropping and
-   re-appearing; viewers see a short freeze, not a page error). The same
-   loop tails ffmpeg's segment list and publishes completed archive
-   segments under timestamped names.
+   ingest, WHEP only, only the configured paths); readiness-probed.
+4. **`web_server.py`** — serves the page, `/config.json`, `/archive`, `/video`.
+5. **`pipeline.py`** — probes `h264_nvenc` once, builds the single ffmpeg
+   command, and supervises it: restarts with backoff if it dies (viewers
+   see a short freeze, not a page error), tails the segment list, and
+   publishes completed archive segments under timestamped names.
 
----
+## Build
 
-## Build process
+Single-stage build, no compilation (~600 MB, a few minutes):
 
-Single-stage build, no compilation. The final image is ~600 MB and builds
-in a few minutes (package installs + one download).
+```bash
+make service hub     # or: podman build -t desktop-stream-service:ci service/
+```
 
 | Component | Source | Air-gap story |
 |---|---|---|
 | ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL10) | mirror the repo |
 | Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | mirror the repos |
-| MediaMTX | GitHub release binary, **pinned version + sha256** | vendor one tarball into the internal artifact store, pass `--build-arg MEDIAMTX_URL=…` |
-| Web page + WHEP client | `service/web/` (index.html, style.css, app.js) | in-repo, no build step |
+| MediaMTX | GitHub release binary, **pinned version + sha256** | vendor the tarball, pass `--build-arg MEDIAMTX_URL=…` |
+| Web page + WHEP client | `service/web/` | in-repo, no build step |
 
-Two things to watch:
+Watch out for:
 
-- **Do not install EPEL's `ffmpeg-free`** — it conflicts with RPM Fusion's
-  `ffmpeg-libs` and lacks NVENC. The Containerfile asserts `h264_nvenc` and
-  `x11grab` are present at build time.
-- **MediaMTX cannot be built with `go install`** — its build requires
-  `go generate`, which downloads assets from GitHub. Vendoring the release
-  binary is the supported path (checksum-verified via `MEDIAMTX_SHA256`).
+- **EPEL's `ffmpeg-free`** conflicts with RPM Fusion's `ffmpeg-libs` and
+  lacks NVENC — the Containerfile asserts `h264_nvenc` and `x11grab` at
+  build time.
+- **MediaMTX can't be built with `go install`** (its `go generate` fetches
+  assets); vendoring the checksum-verified release binary is the supported
+  path.
 
-```bash
-# Build (service and hub are independent)
-make service hub
-# or directly:
-podman build -t desktop-stream-service:ci service/
-```
+## Running
 
----
-
-## Running the container
-
-### Prerequisites
-
-- Docker/Podman on a Linux host with an active X11 display
-- The host display must accept connections from the container
-
-```bash
-xhost +local:docker
-```
-
-### Run
+Prerequisites: Docker/Podman on a Linux host with an active X11 display
+that accepts the container's connections (`xhost +local:docker`, or mount
+an Xauthority file and set `-e XAUTHORITY`).
 
 ```bash
 docker run --rm \
@@ -274,64 +148,32 @@ docker run --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v /srv/archive:/archive \
   desktop-stream-service:ci
+# open http://localhost:8080
 ```
 
-Then open **http://localhost:8080** in a browser.
+> **Why `--network=host`?** WebRTC media flows over UDP; with host
+> networking MediaMTX advertises the host's real addresses as ICE
+> candidates. Without it, publish `-p 8080:8080 -p 8889:8889 -p 8189:8189/udp`
+> and set `-e WEBRTC_ADDITIONAL_HOSTS=<host-ip>` so viewers get a
+> reachable address.
 
-> **Why `--network=host`?**
-> WebRTC media flows over UDP. With host networking, MediaMTX advertises
-> the host's real interface addresses as ICE candidates and browsers
-> connect directly. Without it, publish `-p 8080:8080 -p 8889:8889
-> -p 8189:8189/udp` and set `-e WEBRTC_ADDITIONAL_HOSTS=<host-ip>` so
-> MediaMTX advertises an address viewers can actually reach.
+### NVIDIA GPU encoding
 
-### Using Xauthority (alternative to xhost)
-
-```bash
-docker run --rm \
-  --network=host \
-  -e DISPLAY=:0 \
-  -e XAUTHORITY=/root/.Xauthority \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  -v "$HOME/.Xauthority:/root/.Xauthority:ro" \
-  desktop-stream-service:ci
-```
-
----
-
-## NVIDIA GPU encoding
-
-With an NVIDIA GPU and
+Add `--gpus all` (with
 [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-(or Podman CDI injection), all encodes run on the GPU's NVENC hardware:
+or Podman CDI) and all encodes run on NVENC. `pipeline.py` probes
+`h264_nvenc` at startup and falls back to `libx264` automatically — the log
+shows `Pipeline mode: GPU (h264_nvenc)` or `CPU (libx264)`.
 
-```bash
-docker run --rm --gpus all \
-  --network=host \
-  -e DISPLAY=:0 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  desktop-stream-service:ci
-```
-
-- `pipeline.py` probes `h264_nvenc` once at startup with a one-frame test
-  encode; if the driver libraries aren't injected it falls back to
-  `libx264` automatically. The startup log shows which path was chosen
-  (`Pipeline mode: GPU (h264_nvenc)` / `CPU (libx264)`).
-- **Session budget**: every (stream, tier) pair plus the archive is one
-  concurrent NVENC session. Consumer GeForce GPUs allow 8 concurrent
-  sessions; datacenter GPUs are unrestricted. The default 2-tier ladder
-  with two monitors uses 7 sessions.
-- Capture and scaling run on the CPU (the RPM Fusion ffmpeg build has no
-  CUDA scale filters); only encoding is offloaded.
-
-Verify: `nvidia-smi dmon -s u -d 1` on the host while streaming, or check
-the startup log.
-
----
+- **Session budget:** every (stream, tier) pair plus the archive is one
+  concurrent NVENC session. Consumer GeForce GPUs allow 8; the default
+  2-tier ladder with two monitors uses 7.
+- Capture and scaling stay on the CPU (this ffmpeg build has no CUDA scale
+  filters); only encoding is offloaded.
 
 ## Configuration reference
 
-All settings are environment variables passed to `docker run -e`.
+All settings are environment variables (`docker run -e`).
 
 ### Capture and streams
 
@@ -339,52 +181,51 @@ All settings are environment variables passed to `docker run -e`.
 |---|---|---|
 | `DISPLAY` | `:0` | X11 display to capture |
 | `DESKTOP_NAME` | `desktop` | Page-header label; also the archive filename prefix |
-| `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR |
+| `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR. If set below native, provide `DESKTOP_SPLITS` in frame coordinates — auto-detected monitor regions are native-pixel and won't fit |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
 | `DESKTOP_SPLITS` | _(auto)_ | Per-screen regions `WxH+X+Y;…`; unset auto-detects monitors via RandR |
-| `LIVE_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the per-stream tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
+| `LIVE_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
 
 ### Live encoding
 
 | Variable | Default | Description |
 |---|---|---|
 | `LIVE_CQ` | `18` | Constant-quality target (H.264 QP scale; 18 ≈ visually lossless) |
-| `LIVE_MAXRATE` | `8M` | Hard bitrate cap for the full-res tier — **set this to the worst-case provisioned per-viewer bandwidth**. Smaller tiers are capped proportionally to pixel count |
+| `LIVE_MAXRATE` | `8M` | Hard bitrate cap for the full-res tier — **set to the worst-case provisioned per-viewer bandwidth**. Smaller tiers are capped proportionally to pixel count |
 | `LIVE_BUFSIZE` | 2× maxrate | VBV buffer; smaller = smoother bitrate, larger = more motion detail |
-| `LIVE_GOP` | = framerate | Keyframe interval in frames. This is also the worst-case viewer join delay (MediaMTX cannot request keyframes from the publisher) — keep it at ~1 s |
+| `LIVE_GOP` | = framerate | Keyframe interval in frames — also the worst-case viewer join delay; keep at ~1 s |
 
-There is no congestion-control feedback loop to the encoder (the old
-per-viewer REMB adaptation was a webrtcsink feature): the encode is shared
-by all viewers of a tier and holds constant quality under the `LIVE_MAXRATE`
-cap. On a provisioned network, cap at the provisioned rate and motion
-bursts appear as brief clarity dips instead of packet loss. See the
-rate-control decision record in `service/stream_command.py` (including the
-fixed-CBR alternative and when to prefer it).
+There is no congestion-control feedback to the encoder (the old per-viewer
+REMB adaptation was a webrtcsink feature): one encode is shared by all
+viewers of a tier and holds constant quality under `LIVE_MAXRATE`. Motion
+bursts appear as brief clarity dips, never packet loss. See the
+rate-control decision record in `service/stream_command.py` for the
+fixed-CBR alternative.
 
 ### Ports / MediaMTX
 
 | Variable | Default | Description |
 |---|---|---|
 | `WEB_PORT` | `8080` | HTTP page server |
-| `WEB_DIR` | `/var/www/html` | Static file root for the page server (set by the image; rarely changed) |
+| `WEB_DIR` | `/var/www/html` | Static file root (set by the image; rarely changed) |
 | `WHEP_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
 | `WEBRTC_UDP_PORT` | `8189` | MediaMTX ICE/UDP media port (browser-facing) |
 | `MEDIAMTX_RTSP_PORT` | `8554` | Loopback-only RTSP ingest (ffmpeg → MediaMTX) |
-| `WEBRTC_ADDITIONAL_HOSTS` | _(empty)_ | Comma-separated extra IPs/hostnames to advertise as ICE candidates (needed when not on host networking, or behind NAT) |
+| `WEBRTC_ADDITIONAL_HOSTS` | _(empty)_ | Extra IPs/hostnames to advertise as ICE candidates (needed off host networking or behind NAT) |
 
 ### Archive
 
 | Variable | Default | Description |
 |---|---|---|
 | `ARCHIVE_DIR` | `/archive` | Completed, timestamp-named segments |
-| `ARCHIVE_LIVE_DIR` | `/archive-live` | In-progress segment (readable mid-write — fragmented MP4 with moov up front) |
+| `ARCHIVE_LIVE_DIR` | `/archive-live` | In-progress segment (readable mid-write — fragmented MP4, moov up front) |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration |
 | `ARCHIVE_QUALITY` | `visually-lossless` | `visually-lossless` (constant QP), `lossless` (NVENC lossless tune / x264 QP 0), or `legacy` (fixed-bitrate VBR) |
 | `ARCHIVE_QP` | `18` | QP for `visually-lossless` mode |
 | `ARCHIVE_BITRATE` | `6000` | kbps, `legacy` mode only |
 | `ARCHIVE_MAX_BYTES` / `ARCHIVE_MAX_AGE_DAYS` | `0` | Size/age-based purge; 0 = unlimited |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
-| `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output encode quality (QP); tracks the archive quality so there is no second knob to tune |
+| `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output quality; tracks the archive so there's no second knob |
 | `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
 
 ### Page URL parameters
@@ -396,68 +237,42 @@ fixed-CBR alternative and when to prefer it).
 | `?stun=host:port` | Add a STUN server for ICE |
 | `?turn_uri=…&turn_user=…&turn_cred=…` | Add a TURN relay for ICE |
 
----
-
 ## Verifying it works
 
-**1 — Encoders and capture present in the image:**
-
 ```bash
+# 1 — encoders present in the image
 docker run --rm --entrypoint ffmpeg desktop-stream-service:ci \
   -hide_banner -encoders | grep -E 'h264_nvenc|libx264'
-```
 
-**2 — Full X11 stream:**
+# 2 — run it (see Running above), open http://localhost:8080
 
-```bash
-xhost +local:docker
-docker run --rm --network=host \
-  -e DISPLAY=:0 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
-  desktop-stream-service:ci
-# Open http://localhost:8080
-```
-
-**3 — WHEP endpoint answers:**
-
-```bash
+# 3 — WHEP endpoint answers
 curl -i -X OPTIONS http://localhost:8889/full_t0/whep   # expect 2xx
+
+# 4 — archive is being written (after the first rotation)
+ls /srv/archive          # timestamped *_to_*.mp4
 ```
 
-**4 — Archive is being written:**
-
-```bash
-ls /srv/archive          # timestamped *_to_*.mp4 after the first rotation
-```
-
-**5 — Automated suites:** `make test` (pure-Python unit tests) and
-`make functional` (browser-driven container integration in
-`functional-tests/`, including color/archive
-verification) — both run in CI on every push.
-
----
+Automated suites: `make test` (pure-Python unit tests) and
+`make functional` (Java, browser-driven container integration) — both run
+in CI on every push.
 
 ## Migration from the GStreamer stack
 
-The previous version captured with GStreamer (`ximagesrc` → CUDA convert/
-scale → `webrtcsink`) and required building gst-plugins-rs (Rust), usrsctp,
-and a patched gst-plugins-bad from source, plus a WebSocket signalling
-server per tier. All of that is gone:
+The previous version required source builds of gst-plugins-rs (Rust),
+usrsctp, and a patched gst-plugins-bad, plus a WebSocket signalling server
+per tier. All gone:
 
 | Before | After |
 |---|---|
-| `base/` builder image (~5 GB, 20–40 min Rust/meson builds) | none — single-stage `service/Containerfile` |
-| gst-plugins-rs pin ↔ GStreamer version matching | n/a |
-| `gst-webrtc-signalling-server`, one port per (stream × tier), 8443+N | one WHEP port (`8889/tcp`) + one media port (`8189/udp`) |
+| `base/` builder image (~5 GB, 20–40 min Rust/meson builds) | single-stage `service/Containerfile` |
+| Signalling server, one port per (stream × tier), 8443+N | one WHEP port (`8889/tcp`) + one media port (`8189/udp`) |
 | gstwebrtc-api npm bundle | same-origin WHEP client in `app.js` |
-| VP9 default codec, per-viewer encoders, REMB adaptation to 80 Mbps | H.264, one shared encode per tier, constant quality capped at `LIVE_MAXRATE` |
-| splitmuxsink/mp4mux archive (moov at EOS; mdat-walker remux to serve the active segment) | ffmpeg segment muxer fMP4 (moov up front; active segment served by plain copy) |
-| Lazy per-consumer encoders (idle tiers free) | every tier always encoded → default ladder reduced to `1.0,0.5` |
+| VP9, per-viewer encoders, REMB adaptation to 80 Mbps | H.264, one shared encode per tier, constant quality capped at `LIVE_MAXRATE` |
+| splitmuxsink archive (moov at EOS; mdat-walker remux to serve the active segment) | ffmpeg segment muxer fMP4 (moov up front; active segment served by plain copy) |
+| Lazy per-consumer encoders (idle tiers free) | every tier always encoded → default ladder `1.0,0.5` |
 
-Operational notes:
-
-- Firewalls: close 8443–8751/tcp, open 8889/tcp + 8189/udp.
-- Any dashboards or scripts reading `/config.json` should switch from
-  `signallingPort` fields to `whepPath` + `webrtcPort`.
-- Archive file naming, `/archive` and `/video` endpoints, and purge
-  behaviour are unchanged.
+Operational notes: close 8443–8751/tcp, open 8889/tcp + 8189/udp; scripts
+reading `/config.json` switch from `signallingPort` fields to `whepPath` +
+`webrtcPort`; archive naming, `/archive`, `/video`, and purge behaviour are
+unchanged.

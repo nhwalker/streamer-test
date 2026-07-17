@@ -49,7 +49,8 @@ mediamtx /run/desktop-stream/mediamtx.yml &
 MTXPID=$!
 
 PIPPID=""
-trap 'echo "[service] Shutting down..."; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; kill "${MTXPID}" 2>/dev/null; exit' \
+WEBPID=""
+trap 'echo "[service] Shutting down..."; [ -n "${PIPPID}" ] && kill "${PIPPID}" 2>/dev/null; [ -n "${WEBPID}" ] && kill "${WEBPID}" 2>/dev/null; kill "${MTXPID}" 2>/dev/null; exit' \
      EXIT INT TERM
 
 # Readiness probe -- wait up to 30 s for the RTSP listener.  MediaMTX
@@ -78,11 +79,17 @@ fi
 echo "[service] MediaMTX ready."
 
 # ── Web server ───────────────────────────────────────────────────────────────
+# NOTE: the functional-test harness (ServiceStack.java) waits for this exact
+# "web server on port" log line — keep it if you reword the message.
 echo "[service] Starting web server on port ${WEB_PORT} ..."
 python3 /usr/local/bin/web_server.py &
+WEBPID=$!
 
 # ── Access info ──────────────────────────────────────────────────────────────
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+# `|| true` guards set -e/pipefail: hostname may be missing from the image
+# or fail entirely; ${HOST_IP:-} then also covers empty output.
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+HOST_IP="${HOST_IP:-localhost}"
 echo ""
 echo "┌─────────────────────────────────────────────────────┐"
 echo "│  Desktop Stream Service ready                       │"

@@ -82,6 +82,49 @@ def _copy_active_to_stage(src_fd, dst):
             if not chunk:
                 break
             out.write(chunk)
+    if not _truncate_to_complete_boxes(dst):
+        # ftyp+moov but not one whole fragment yet: with empty_moov the
+        # moov holds no samples, so this file contains zero frames and
+        # ffmpeg (the /video path) errors out on it.  Skip the active
+        # segment; it becomes servable as soon as a fragment lands.
+        raise OSError('active segment has no complete fragment yet')
+
+
+def _truncate_to_complete_boxes(path):
+    """Trim a staged fMP4 copy to the last complete moof+mdat pair; return
+    True when at least one complete movie fragment survived.
+
+    The live segment is copied mid-write, so the copy can end inside a
+    moof/mdat pair.  Browsers ignore a truncated trailing fragment, but
+    /video pipes the staged file into ffmpeg, which rejects both a
+    mid-box cut and a complete moof whose mdat is missing (the moof
+    references sample data that isn't there).  So the walk keeps whole
+    top-level boxes only (4-byte big-endian size + type) and then also
+    drops a trailing moof left without its mdat.
+
+    Unusual headers (size 0 = "to EOF", size 1 = 64-bit extended) stop
+    the walk conservatively: everything from that box on is dropped.
+    """
+    size = os.path.getsize(path)
+    boxes = []          # (type, end_offset) of each complete top-level box
+    with open(path, 'rb') as fh:
+        off = 0
+        while off + 8 <= size:
+            fh.seek(off)
+            hdr = fh.read(8)
+            if len(hdr) < 8:
+                break
+            box_size = int.from_bytes(hdr[:4], 'big')
+            if box_size < 8 or off + box_size > size:
+                break
+            off += box_size
+            boxes.append((hdr[4:8], off))
+    while boxes and boxes[-1][0] == b'moof':
+        boxes.pop()
+    keep = boxes[-1][1] if boxes else 0
+    if keep and keep < size:
+        os.truncate(path, keep)
+    return any(t == b'moof' for t, _ in boxes)
 
 
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,

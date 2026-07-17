@@ -56,7 +56,7 @@ class SegmentFinalizer:
     def poll(self):
         """Process any newly-completed segments.  Returns count published."""
         try:
-            with open(self.list_path, 'r') as fh:
+            with open(self.list_path) as fh:
                 fh.seek(self._offset)
                 chunk = fh.read()
         except FileNotFoundError:

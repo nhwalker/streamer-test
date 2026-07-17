@@ -7,13 +7,11 @@ archive dir under timestamped names.  No ffmpeg required — the tests
 write the CSV by hand.
 """
 import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'service'))
-from archive_finalize import SegmentFinalizer, next_segment_number  # noqa: E402
-from archive_times import parse_segment_times  # noqa: E402
+from archive_finalize import SegmentFinalizer, next_segment_number
+from archive_times import parse_segment_times
 
 ANCHOR = 1_700_000_000.0  # arbitrary fixed epoch anchor
 
