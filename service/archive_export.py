@@ -82,6 +82,38 @@ def _copy_active_to_stage(src_fd, dst):
             if not chunk:
                 break
             out.write(chunk)
+    _truncate_to_complete_boxes(dst)
+
+
+def _truncate_to_complete_boxes(path):
+    """Trim a staged fMP4 copy back to the last complete top-level box.
+
+    The live segment is copied mid-write, so the copy can end inside a
+    moof/mdat pair.  Browsers ignore a truncated trailing fragment, but
+    /video pipes the staged file into ffmpeg, which can reject it with
+    "invalid data" depending on where the cut landed.  Walking the
+    top-level box headers (4-byte big-endian size + type) and truncating
+    at the last complete boundary makes the copy always end cleanly.
+
+    Unusual headers (size 0 = "to EOF", size 1 = 64-bit extended) stop
+    the walk conservatively: everything from that box on is dropped.
+    """
+    size = os.path.getsize(path)
+    keep = 0
+    with open(path, 'rb') as fh:
+        off = 0
+        while off + 8 <= size:
+            fh.seek(off)
+            hdr = fh.read(8)
+            if len(hdr) < 8:
+                break
+            box_size = int.from_bytes(hdr[:4], 'big')
+            if box_size < 8 or off + box_size > size:
+                break
+            off += box_size
+            keep = off
+    if keep and keep < size:
+        os.truncate(path, keep)
 
 
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,

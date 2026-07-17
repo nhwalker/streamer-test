@@ -403,12 +403,14 @@ class TestCopyActiveToStage:
         with open(dst, 'rb') as fh:
             assert fh.read() == content
 
-    def test_truncated_trailing_fragment_still_copied(self, tmp_path):
-        # A partial trailing box (mid-write) is fine — players ignore it.
-        content = (_box(b'ftyp') + _box(b'moov', b'\x00' * 700)
-                   + _box(b'mdat', b'\x01' * 900)[:400])
+    def test_truncated_trailing_fragment_is_trimmed(self, tmp_path):
+        # A partial trailing box (mid-write) is dropped from the staged
+        # copy so downstream ffmpeg (/video) always sees a clean fMP4.
+        complete = _box(b'ftyp') + _box(b'moov', b'\x00' * 700)
+        content = complete + _box(b'mdat', b'\x01' * 900)[:400]
         dst = self._run_copy(tmp_path, content)
-        assert os.path.getsize(dst) == len(content)
+        with open(dst, 'rb') as fh:
+            assert fh.read() == complete
 
     def test_ftyp_only_file_rejected(self, tmp_path):
         with pytest.raises(OSError, match='moov'):
@@ -491,3 +493,60 @@ class TestStageAndZip:
                 assert content in [zf.read(n) for n in names]
         finally:
             tmp.cleanup()
+
+
+# ── _truncate_to_complete_boxes ───────────────────────────────────────────────
+
+class TestTruncateToCompleteBoxes:
+    """The staged active-segment copy must always end on a complete
+    top-level box so /video's ffmpeg never sees a mid-fragment cut."""
+
+    def _write(self, tmp_path, data):
+        p = tmp_path / 'staged.mp4'
+        p.write_bytes(data)
+        return str(p)
+
+    def test_complete_file_untouched(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        data = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
+                + _box(b'moof') + _box(b'mdat', b'z' * 100))
+        p = self._write(tmp_path, data)
+        _truncate_to_complete_boxes(p)
+        assert open(p, 'rb').read() == data
+
+    def test_partial_trailing_box_dropped(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        good = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24) + _box(b'moof')
+        partial = (100).to_bytes(4, 'big') + b'mdat' + b'z' * 20  # claims 100, has 28
+        p = self._write(tmp_path, good + partial)
+        _truncate_to_complete_boxes(p)
+        assert open(p, 'rb').read() == good
+
+    def test_bare_header_fragment_dropped(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
+        p = self._write(tmp_path, good + b'\x00\x00')  # 2 stray bytes
+        _truncate_to_complete_boxes(p)
+        assert open(p, 'rb').read() == good
+
+    def test_size_zero_box_stops_walk(self, tmp_path):
+        from archive_export import _truncate_to_complete_boxes
+        good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
+        weird = (0).to_bytes(4, 'big') + b'mdat' + b'z' * 40  # size 0 = "to EOF"
+        p = self._write(tmp_path, good + weird)
+        _truncate_to_complete_boxes(p)
+        assert open(p, 'rb').read() == good
+
+    def test_staged_copy_is_truncated_end_to_end(self, tmp_path):
+        """_copy_active_to_stage applies the trim to what it writes."""
+        good = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24) + _box(b'mdat', b'z' * 16)
+        partial = (64).to_bytes(4, 'big') + b'moof' + b'w' * 10
+        src = tmp_path / 'active.mp4'
+        src.write_bytes(good + partial)
+        dst = str(tmp_path / 'staged.mp4')
+        fd = os.open(str(src), os.O_RDONLY)
+        try:
+            _copy_active_to_stage(fd, dst)
+        finally:
+            os.close(fd)
+        assert open(dst, 'rb').read() == good
