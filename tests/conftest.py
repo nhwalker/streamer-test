@@ -7,7 +7,7 @@ Fixture dependency graph:
          │                                                 │
          ▼                                                 │
     _service (session)  ── runs service container;        │
-         │                  ximagesrc captures xvfb_display,
+         │                  ffmpeg x11grab captures xvfb_display,
          │                  mounts archive_dir as /archive,
          │                  mounts archive_live_dir as /archive-live
          ▼
@@ -40,9 +40,9 @@ STREAM_WIDTH  = 1280
 STREAM_HEIGHT = 720
 CROP_HEIGHT   = STREAM_HEIGHT // 2   # 360 — split point for top/bottom tests
 
-SERVICE_SIGNALLING_PORT = 8443   # service's browser-facing signalling (full stream)
-WS_PORT_TOP             = 8444   # service top-half signalling
-WS_PORT_BOTTOM          = 8445   # service bottom-half signalling
+# Regular chain uses the image defaults: MediaMTX WHEP on 8889 (UDP 8189),
+# RTSP loopback ingest on 8554.
+WEBRTC_PORT             = 8889
 HTTP_PORT               = 8080
 
 # Two-tone chain (separate Xvfb/service for crop-offset colour tests).
@@ -63,13 +63,13 @@ HUB_TEST_STREAMS = [
 ]
 
 TWO_TONE_DISPLAY                  = ":98"
-TWO_TONE_SIGNALLING_PORT          = 8453   # +1 = 8454 (top), +2 = 8455 (bottom)
-TWO_TONE_WS_PORT_TOP              = 8454
-TWO_TONE_WS_PORT_BOTTOM           = 8455
 TWO_TONE_HTTP_PORT                = 8090
+TWO_TONE_WEBRTC_PORT              = 9889
+TWO_TONE_WEBRTC_UDP_PORT          = 9189
+TWO_TONE_RTSP_PORT                = 9554
 
-# Optional TURN config for both sides.
-GST_TURN_SERVER    = os.environ.get("GST_WEBRTC_TURN_SERVER", "")
+# Optional TURN config for the browser side (MediaMTX serves host
+# candidates on loopback, so the server side needs no relay).
 WEBRTC_TURN_SERVER = os.environ.get("WEBRTC_TURN_SERVER", "")
 WEBRTC_TURN_USER   = os.environ.get("WEBRTC_TURN_USER", "")
 WEBRTC_TURN_CRED   = os.environ.get("WEBRTC_TURN_CRED", "")
@@ -218,30 +218,49 @@ def archive_dir(tmp_path_factory):
 def archive_live_dir(tmp_path_factory):
     """Host directory mounted into the service container as /archive-live.
 
-    Holds the in-progress segment that splitmuxsink is currently writing.
+    Holds the in-progress segment that ffmpeg is currently writing.
     """
     path = tmp_path_factory.mktemp("archive_live")
     os.chmod(path, 0o777)
     return str(path)
 
 
+def _wait_for_logs_or_dump(container, pattern, timeout):
+    """wait_for_logs, but re-raise startup timeouts with the FULL container log.
+
+    testcontainers' TimeoutError includes only the last few log lines,
+    which hides the actual startup error (e.g. a MediaMTX port-bind
+    failure logged 30 lines earlier).
+    """
+    try:
+        wait_for_logs(container, pattern, timeout=timeout)
+    except TimeoutError as exc:
+        stdout, stderr = container.get_logs()
+        raise TimeoutError(
+            f"did not see {pattern!r} within {timeout}s.\n"
+            f"===== container stdout =====\n{stdout.decode(errors='replace')}\n"
+            f"===== container stderr =====\n{stderr.decode(errors='replace')}"
+        ) from exc
+
+
 # ── Service ──────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="session")
 def _service(xvfb_display, archive_dir, archive_live_dir):
     """
-    The service container: ximagesrc captures the Xvfb display → tee →
-    archive + webrtcsink.
+    The service container: ffmpeg x11grab captures the Xvfb display →
+    live RTSP tiers into MediaMTX (WHEP egress) + archive segments.
     """
     container = (
         DockerContainer(SERVICE_IMAGE)
         .with_env("DISPLAY", xvfb_display)
-        .with_env("SIGNALLING_PORT", str(SERVICE_SIGNALLING_PORT))
         .with_env("DESKTOP_NAME", "stream")
         .with_env("STREAM_WIDTH", str(STREAM_WIDTH))
         .with_env("STREAM_HEIGHT", str(STREAM_HEIGHT))
         .with_env("DESKTOP_SPLITS", TOP_BOTTOM_SPLITS)
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
-        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
+        # Host networking: make sure loopback is among the advertised ICE
+        # candidates so the CI browser can connect over 127.0.0.1.
+        .with_env("WEBRTC_ADDITIONAL_HOSTS", "127.0.0.1")
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         .with_volume_mapping(archive_dir, "/archive", "rw")
         .with_volume_mapping(archive_live_dir, "/archive-live", "rw")
@@ -255,16 +274,15 @@ def _service(xvfb_display, archive_dir, archive_live_dir):
 @pytest.fixture(scope="session")
 def streaming_container(_service):
     """
-    Wait until the service's HTTP + WebSocket endpoints are reachable,
-    then yield (http_port, ws_port).
+    Wait until the service's HTTP + WHEP endpoints are reachable,
+    then yield (http_port, webrtc_port).
     """
-    http_port = HTTP_PORT
-    ws_port   = SERVICE_SIGNALLING_PORT
+    http_port   = HTTP_PORT
+    webrtc_port = WEBRTC_PORT
 
-    # Wait until all three signalling servers (full, top, bottom) are ready,
-    # then wait for the web server — they start in that order in entrypoint.sh.
-    wait_for_logs(_service, f"Signalling server :{WS_PORT_BOTTOM} ready", timeout=60)
-    wait_for_logs(_service, "web server on port", timeout=10)
+    # MediaMTX comes up before the web server in entrypoint.sh.
+    _wait_for_logs_or_dump(_service, "MediaMTX ready", timeout=60)
+    _wait_for_logs_or_dump(_service, "web server on port", timeout=10)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -283,7 +301,7 @@ def streaming_container(_service):
             f"Container stderr:\n{stderr.decode()}"
         )
 
-    yield http_port, ws_port
+    yield http_port, webrtc_port
 
 
 @pytest.fixture(scope="session")
@@ -464,18 +482,30 @@ def xvfb_two_tone():
 
 @pytest.fixture(scope="session")
 def _service_two_tone(xvfb_two_tone):
-    """Service container capturing the two-tone Xvfb display directly."""
+    """Service container capturing the two-tone Xvfb display directly.
+
+    All listening ports are shifted so this chain can coexist with the
+    regular chain on a host-networked Docker setup.
+    """
     container = (
         DockerContainer(SERVICE_IMAGE)
         .with_env("DISPLAY", xvfb_two_tone)
-        .with_env("SIGNALLING_PORT", str(TWO_TONE_SIGNALLING_PORT))
         .with_env("DESKTOP_NAME", "stream")
         .with_env("STREAM_WIDTH", str(STREAM_WIDTH))
         .with_env("STREAM_HEIGHT", str(STREAM_HEIGHT))
         .with_env("DESKTOP_SPLITS", TOP_BOTTOM_SPLITS)
         .with_env("WEB_PORT", str(TWO_TONE_HTTP_PORT))
+        .with_env("WEBRTC_PORT", str(TWO_TONE_WEBRTC_PORT))
+        .with_env("WEBRTC_UDP_PORT", str(TWO_TONE_WEBRTC_UDP_PORT))
+        .with_env("MEDIAMTX_RTSP_PORT", str(TWO_TONE_RTSP_PORT))
+        .with_env("WEBRTC_ADDITIONAL_HOSTS", "127.0.0.1")
+        # Single tier: this chain only verifies crop correctness at full
+        # resolution, and it runs while the regular chain's encoders are
+        # still alive — every tier is an always-on encode in the ffmpeg
+        # stack, so trimming the ladder halves this chain's CPU load on
+        # the shared CI runner.
+        .with_env("WEBRTC_SCALE_LADDER", "1.0")
         .with_env("ARCHIVE_SEGMENT_SEC", "20")
-        .with_env("GST_WEBRTC_TURN_SERVER", GST_TURN_SERVER)
         .with_volume_mapping("/tmp/.X11-unix", "/tmp/.X11-unix", "rw")
         .with_kwargs(network_mode="host", ipc_mode="host")
     )
@@ -486,18 +516,14 @@ def _service_two_tone(xvfb_two_tone):
 @pytest.fixture(scope="session")
 def streaming_container_two_tone(_service_two_tone):
     """
-    Wait for the two-tone service's HTTP + all three signalling servers,
-    then yield (http_port, ws_port_full).
+    Wait for the two-tone service's HTTP + WHEP endpoints, then yield
+    (http_port, webrtc_port).
     """
-    http_port = TWO_TONE_HTTP_PORT
-    ws_port   = TWO_TONE_SIGNALLING_PORT
+    http_port   = TWO_TONE_HTTP_PORT
+    webrtc_port = TWO_TONE_WEBRTC_PORT
 
-    wait_for_logs(
-        _service_two_tone,
-        f"Signalling server :{TWO_TONE_WS_PORT_BOTTOM} ready",
-        timeout=60,
-    )
-    wait_for_logs(_service_two_tone, "web server on port", timeout=10)
+    _wait_for_logs_or_dump(_service_two_tone, "MediaMTX ready", timeout=60)
+    _wait_for_logs_or_dump(_service_two_tone, "web server on port", timeout=10)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
@@ -516,7 +542,7 @@ def streaming_container_two_tone(_service_two_tone):
             f"Container stderr:\n{stderr.decode()}"
         )
 
-    yield http_port, ws_port
+    yield http_port, webrtc_port
 
 
 # ── Hub container ─────────────────────────────────────────────────────────────

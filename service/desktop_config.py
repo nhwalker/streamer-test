@@ -3,12 +3,15 @@
 desktop_config.py -- single source of truth for desktop name, capture
 resolution, and per-screen splits.
 
-The container's three Python processes (pipeline.py, web_server.py, and the
-entrypoint helper) each load the same config so they agree on:
+The container's Python processes (pipeline.py, web_server.py, and the
+entrypoint helpers) each load the same config so they agree on:
 
   * The desktop name (page header + archive filename prefix).
   * The capture width x height.
-  * The list of named screen regions, each with its WebRTC signalling port.
+  * The list of named screen regions.
+  * The per-stream tier ladder and each tier's MediaMTX path (whepPath),
+    which doubles as the ffmpeg RTSP publish path and the browser's WHEP
+    endpoint (http://<host>:<webrtcPort>/<whepPath>/whep).
 
 Inputs (environment variables, evaluated once at container start):
 
@@ -20,34 +23,33 @@ Inputs (environment variables, evaluated once at container start):
   STREAM_WIDTH      Capture width.  Empty = native screen width via xrandr.
   STREAM_HEIGHT     Capture height. Empty = native screen height via xrandr.
 
-  STREAM_FRAMERATE  Target frames-per-second.  Drives the videorate caps
-                    filter and surfaced in /config.json so the browser
-                    gumball can gate its top quality tiers on the delivered
-                    fps matching the target.  Default: 30.
+  STREAM_FRAMERATE  Target frames-per-second.  Drives ffmpeg's x11grab
+                    -framerate and is surfaced in /config.json so the
+                    browser gumball can gate its top quality tiers on the
+                    delivered fps matching the target.  Default: 30.
 
   DESKTOP_SPLITS    Semicolon-separated 'WxH+X+Y' regions.  Empty triggers
                     RandR auto-detection of the connected monitors.
 
-  SIGNALLING_PORT   Base port for browser-facing signalling servers.
-                    Screen i uses SIGNALLING_PORT + 1 + i for its scale-1.0
-                    tier; subsequent tiers add SIGNALLING_PORT_STRIDE per
-                    tier index.
+  WEBRTC_PORT       MediaMTX WHEP/HTTP port surfaced to the browser via
+                    /config.json.  Default: 8889.
 
   WEBRTC_SCALE_LADDER  Comma-separated fractional scales for the per-stream
-                       webrtcsink ladder.  Each browser auto-picks the
-                       smallest tier whose dimensions still meet its
-                       rendered video size, so an idle small-window viewer
-                       pulls a 1/4-pixel-count stream instead of forcing
-                       the encoder to deliver full-source frames it would
-                       just downscale on the client.
+                       tier ladder.  Each browser auto-picks the smallest
+                       tier whose dimensions still meet its rendered video
+                       size.  Unlike the old per-consumer webrtcsink
+                       encoders, every tier is encoded continuously by
+                       ffmpeg — each ladder entry costs one always-on
+                       encode per stream, so keep the ladder short.
 
                        Accepts decimals (``"0.5"``), ints (``"1"``) and
                        ratios (``"1/3"``).  Values must be in (0, 1.0]; the
                        ``1.0`` tier is always included.  Default:
-                       ``"1.0,0.75,0.5,0.25"``.
+                       ``"1.0,0.5"``.
 
-  SIGNALLING_PORT_STRIDE  Spacing between successive tier ports per stream.
-                          Default 100 (full=8443/8543/8643/8743, ...).
+  SIGNALLING_PORT / SIGNALLING_PORT_STRIDE
+                       Deprecated (pre-MediaMTX WebSocket signalling).
+                       Ignored with a warning when set.
 
 The computed config is written to /run/desktop-stream/config.json by the
 entrypoint and read by the other processes via load_config().
@@ -61,17 +63,27 @@ CONFIG_PATH_DEFAULT = '/run/desktop-stream/config.json'
 
 _GEOM_RE = re.compile(r'^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$')
 
-# Defaults for the WebRTC tier ladder (see _parse_scale_ladder).
-_DEFAULT_SCALE_LADDER = '1.0,0.75,0.5,0.25'
+# Defaults for the WebRTC tier ladder (see _parse_scale_ladder).  Two tiers:
+# every ladder entry is a continuously-running ffmpeg encode per stream, so
+# the default stays small (full + half); widen per deployment if needed.
+_DEFAULT_SCALE_LADDER = '1.0,0.5'
 # Tiers smaller than this in either dimension are skipped (except the 1.0
 # tier, which is always kept).  WebRTC video below ~64px is rarely useful and
 # small encoded sizes hit codec floors anyway.
 _TIER_MIN_DIM       = 64
-# Hard cap on tier count so a misconfigured ladder can't blow up port
-# allocation or pipeline element count.
+# Hard cap on tier count so a misconfigured ladder can't blow up the encoder
+# session count or pipeline output count.
 _TIER_MAX_COUNT     = 8
 # Dedup tolerance — two scales that differ by less than this are the same.
 _SCALE_EPS          = 1e-6
+
+_DEFAULT_WEBRTC_PORT = 8889
+
+_DEPRECATED_ENV = ('SIGNALLING_PORT', 'SIGNALLING_PORT_STRIDE',
+                   'SIGNALLING_HOST', 'STREAM_CODEC',
+                   'GST_WEBRTC_STUN_SERVER', 'GST_WEBRTC_TURN_SERVER',
+                   'WEBRTC_MIN_BITRATE', 'WEBRTC_START_BITRATE',
+                   'WEBRTC_MAX_BITRATE')
 
 
 def _parse_scale_ladder(env):
@@ -109,9 +121,7 @@ def _parse_scale_ladder(env):
             )
         out.append(value)
 
-    # Ensure 1.0 is always present — every stream needs a passthrough tier
-    # so the legacy fullSignallingPort / screen.signallingPort fields below
-    # remain meaningful.
+    # Ensure 1.0 is always present — every stream needs a passthrough tier.
     if not any(abs(v - 1.0) < _SCALE_EPS for v in out):
         out.append(1.0)
 
@@ -143,8 +153,8 @@ def _compute_tiers(base_w, base_h, scales, min_dim=_TIER_MIN_DIM):
     seen_dims = set()
     for scale in scales:
         # round-half-to-even into pixels, then snap to nearest even.  We
-        # need even dims because videoscale's NV12/I420 paths refuse odd
-        # widths/heights (YUV 4:2:0 sub-sampling).
+        # need even dims because H.264 4:2:0 encoders refuse odd
+        # widths/heights (YUV chroma sub-sampling).
         w = max(2, 2 * round(base_w * scale / 2))
         h = max(2, 2 * round(base_h * scale / 2))
         is_passthrough = abs(scale - 1.0) < _SCALE_EPS
@@ -286,7 +296,7 @@ def _name_regions(regions):
 
 
 def _crops_from_region(region, frame_w, frame_h):
-    """Compute videocrop edge trims that select *region* out of frame_w x frame_h."""
+    """Compute crop edge trims that select *region* out of frame_w x frame_h."""
     return {
         'left':   max(0, region['x']),
         'top':    max(0, region['y']),
@@ -321,6 +331,12 @@ def compute_config(env=None):
     """
     env = env if env is not None else os.environ
 
+    for var in _DEPRECATED_ENV:
+        if (env.get(var) or '').strip():
+            print(f'[desktop_config] WARNING: {var} is deprecated and '
+                  'ignored — WebRTC is served by MediaMTX on WEBRTC_PORT '
+                  '(default 8889).', file=sys.stderr)
+
     display   = env.get('DISPLAY', ':0')
 
     width_raw  = (env.get('STREAM_WIDTH')  or '').strip()
@@ -338,8 +354,7 @@ def compute_config(env=None):
         width  = int(width_raw)  if width_raw  else native_w
         height = int(height_raw) if height_raw else native_h
 
-    sig_port    = int(env.get('SIGNALLING_PORT',         '8443'))
-    sig_stride  = int(env.get('SIGNALLING_PORT_STRIDE',  '100'))
+    webrtc_port = int(env.get('WEBRTC_PORT', str(_DEFAULT_WEBRTC_PORT)))
     framerate   = int((env.get('STREAM_FRAMERATE')   or  '30').strip())
     scales      = _parse_scale_ladder(env)
 
@@ -350,49 +365,34 @@ def compute_config(env=None):
     # reorder the regions, so look them up by identity from the original list.
     region_to_crop = {id(s['region']): s['crop'] for s in splits}
 
-    # Stream index 0 is the full-frame; screens are 1..N.  Each (stream,
-    # tier) pair uses port = SIGNALLING_PORT + stream_idx + stride * tier_idx.
-    # The stride defaults to 100, leaving room for up to ~99 screens before
-    # tier 1's allocation would collide with tier 0 of another stream.  We
-    # assert that explicitly so a misconfigured deployment fails loudly
-    # instead of silently double-binding a port.
-    if len(named) + 1 >= sig_stride:
-        raise ValueError(
-            f'SIGNALLING_PORT_STRIDE={sig_stride} is too small for '
-            f'{len(named) + 1} streams (full + {len(named)} screens)'
-        )
-
-    def _port_for(stream_idx, tier_idx):
-        return sig_port + stream_idx + sig_stride * tier_idx
-
-    def _tier_list_with_ports(tiers, stream_idx):
+    def _tier_list_with_paths(tiers, stream_key):
+        # whepPath is the single stream identifier shared by the ffmpeg
+        # RTSP publish URL, the MediaMTX path table, and the browser's
+        # WHEP endpoint.  Tier index (not scale) keeps names stable for
+        # any ladder: full_t0, full_t1, left_t0, ...
         return [
             {
-                'scale':          t['scale'],
-                'width':          t['width'],
-                'height':         t['height'],
-                'signallingPort': _port_for(stream_idx, tier_idx),
+                'scale':    t['scale'],
+                'width':    t['width'],
+                'height':   t['height'],
+                'whepPath': f'{stream_key}_t{tier_idx}',
             }
             for tier_idx, t in enumerate(tiers)
         ]
 
-    full_tiers = _tier_list_with_ports(
-        _compute_tiers(width, height, scales), stream_idx=0)
+    full_tiers = _tier_list_with_paths(
+        _compute_tiers(width, height, scales), 'full')
 
     screens = []
-    for i, (region, name) in enumerate(named):
+    for region, name in named:
         crop = region_to_crop[id(region)]
-        stream_idx = i + 1
-        screen_tiers = _tier_list_with_ports(
+        screen_tiers = _tier_list_with_paths(
             _compute_tiers(region['width'], region['height'], scales),
-            stream_idx=stream_idx,
+            name,
         )
         screens.append({
             'name':            name,
             'path':            f'/{name}',
-            # signallingPort is the scale=1.0 (tier 0) port — kept for
-            # legacy callers that haven't been taught about the tiers list.
-            'signallingPort':  screen_tiers[0]['signallingPort'],
             'x':               region['x'],
             'y':               region['y'],
             'width':           region['width'],
@@ -409,8 +409,7 @@ def compute_config(env=None):
         'width':               width,
         'height':              height,
         'framerate':           framerate,
-        # Kept for backward compatibility — same value as fullTiers[0].
-        'fullSignallingPort':  full_tiers[0]['signallingPort'],
+        'webrtcPort':          webrtc_port,
         'fullTiers':           full_tiers,
         'screens':             screens,
     }

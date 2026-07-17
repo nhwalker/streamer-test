@@ -129,20 +129,23 @@
       >&nbsp;&nbsp;HW decode: <span id="m-hw">--</span></span>
   </div>
   <div id="video-area">
-    <p id="status">Connecting to signalling server…</p>
+    <p id="status">Connecting…</p>
     <video id="stream" autoplay playsinline muted></video>
   </div>
 
   <!--
-    The webpack bundle sets window.GstWebRTCAPI (not an ES-module export),
-    so it must be loaded as a classic script before the inline script runs.
+    The stream is received over WHEP (WebRTC-HTTP Egress Protocol): one
+    HTTP POST of an SDP offer to MediaMTX's per-path endpoint
+    (http://<host>:<webrtcPort>/<whepPath>/whep), the SDP answer comes
+    back in the response body, and media flows over a normal
+    RTCPeerConnection.  No signalling WebSocket, no client library.
 
     Query parameters:
-      ?signalling=ws://host:8443     Override the signalling server URL.
-                                     The default is read from /config.json
-                                     based on the current URL path.  Pins
-                                     the connection to a single endpoint —
-                                     no tier auto-switching.
+      ?whep=<url>                    Pin the connection to a single WHEP
+                                     endpoint URL (absolute, or relative to
+                                     this page).  The default is built from
+                                     /config.json based on the current URL
+                                     path.  Disables tier auto-switching.
       ?tier=<N>                      Pin a specific tier index (0 = largest /
                                      source resolution, N-1 = smallest).
                                      Disables the ResizeObserver auto-switch.
@@ -151,49 +154,9 @@
                                      of headless viewport size.
       ?stun=stun.l.google.com:19302  Add a STUN server for ICE when the
                                      browser and container are on different hosts.
+      ?turn_uri= / ?turn_user= / ?turn_cred=
+                                     Add a TURN relay for ICE.
   -->
-  <!--
-    GStreamer's webrtcbin uses ssrc-level MSID (a=ssrc:... msid:...) rather than
-    the Unified-Plan m-line-level attribute (a=msid:).  Chrome's Unified-Plan
-    RTCPeerConnection therefore fires ontrack with event.streams = [].
-    gstwebrtc-api checks event.streams[0] and silently returns when it's absent,
-    leaving video.srcObject unset even though the connection is fully established.
-
-    This shim patches RTCPeerConnection BEFORE gstwebrtc-api loads so that every
-    consumer peer connection also has a track listener that creates a MediaStream
-    directly from event.track when event.streams is empty.
-  -->
-  <script>
-    (function () {
-      var _OrigRPC = window.RTCPeerConnection;
-      function PatchedRPC(cfg) {
-        var pc = new _OrigRPC(cfg);
-        window._streamPc = pc;
-        pc.addEventListener('track', function (e) {
-          var vid = document.getElementById('stream');
-          if (!vid || vid.srcObject) return;
-          vid.srcObject = (e.streams && e.streams.length > 0)
-            ? e.streams[0]
-            : new MediaStream([e.track]);
-          // Chrome's autoplay policy rejects play() without a user gesture
-          // unless the element is muted.  The stream has no audio track so
-          // muting is harmless; belt-and-suspenders in case the attribute
-          // was stripped or overridden.
-          vid.muted = true;
-          var p = vid.play();
-          if (p && typeof p.catch === 'function') {
-            p.catch(function (err) {
-              console.warn('[stream] video.play() rejected:', err);
-            });
-          }
-        });
-        return pc;
-      }
-      PatchedRPC.prototype = _OrigRPC.prototype;
-      window.RTCPeerConnection = PatchedRPC;
-    })();
-  </script>
-  <script src="./gstwebrtc-api/gstwebrtc-api.js"></script>
   <script>
     const params   = new URLSearchParams(window.location.search);
     const path     = window.location.pathname.replace(/\/$/, '') || '/';
@@ -215,11 +178,10 @@
     // Returns the routed stream's `tiers` array (descending order — entry 0
     // is the source-resolution passthrough tier) along with display labels
     // and the metric classifier targets.  Each tier carries a fully-formed
-    // `sigUrl` so callers don't have to know about ports or hostnames.
+    // `whepUrl` so callers don't have to know about ports or path naming.
     //
-    // Falls back to a single legacy-port tier if /config.json is missing
-    // (e.g. older container image cached during a rolling upgrade) or
-    // doesn't carry the `fullTiers` / `screens[*].tiers` fields.
+    // Falls back to a synthesised single tier if /config.json is missing
+    // (e.g. older container image cached during a rolling upgrade).
     async function resolveStreamConfig() {
       let cfg = null;
       try {
@@ -227,10 +189,12 @@
         if (r.ok) cfg = await r.json();
       } catch (_) {}
 
-      const host = window.location.hostname;
-      const makeSigUrl = (port) => `ws://${host}:${port}`;
+      const host       = window.location.hostname;
+      const webrtcPort = (cfg && cfg.webrtcPort) || 8889;
+      const makeWhepUrl = (whepPath) =>
+        `${window.location.protocol}//${host}:${webrtcPort}/${whepPath}/whep`;
 
-      let desktopName  = cfg ? cfg.desktopName : null;
+      let desktopName  = cfg ? cfg.desktopName : host;
       let screenLabel  = '';
       let targetFps    = cfg ? cfg.framerate : 30;
 
@@ -250,45 +214,33 @@
         }
       }
 
-      // Build the tier list, attaching a fully-formed sigUrl to each entry.
-      // If the config didn't carry tiers (legacy / cached image), synthesise
-      // a single-entry ladder from the legacy fullSignallingPort /
-      // screen.signallingPort field so the page still works.
       let tiers;
       if (rawTiers && rawTiers.length) {
         tiers = rawTiers.map(t => ({
-          scale:  t.scale,
-          width:  t.width,
-          height: t.height,
-          sigUrl: makeSigUrl(t.signallingPort),
+          scale:   t.scale,
+          width:   t.width,
+          height:  t.height,
+          whepUrl: makeWhepUrl(t.whepPath),
         }));
       } else {
-        let legacyPort = cfg ? cfg.fullSignallingPort : 8443;
-        if (cfg) {
-          const screen = (cfg.screens || []).find(s => s.path === path);
-          if (screen) legacyPort = screen.signallingPort;
-        } else {
-          if (path === '/top')    legacyPort = 8444;
-          if (path === '/bottom') legacyPort = 8445;
-        }
+        // No config — synthesise the conventional tier-0 path from the
+        // page's URL path ('/' → full_t0, '/top' → top_t0, ...).
+        const streamKey = path === '/' ? 'full' : path.slice(1);
         tiers = [{
           scale: 1.0, width: streamWidth, height: streamHeight,
-          sigUrl: makeSigUrl(legacyPort),
+          whepUrl: makeWhepUrl(`${streamKey}_t0`),
         }];
       }
 
-      // ?signalling=… overrides everything to a single pinned endpoint.
-      const sigOverride = params.get('signalling');
-      if (sigOverride) {
+      // ?whep=… overrides everything to a single pinned endpoint.
+      const whepOverride = params.get('whep');
+      if (whepOverride) {
         tiers = [{
           scale: 1.0, width: streamWidth, height: streamHeight,
-          sigUrl: sigOverride,
+          whepUrl: new URL(whepOverride, window.location.href).href,
         }];
       }
 
-      if (!desktopName) {
-        desktopName = tiers[0].sigUrl.replace(/^wss?:\/\//, '').split(':')[0];
-      }
       return { tiers, desktopName, screenLabel,
                targetFps, streamWidth, streamHeight };
     }
@@ -661,115 +613,165 @@
       if (turnUri) iceServers.push({ urls: turnUri, username: turnUser ?? undefined, credential: turnCred ?? undefined });
 
       // Connection lifecycle state.  Each call to connectToTier() tears
-      // down the prior api / session and then opens a new one.  We track
-      // an "intentional teardown" flag so the 'closed' handler doesn't
-      // flash "Stream ended" during a tier switch — the user should only
-      // see that message when the producer actually disappears.
-      let currentApi      = null;
-      let currentSession  = null;
-      let currentTier     = null;
-      let switchingTier   = false;
+      // down the prior peer connection / WHEP session and opens a new
+      // one.  `connectSeq` stamps every async attempt so callbacks and
+      // retry timers from a superseded connection are ignored — the user
+      // should only see "Stream ended" when the producer actually
+      // disappears, never during a tier switch.
+      let currentPc         = null;
+      let currentSessionUrl = null;   // WHEP resource (Location) for DELETE
+      let currentTier       = null;
+      let connectSeq        = 0;
+      let retryTimer        = null;
       // Exposed for functional tests: assert which tier the browser picked.
       window._activeTier  = null;
 
+      const WHEP_RETRY_MS = 2000;
+
       function teardownCurrent() {
-        switchingTier = true;
-        // gstwebrtc-api's ConsumerSession exposes `.close()` for an
-        // orderly teardown (matches the `closed` event we already listen
-        // for).  Guard with a typeof check so an older bundle that lacks
-        // it doesn't crash the page — we'll fall through to nulling the
-        // refs and the next session takes over.
-        try {
-          if (currentSession && typeof currentSession.close === 'function') {
-            currentSession.close();
-          }
-        } catch (_) { /* best-effort */ }
-        currentSession = null;
-        currentApi     = null;
+        connectSeq += 1;              // invalidate in-flight attempts
+        if (retryTimer != null) {
+          clearTimeout(retryTimer);
+          retryTimer = null;
+        }
+        if (currentSessionUrl) {
+          // Best-effort: free the server-side WHEP session immediately
+          // instead of waiting for its ICE timeout.
+          fetch(currentSessionUrl, { method: 'DELETE' }).catch(() => {});
+          currentSessionUrl = null;
+        }
+        if (currentPc) {
+          try { currentPc.close(); } catch (_) {}
+          currentPc = null;
+        }
         video.srcObject = null;
+        stopMetrics();
+      }
+
+      // Resolve once ICE gathering finishes (or after a short timeout —
+      // host candidates on a LAN gather in milliseconds; the timeout only
+      // guards against a wedged mDNS/STUN lookup delaying the POST).
+      function waitIceGathering(pc, timeoutMs = 1000) {
+        if (pc.iceGatheringState === 'complete') return Promise.resolve();
+        return new Promise((resolve) => {
+          const timer = setTimeout(resolve, timeoutMs);
+          pc.addEventListener('icegatheringstatechange', () => {
+            if (pc.iceGatheringState === 'complete') {
+              clearTimeout(timer);
+              resolve();
+            }
+          });
+        });
+      }
+
+      function scheduleRetry(tier, seq, delayMs) {
+        if (seq !== connectSeq) return;
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          if (seq === connectSeq) startWhep(tier, seq);
+        }, delayMs);
+      }
+
+      async function startWhep(tier, seq) {
+        const pc = new RTCPeerConnection({ iceServers });
+        currentPc = pc;
+        window._streamPc = pc;   // metrics loop reads this
+        pc.addTransceiver('video', { direction: 'recvonly' });
+
+        pc.addEventListener('track', (e) => {
+          if (pc !== currentPc) return;
+          video.srcObject = (e.streams && e.streams.length > 0)
+            ? e.streams[0]
+            : new MediaStream([e.track]);
+          // Chrome's autoplay policy rejects play() without a user
+          // gesture unless the element is muted.  The stream has no
+          // audio track so muting is harmless.
+          video.muted = true;
+          const p = video.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch((err) => console.warn('[stream] video.play() rejected:', err));
+          }
+        });
+
+        pc.addEventListener('connectionstatechange', () => {
+          if (pc !== currentPc || seq !== connectSeq) return;
+          if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+            setStatus('Stream ended. Reconnecting…');
+            video.srcObject = null;
+            stopMetrics();
+            try { pc.close(); } catch (_) {}
+            scheduleRetry(tier, seq, WHEP_RETRY_MS);
+          }
+        });
+
+        const hideBanner = () => { status.className = 'hidden'; };
+        video.addEventListener('playing', hideBanner, { once: true });
+        video.addEventListener('loadeddata', hideBanner, { once: true });
+        video.addEventListener('playing', startMetrics, { once: true });
+
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          await waitIceGathering(pc);
+          if (seq !== connectSeq) return;
+
+          const resp = await fetch(tier.whepUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/sdp' },
+            body: pc.localDescription.sdp,
+          });
+          if (seq !== connectSeq) return;
+
+          if (resp.status === 404) {
+            // Path exists but nothing is publishing yet (ffmpeg still
+            // starting, or restarting after a crash).  Keep polling.
+            setStatus('Waiting for stream…');
+            try { pc.close(); } catch (_) {}
+            scheduleRetry(tier, seq, WHEP_RETRY_MS);
+            return;
+          }
+          if (!resp.ok) {
+            setStatus(`WHEP request failed: HTTP ${resp.status}`, true);
+            try { pc.close(); } catch (_) {}
+            scheduleRetry(tier, seq, WHEP_RETRY_MS * 2);
+            return;
+          }
+
+          const loc = resp.headers.get('Location');
+          currentSessionUrl = loc
+            ? new URL(loc, tier.whepUrl).href
+            : null;
+          const answer = await resp.text();
+          await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+          if (seq !== connectSeq) return;
+          setStatus('Stream connected — waiting for video…');
+        } catch (err) {
+          if (seq !== connectSeq) return;
+          setStatus(`Connection error: ${err.message ?? err}. Retrying…`, true);
+          try { pc.close(); } catch (_) {}
+          scheduleRetry(tier, seq, WHEP_RETRY_MS * 2);
+        }
       }
 
       function connectToTier(tier) {
-        if (currentTier && tier.sigUrl === currentTier.sigUrl) return;
+        if (currentTier && tier.whepUrl === currentTier.whepUrl) return;
         teardownCurrent();
         currentTier = tier;
         window._activeTier = {
           scale: tier.scale, width: tier.width, height: tier.height,
-          sigUrl: tier.sigUrl,
+          whepUrl: tier.whepUrl,
         };
         // Update the gumball's "at-target resolution" classifier so the
         // active tier counts as 'at target' — not the source resolution.
         _targetWidth  = tier.width;
         _targetHeight = tier.height;
 
-        setStatus(`Connecting to ${tier.sigUrl} (scale ${tier.scale}) …`);
-
-        const api = new GstWebRTCAPI({
-          signalingServerUrl: tier.sigUrl,
-          // webrtcConfig is passed directly to RTCPeerConnection() by gstwebrtc-api.
-          webrtcConfig: { iceServers },
-        });
-        currentApi = api;
-
-        api.registerProducersListener({
-          producerAdded(producer) {
-            // Stale events from an api that was torn down during a fast
-            // sequence of tier switches: ignore.
-            if (api !== currentApi) return;
-            setStatus(`Producer found (${producer.id}) — starting stream…`);
-
-            const session = api.createConsumerSession(producer.id);
-            if (!session) {
-              setStatus('Failed to create consumer session.', true);
-              return;
-            }
-            currentSession = session;
-            session.element = video;
-
-            session.addEventListener('error', (e) => {
-              setStatus(`Stream error: ${e.message ?? e}`, true);
-            });
-
-            session.addEventListener('closed', () => {
-              if (switchingTier) {
-                switchingTier = false;
-                return;
-              }
-              setStatus('Stream ended.');
-              video.srcObject = null;
-              stopMetrics();
-            });
-
-            const hideBanner = () => { status.className = 'hidden'; };
-            if (!video.paused && video.videoWidth > 0) {
-              hideBanner();
-              startMetrics();
-            } else {
-              video.addEventListener('playing', hideBanner, { once: true });
-              video.addEventListener('loadeddata', hideBanner, { once: true });
-              video.addEventListener('playing', startMetrics, { once: true });
-            }
-
-            session.connect();
-          },
-
-          producerRemoved(_producer) {
-            if (api !== currentApi) return;
-            if (switchingTier) return;
-            setStatus('Producer disconnected. Waiting for stream…');
-            video.srcObject = null;
-            stopMetrics();
-          },
-        });
-
-        // teardownCurrent() set switchingTier=true; clear it now that the
-        // new api is registered, so any *subsequent* unexpected close
-        // surfaces "Stream ended" to the user.
-        switchingTier = false;
+        setStatus(`Connecting to ${tier.whepUrl} (scale ${tier.scale}) …`);
+        startWhep(tier, connectSeq);
       }
 
       // Pin a specific tier via ?tier=<index> (functional tests), or via
-      // ?signalling=… (single-entry tier list built by resolveStreamConfig).
+      // ?whep=… (single-entry tier list built by resolveStreamConfig).
       let pinnedTier = null;
       const tierParam = params.get('tier');
       if (tierParam != null) {
@@ -778,7 +780,7 @@
           pinnedTier = tiers[idx];
         }
       }
-      if (tiers.length === 1) pinnedTier = tiers[0];  // signalling override
+      if (tiers.length === 1) pinnedTier = tiers[0];  // whep override
 
       const chosen = pinnedTier || pickTier(tiers, video);
       connectToTier(chosen);
@@ -793,7 +795,7 @@
           resizeTimer = setTimeout(() => {
             resizeTimer = null;
             const next = pickTier(tiers, video);
-            if (currentTier && next.sigUrl !== currentTier.sigUrl) {
+            if (currentTier && next.whepUrl !== currentTier.whepUrl) {
               connectToTier(next);
             }
           }, 250);
