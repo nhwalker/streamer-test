@@ -1,7 +1,14 @@
-# Lint-only configuration. The ruff *formatter* is deliberately not used:
-# the codebase uses hand-aligned assignment/dict tables in several modules
-# and reformatting them would destroy intentional readability. Run
-# `make lint` (ruff check) locally; CI enforces the same.
+# Lint-only configuration — two deliberate tooling decisions live here
+# (both revisited and reaffirmed after the ffmpeg/MediaMTX rewrite):
+#
+# * The ruff *formatter* is not used: the codebase hand-aligns
+#   assignment/dict tables in several modules and reformatting would
+#   destroy intentional readability.
+# * mypy runs in its default (non-strict) mode, which passes clean.
+#   Strict mode was evaluated and declined: ~120 annotation sites across
+#   a small, stable, stdlib-only codebase buys little safety here.
+#
+# Run `make lint` (ruff check + mypy) locally; CI enforces the same.
 target-version = "py311"
 
 [lint]
