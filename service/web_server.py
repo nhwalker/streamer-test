@@ -59,6 +59,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -76,6 +77,14 @@ VIDEO_FILL_COLOR     = int(os.environ.get('VIDEO_FILL_COLOR', '0xFF000000'), 16)
 VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
 VIDEO_DEFAULT_HEIGHT = int(os.environ.get('VIDEO_DEFAULT_HEIGHT', '1080'))
 VIDEO_MAX_SEC        = 12 * 3600
+VIDEO_MAX_CONCURRENT = int(os.environ.get('VIDEO_MAX_CONCURRENT', '2'))
+VIDEO_RETRY_AFTER_SEC = 15
+
+# Each /video request is a full ffmpeg re-encode that competes with the
+# always-on live encoders for CPU (and NVENC sessions, where the budget is
+# tight).  Beyond the cap, requests get 503 + Retry-After instead of
+# degrading the live stream.
+_video_slots = threading.BoundedSemaphore(VIDEO_MAX_CONCURRENT)
 
 CONFIG = load_config()
 CONFIG_JSON = json.dumps(CONFIG).encode('utf-8')
@@ -162,6 +171,22 @@ class Router(SimpleHTTPRequestHandler):
             self.send_error(400, 'requested range exceeds 12-hour maximum')
             return
 
+        if not _video_slots.acquire(blocking=False):
+            self.send_response(503, 'Busy')
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Retry-After', str(VIDEO_RETRY_AFTER_SEC))
+            body = (f'{VIDEO_MAX_CONCURRENT} /video transcodes already '
+                    'running; retry shortly\n').encode('utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        try:
+            self._transcode_video(start_ts, end_ts)
+        finally:
+            _video_slots.release()
+
+    def _transcode_video(self, start_ts, end_ts):
         stage_tmp  = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
         output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
         try:

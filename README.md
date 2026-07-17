@@ -226,6 +226,7 @@ fixed-CBR alternative.
 | `ARCHIVE_MAX_BYTES` / `ARCHIVE_MAX_AGE_DAYS` | `0` | Size/age-based purge; 0 = unlimited |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
 | `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output quality; tracks the archive so there's no second knob |
+| `VIDEO_MAX_CONCURRENT` | `2` | Max simultaneous `/video` transcodes; beyond it requests get `503` + `Retry-After` so archive downloads can't starve the live encoders |
 | `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
 
 ### Page URL parameters

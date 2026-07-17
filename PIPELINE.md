@@ -379,8 +379,10 @@ so a rotation mid-copy cannot corrupt the download.
 One faststart MP4 covering exactly the window: segments are laid on a
 solid-color base track at their true temporal offsets (gaps filled with
 `VIDEO_FILL_COLOR`), re-encoded at `VIDEO_QP` (defaults to `ARCHIVE_QP`).
-Windows over 12 hours are rejected. Unchanged from the previous stack
-(`video_transcode.py` always used ffmpeg).
+Windows over 12 hours are rejected. At most `VIDEO_MAX_CONCURRENT`
+(default 2) transcodes run at once — each is a full ffmpeg encode that
+competes with the live encoders — and overflow requests receive
+`503` + `Retry-After`.
 
 Timestamps accept Unix epoch or ISO 8601 (UTC assumed when no timezone);
 durations are `30s` / `60m` / `1.5h`.
