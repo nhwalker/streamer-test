@@ -291,7 +291,7 @@ encoder (see rate control above).
 ## Streams, tiers, and path naming
 
 `desktop_config.py` computes, per stream (full frame + one per screen), a
-tier ladder from `WEBRTC_SCALE_LADDER` (default `1.0,0.5`):
+tier ladder from `LIVE_SCALE_LADDER` (default `1.0,0.5`):
 
 - Tier dimensions snap to even numbers (H.264 4:2:0 requirement); tiers
   below 64 px in either dimension are dropped; duplicate sizes dedup.

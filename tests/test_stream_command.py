@@ -22,7 +22,7 @@ from stream_command import (  # noqa: E402
 def _cfg(**env):
     base = {'STREAM_WIDTH': '1920', 'STREAM_HEIGHT': '1080',
             'DESKTOP_SPLITS': '1920x540+0+0;1920x540+0+540',
-            'WEBRTC_SCALE_LADDER': '1.0,0.5'}
+            'LIVE_SCALE_LADDER': '1.0,0.5'}
     base.update(env)
     return compute_config(base), base
 
@@ -127,7 +127,7 @@ def test_filter_complex_crops_screens_once_before_tier_split():
 
 
 def test_filter_complex_single_tier_skips_split():
-    cfg, _ = _cfg(WEBRTC_SCALE_LADDER='1.0')
+    cfg, _ = _cfg(LIVE_SCALE_LADDER='1.0')
     filt, branches = build_filter_complex(cfg)
     assert [b['whepPath'] for b in branches] == ['full_t0', 'top_t0', 'bottom_t0']
     # Inner tier splits absent; only the top-level fan-out split remains.

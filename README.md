@@ -158,7 +158,7 @@ boundary reconnects to the new tier (~250 ms blip).
 
 Unlike the previous webrtcsink design, **every tier is encoded
 continuously** — an unwatched tier still costs an encoder session. Keep the
-ladder short (see `WEBRTC_SCALE_LADDER`).
+ladder short (see `LIVE_SCALE_LADDER`).
 
 ### Media flow (viewer join)
 
@@ -211,7 +211,7 @@ graph TD
 2. **`desktop_config.py`** — probe RandR for resolution/monitors, compute
    the tier ladder, write `/run/desktop-stream/config.json`.
 3. **MediaMTX** — `stream_command.py` renders `mediamtx.yml` (loopback RTSP
-   ingest, WHEP on `WEBRTC_PORT`, everything else disabled, only the
+   ingest, WHEP on `WHEP_PORT`, everything else disabled, only the
    configured paths allowed); readiness-probed before continuing.
 4. **`web_server.py`** — serves the page, `/config.json`, and the archive
    endpoints.
@@ -342,7 +342,7 @@ All settings are environment variables passed to `docker run -e`.
 | `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
 | `DESKTOP_SPLITS` | _(auto)_ | Per-screen regions `WxH+X+Y;…`; unset auto-detects monitors via RandR |
-| `WEBRTC_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the per-stream tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
+| `LIVE_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the per-stream tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
 
 ### Live encoding
 
@@ -367,7 +367,7 @@ fixed-CBR alternative and when to prefer it).
 |---|---|---|
 | `WEB_PORT` | `8080` | HTTP page server |
 | `WEB_DIR` | `/var/www/html` | Static file root for the page server (set by the image; rarely changed) |
-| `WEBRTC_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
+| `WHEP_PORT` | `8889` | MediaMTX WHEP/HTTP port (browser-facing) |
 | `WEBRTC_UDP_PORT` | `8189` | MediaMTX ICE/UDP media port (browser-facing) |
 | `MEDIAMTX_RTSP_PORT` | `8554` | Loopback-only RTSP ingest (ffmpeg → MediaMTX) |
 | `WEBRTC_ADDITIONAL_HOSTS` | _(empty)_ | Comma-separated extra IPs/hostnames to advertise as ICE candidates (needed when not on host networking, or behind NAT) |
@@ -386,6 +386,16 @@ fixed-CBR alternative and when to prefer it).
 | `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
 | `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output encode quality (QP); tracks the archive quality so there is no second knob to tune |
 | `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
+
+### Renamed (old name still honoured, warns at startup)
+
+| Old name | New name |
+|---|---|
+| `WEBRTC_PORT` | `WHEP_PORT` |
+| `WEBRTC_SCALE_LADDER` | `LIVE_SCALE_LADDER` |
+
+When both are set, the new name wins.  The old names will be removed in a
+future release; migrate at your convenience.
 
 ### Deprecated (ignored with a warning)
 

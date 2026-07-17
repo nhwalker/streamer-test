@@ -101,21 +101,49 @@ def test_whep_paths_use_stream_key_and_tier_index():
         'STREAM_WIDTH': '3840',
         'STREAM_HEIGHT': '1080',
         'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
-        'WEBRTC_SCALE_LADDER': '1.0',
+        'LIVE_SCALE_LADDER': '1.0',
     })
     assert [t['whepPath'] for t in cfg['fullTiers']] == ['full_t0']
     assert [t['whepPath'] for t in cfg['screens'][0]['tiers']] == ['left_t0']
     assert [t['whepPath'] for t in cfg['screens'][1]['tiers']] == ['right_t0']
 
 
-def test_webrtc_port_default_and_override():
+def test_whep_port_default_and_override():
     assert desktop_config.compute_config({
         'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
     })['webrtcPort'] == 8889
     assert desktop_config.compute_config({
         'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
+        'WHEP_PORT': '9889',
+    })['webrtcPort'] == 9889
+
+
+def test_whep_port_legacy_alias_still_works(capsys):
+    # Pre-rename deployments set WEBRTC_PORT; it must keep working, with a
+    # deprecation warning naming the replacement.
+    assert desktop_config.compute_config({
+        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
         'WEBRTC_PORT': '9889',
     })['webrtcPort'] == 9889
+    assert 'WEBRTC_PORT is deprecated' in capsys.readouterr().err
+
+
+def test_whep_port_new_name_wins_over_alias():
+    assert desktop_config.compute_config({
+        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
+        'WHEP_PORT': '9000', 'WEBRTC_PORT': '9889',
+    })['webrtcPort'] == 9000
+
+
+def test_scale_ladder_legacy_alias_still_works(capsys):
+    assert desktop_config._parse_scale_ladder(
+        {'WEBRTC_SCALE_LADDER': '1.0,0.25'}
+    ) == [1.0, 0.25]
+    assert 'WEBRTC_SCALE_LADDER is deprecated' in capsys.readouterr().err
+    # New name wins when both are set.
+    assert desktop_config._parse_scale_ladder(
+        {'LIVE_SCALE_LADDER': '1.0,0.5', 'WEBRTC_SCALE_LADDER': '1.0,0.25'}
+    ) == [1.0, 0.5]
 
 
 def test_deprecated_signalling_env_is_ignored():
@@ -155,13 +183,13 @@ class TestScaleLadder:
 
     def test_explicit_ladder_sorts_descending(self):
         assert desktop_config._parse_scale_ladder(
-            {'WEBRTC_SCALE_LADDER': '0.5,1.0,0.25'}
+            {'LIVE_SCALE_LADDER': '0.5,1.0,0.25'}
         ) == [1.0, 0.5, 0.25]
 
     def test_ratio_form_parses(self):
         # 1/3 ≈ 0.333; we accept it as a tier scale.
         out = desktop_config._parse_scale_ladder(
-            {'WEBRTC_SCALE_LADDER': '1.0,1/3'}
+            {'LIVE_SCALE_LADDER': '1.0,1/3'}
         )
         assert out[0] == 1.0
         assert abs(out[1] - 1/3) < 1e-9
@@ -172,7 +200,7 @@ class TestScaleLadder:
         # descending sort wins — we don't care which; we only care that
         # the final list has exactly the two distinct tiers.
         out = desktop_config._parse_scale_ladder(
-            {'WEBRTC_SCALE_LADDER': '1.0,0.5,0.5,0.50000001'}
+            {'LIVE_SCALE_LADDER': '1.0,0.5,0.5,0.50000001'}
         )
         assert len(out) == 2
         assert out[0] == 1.0
@@ -182,19 +210,19 @@ class TestScaleLadder:
         # Operator forgot to include 1.0 — we silently add it so every
         # stream has a passthrough tier.
         assert desktop_config._parse_scale_ladder(
-            {'WEBRTC_SCALE_LADDER': '0.5,0.25'}
+            {'LIVE_SCALE_LADDER': '0.5,0.25'}
         ) == [1.0, 0.5, 0.25]
 
     @pytest.mark.parametrize('bad', ['0', '-0.5', '1.5', '2', 'abc', '1/0'])
     def test_rejects_invalid_scales(self, bad):
         with pytest.raises(ValueError):
-            desktop_config._parse_scale_ladder({'WEBRTC_SCALE_LADDER': bad})
+            desktop_config._parse_scale_ladder({'LIVE_SCALE_LADDER': bad})
 
     def test_rejects_too_many_tiers(self):
         ladder = ','.join(str(round(1 - i * 0.05, 3)) for i in range(20))
         with pytest.raises(ValueError):
             desktop_config._parse_scale_ladder(
-                {'WEBRTC_SCALE_LADDER': ladder})
+                {'LIVE_SCALE_LADDER': ladder})
 
     def test_compute_tiers_snaps_to_even(self):
         # Banker's rounding: 1.0×1281/2 = 640.5 → 640, ×2 = 1280.  Same for
@@ -232,7 +260,7 @@ class TestScaleLadder:
             'STREAM_WIDTH': '1920',
             'STREAM_HEIGHT': '1080',
             'DESKTOP_SPLITS': '1920x540+0+0;1920x540+0+540',
-            'WEBRTC_SCALE_LADDER': '1.0,0.5',
+            'LIVE_SCALE_LADDER': '1.0,0.5',
         })
         # Full stream tiers.
         assert cfg['fullTiers'] == [
@@ -261,7 +289,7 @@ class TestScaleLadder:
             'STREAM_WIDTH': '3840',
             'STREAM_HEIGHT': '1080',
             'DESKTOP_SPLITS': '1920x1080+0+0;1920x1080+1920+0',
-            'WEBRTC_SCALE_LADDER': '1.0,0.5,0.25',
+            'LIVE_SCALE_LADDER': '1.0,0.5,0.25',
         })
         paths = [t['whepPath'] for t in cfg['fullTiers']]
         for s in cfg['screens']:

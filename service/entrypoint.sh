@@ -3,7 +3,7 @@
 #
 # Starts services in order and waits on all of them:
 #   1. desktop_config.py   (writes /run/desktop-stream/config.json)
-#   2. mediamtx            (RTSP ingest on loopback, WHEP egress on :WEBRTC_PORT)
+#   2. mediamtx            (RTSP ingest on loopback, WHEP egress on :WHEP_PORT)
 #   3. web_server.py       (background, :WEB_PORT, serves /var/www/html)
 #   4. pipeline.py         (supervised ffmpeg: x11grab capture -> live RTSP
 #                           tiers + archive segments)
@@ -41,9 +41,12 @@ python3 /usr/local/bin/desktop_config.py >/dev/null
 
 # ── MediaMTX (WebRTC/WHEP egress) ─────────────────────────────────────────────
 # stream_command.py renders the config from the runtime config + env:
-# loopback RTSP ingest, WHEP on :WEBRTC_PORT, everything else disabled.
+# loopback RTSP ingest, WHEP on :WHEP_PORT, everything else disabled.
+# (WEBRTC_PORT is the deprecated alias; the Python side warns when it is
+# used.  The chain below mirrors that resolution for log output only.)
+WHEP_PORT="${WHEP_PORT:-${WEBRTC_PORT:-8889}}"
 python3 /usr/local/bin/stream_command.py > /run/desktop-stream/mediamtx.yml
-echo "[service] Starting MediaMTX (rtsp 127.0.0.1:${MEDIAMTX_RTSP_PORT}, whep :${WEBRTC_PORT}) ..."
+echo "[service] Starting MediaMTX (rtsp 127.0.0.1:${MEDIAMTX_RTSP_PORT}, whep :${WHEP_PORT}) ..."
 mediamtx /run/desktop-stream/mediamtx.yml &
 MTXPID=$!
 
