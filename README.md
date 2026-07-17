@@ -387,23 +387,6 @@ fixed-CBR alternative and when to prefer it).
 | `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output encode quality (QP); tracks the archive quality so there is no second knob to tune |
 | `VIDEO_DEFAULT_WIDTH` / `VIDEO_DEFAULT_HEIGHT` | `1920`/`1080` | `/video` output size when no segments exist |
 
-### Renamed (old name still honoured, warns at startup)
-
-| Old name | New name |
-|---|---|
-| `WEBRTC_PORT` | `WHEP_PORT` |
-| `WEBRTC_SCALE_LADDER` | `LIVE_SCALE_LADDER` |
-
-When both are set, the new name wins.  The old names will be removed in a
-future release; migrate at your convenience.
-
-### Deprecated (ignored with a warning)
-
-`STREAM_CODEC` (live codec is always H.264), `SIGNALLING_HOST`,
-`SIGNALLING_PORT`, `SIGNALLING_PORT_STRIDE`, `GST_WEBRTC_STUN_SERVER`,
-`GST_WEBRTC_TURN_SERVER`, `WEBRTC_MIN_BITRATE`, `WEBRTC_START_BITRATE`,
-`WEBRTC_MAX_BITRATE`.
-
 ### Page URL parameters
 
 | Parameter | Effect |

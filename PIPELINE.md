@@ -387,8 +387,7 @@ durations are `30s` / `60m` / `1.5h`.
 ## Environment Variable Reference
 
 See [README.md — Configuration reference](README.md#configuration-reference)
-for the authoritative table, including the deprecated GStreamer-era
-variables that are now ignored with a warning.
+for the authoritative table.
 
 ---
 

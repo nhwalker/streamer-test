@@ -44,8 +44,8 @@ public final class ServiceStack {
 
     // Fixed ports — service runs with network_mode=host so there is no
     // dynamic port mapping.
-    private static final int HTTP_PORT   = 8080;
-    private static final int WEBRTC_PORT = 8889;
+    private static final int HTTP_PORT = 8080;
+    private static final int WHEP_PORT = 8889;
 
     // 1280x720 Xvfb split into top (0..360) / bottom (360..720) regions.
     private static final String DESKTOP_SPLITS =
@@ -211,7 +211,7 @@ public final class ServiceStack {
     // ── Public API ────────────────────────────────────────────────────────────
     public String baseUrl()     { return "http://localhost:" + HTTP_PORT; }
     public String serviceLogs() { return service.getLogs(); }
-    public int    webrtcPort()  { return WEBRTC_PORT; }
+    public int    webrtcPort()  { return WHEP_PORT; }
     public Path   archiveDir()  { return archiveDir; }
 
     /**

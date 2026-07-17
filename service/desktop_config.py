@@ -33,7 +33,6 @@ Inputs (environment variables, evaluated once at container start):
 
   WHEP_PORT         MediaMTX WHEP/HTTP port surfaced to the browser via
                     /config.json.  Default: 8889.
-                    (Deprecated alias: WEBRTC_PORT.)
 
   LIVE_SCALE_LADDER    Comma-separated fractional scales for the per-stream
                        tier ladder.  Each browser auto-picks the smallest
@@ -47,11 +46,6 @@ Inputs (environment variables, evaluated once at container start):
                        ratios (``"1/3"``).  Values must be in (0, 1.0]; the
                        ``1.0`` tier is always included.  Default:
                        ``"1.0,0.5"``.
-                       (Deprecated alias: WEBRTC_SCALE_LADDER.)
-
-  SIGNALLING_PORT / SIGNALLING_PORT_STRIDE
-                       Deprecated (pre-MediaMTX WebSocket signalling).
-                       Ignored with a warning when set.
 
 The computed config is written to /run/desktop-stream/config.json by the
 entrypoint and read by the other processes via load_config().
@@ -88,39 +82,6 @@ _SCALE_EPS          = 1e-6
 
 _DEFAULT_WHEP_PORT = 8889
 
-_DEPRECATED_ENV = ('SIGNALLING_PORT', 'SIGNALLING_PORT_STRIDE',
-                   'SIGNALLING_HOST', 'STREAM_CODEC',
-                   'GST_WEBRTC_STUN_SERVER', 'GST_WEBRTC_TURN_SERVER',
-                   'WEBRTC_MIN_BITRATE', 'WEBRTC_START_BITRATE',
-                   'WEBRTC_MAX_BITRATE')
-
-# Renamed variables: new primary name -> deprecated alias.  The old names
-# date from the GStreamer/webrtcsink stack; they keep working (with a
-# startup warning) until deployments migrate.  Removal is a future,
-# separately-announced change.
-_ENV_ALIASES = {
-    'WHEP_PORT':         'WEBRTC_PORT',
-    'LIVE_SCALE_LADDER': 'WEBRTC_SCALE_LADDER',
-}
-
-
-def resolve_env_alias(env, new_name):
-    """Return the raw string value for a renamed env var, or None when unset.
-
-    The new name wins when both are set.  Setting only the deprecated old
-    name still works but prints a warning naming the replacement.
-    """
-    old_name = _ENV_ALIASES[new_name]
-    new_val = (env.get(new_name) or '').strip()
-    if new_val:
-        return new_val
-    old_val = (env.get(old_name) or '').strip()
-    if old_val:
-        print(f'[desktop_config] WARNING: {old_name} is deprecated; '
-              f'use {new_name}. The value {old_val!r} is still honoured.',
-              file=sys.stderr)
-        return old_val
-    return None
 
 
 def _parse_scale_ladder(env):
@@ -132,8 +93,7 @@ def _parse_scale_ladder(env):
     ``"1,5"`` meaning ``[1.0, 5.0]``) surfaces as an error instead of being
     silently saturated.
     """
-    raw = (resolve_env_alias(env, 'LIVE_SCALE_LADDER')
-           or _DEFAULT_SCALE_LADDER).strip()
+    raw = (env.get('LIVE_SCALE_LADDER') or _DEFAULT_SCALE_LADDER).strip()
     if not raw:
         raw = _DEFAULT_SCALE_LADDER
     out = []
@@ -279,12 +239,6 @@ def compute_config(env=None):
     """
     env = env if env is not None else os.environ
 
-    for var in _DEPRECATED_ENV:
-        if (env.get(var) or '').strip():
-            print(f'[desktop_config] WARNING: {var} is deprecated and '
-                  'ignored — WebRTC is served by MediaMTX on WHEP_PORT '
-                  '(default 8889).', file=sys.stderr)
-
     display   = env.get('DISPLAY', ':0')
 
     width_raw  = (env.get('STREAM_WIDTH')  or '').strip()
@@ -302,8 +256,7 @@ def compute_config(env=None):
         width  = int(width_raw)  if width_raw  else native_w
         height = int(height_raw) if height_raw else native_h
 
-    webrtc_port = int(resolve_env_alias(env, 'WHEP_PORT')
-                      or _DEFAULT_WHEP_PORT)
+    webrtc_port = int(env.get('WHEP_PORT') or _DEFAULT_WHEP_PORT)
     framerate   = int((env.get('STREAM_FRAMERATE')   or  '30').strip())
     scales      = _parse_scale_ladder(env)
 

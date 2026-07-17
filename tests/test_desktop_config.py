@@ -118,46 +118,6 @@ def test_whep_port_default_and_override():
     })['webrtcPort'] == 9889
 
 
-def test_whep_port_legacy_alias_still_works(capsys):
-    # Pre-rename deployments set WEBRTC_PORT; it must keep working, with a
-    # deprecation warning naming the replacement.
-    assert desktop_config.compute_config({
-        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
-        'WEBRTC_PORT': '9889',
-    })['webrtcPort'] == 9889
-    assert 'WEBRTC_PORT is deprecated' in capsys.readouterr().err
-
-
-def test_whep_port_new_name_wins_over_alias():
-    assert desktop_config.compute_config({
-        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
-        'WHEP_PORT': '9000', 'WEBRTC_PORT': '9889',
-    })['webrtcPort'] == 9000
-
-
-def test_scale_ladder_legacy_alias_still_works(capsys):
-    assert desktop_config._parse_scale_ladder(
-        {'WEBRTC_SCALE_LADDER': '1.0,0.25'}
-    ) == [1.0, 0.25]
-    assert 'WEBRTC_SCALE_LADDER is deprecated' in capsys.readouterr().err
-    # New name wins when both are set.
-    assert desktop_config._parse_scale_ladder(
-        {'LIVE_SCALE_LADDER': '1.0,0.5', 'WEBRTC_SCALE_LADDER': '1.0,0.25'}
-    ) == [1.0, 0.5]
-
-
-def test_deprecated_signalling_env_is_ignored():
-    # Legacy deployments still setting the WebSocket-signalling vars must
-    # not break — the values are ignored (a warning is printed to stderr).
-    cfg = desktop_config.compute_config({
-        'STREAM_WIDTH': '1280', 'STREAM_HEIGHT': '720',
-        'SIGNALLING_PORT': '9000',
-        'SIGNALLING_PORT_STRIDE': '100',
-    })
-    assert 'fullSignallingPort' not in cfg
-    assert all('signallingPort' not in t for t in cfg['fullTiers'])
-
-
 def test_invalid_desktop_splits_raises():
     with pytest.raises(ValueError):
         desktop_config.compute_config({

@@ -248,9 +248,9 @@ jobs:
       - name: Run functional tests
         working-directory: functional-tests
         env:
-          SERVICE_IMAGE:          "desktop-stream-service:ci"
-          HUB_IMAGE:              "desktop-stream-hub:ci"
-          GST_WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
+          SERVICE_IMAGE:      "desktop-stream-service:ci"
+          HUB_IMAGE:          "desktop-stream-hub:ci"
+          WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
         run: ./gradlew test
 
       - name: Generate Allure report
