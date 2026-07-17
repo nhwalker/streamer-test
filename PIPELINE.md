@@ -302,7 +302,9 @@ tier ladder from `LIVE_SCALE_LADDER` (default `1.0,0.5`):
   `whepPath`.
 - Screen naming is unchanged: two side-by-side monitors are `left`/`right`,
   stacked are `top`/`bottom`, otherwise `screen1..N` in reading order.
-  Regions come from `DESKTOP_SPLITS` or RandR auto-detection.
+  Regions come from `DESKTOP_SPLITS` (frame coordinates, verbatim) or RandR
+  auto-detection (native pixels, scaled into the configured frame with
+  even-snapped shared edges).
 
 **Cost model:** every tier is a continuously-running encode (one NVENC
 session or one x264 instance each) plus the archive. Example budget with

@@ -181,7 +181,7 @@ All settings are environment variables (`docker run -e`).
 |---|---|---|
 | `DISPLAY` | `:0` | X11 display to capture |
 | `DESKTOP_NAME` | `desktop` | Page-header label; also the archive filename prefix |
-| `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR. If set below native, provide `DESKTOP_SPLITS` in frame coordinates — auto-detected monitor regions are native-pixel and won't fit |
+| `STREAM_WIDTH` / `STREAM_HEIGHT` | _(native)_ | Capture size; unset reads the X server's native size via RandR. When set differently from native, auto-detected monitor regions scale into the frame; explicit `DESKTOP_SPLITS` values are frame coordinates |
 | `STREAM_FRAMERATE` | `30` | Frames per second |
 | `DESKTOP_SPLITS` | _(auto)_ | Per-screen regions `WxH+X+Y;…`; unset auto-detects monitors via RandR |
 | `LIVE_SCALE_LADDER` | `1.0,0.5` | Fractional scales for the tier ladder. **Every tier is an always-on encode per stream** — keep it short. Accepts decimals, ints, ratios (`1/3`); values in (0, 1.0]; `1.0` always included |
