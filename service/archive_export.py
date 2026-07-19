@@ -3,24 +3,30 @@ archive_export.py -- assemble archive segments for download requests.
 
 Backs the /archive and /video endpoints (web_server.py): collects the
 completed .mp4 segments that overlap a requested time window into a staging
-directory, includes the in-progress segment when it overlaps, and zips the
-staged files for /archive.  The /video path hands the same staging directory
-to video_transcode.transcode_to_video instead.
+directory, includes the in-progress segment when it overlaps, and streams a
+zip of the staged files for /archive.  The /video path hands the same
+staging directory to video_transcode.transcode_to_video instead.
 
-Completed segments are copied byte-for-byte (they are valid MP4 after
-rotation).  The active segment is also a plain byte-copy: ffmpeg writes the
-archive as fragmented MP4 with the moov atom up front (movflags empty_moov)
-and per-packet flushing, so the in-progress file is parseable mid-write — a
-truncated trailing fragment is simply ignored by players.
+Completed segments are hardlinked into the stage dir (they are valid,
+immutable MP4 after rotation, and the link pins the inode against the
+purger without moving any bytes; a byte copy is the fallback when linking
+is impossible).  The active segment is a plain byte-copy: ffmpeg writes
+the archive as fragmented MP4 with the moov atom up front (movflags
+empty_moov) and per-packet flushing, so the in-progress file is parseable
+mid-write — a truncated trailing fragment is simply ignored by players.
+
+The zip itself is produced by zip_stream.py (stored entries, exact size
+known before any data moves); zip_entries() here maps the staged files
+onto its ZipEntry model.
 """
 import glob
 import os
 import shutil
 import tempfile
 import time
-import zipfile
 
 from archive_times import parse_segment_times, renamed_segment_path
+from zip_stream import ZipEntry, write_zip_stream
 
 
 def _has_complete_moov(head):
@@ -127,6 +133,50 @@ def _truncate_to_complete_boxes(path):
     return any(t == b'moof' for t, _ in boxes)
 
 
+_STAGE_PREFIX    = '.archive_stage_'
+# A stage dir this old cannot belong to a live request (even a maximum-size
+# /video re-encode finishes well inside it); it is debris from a crash.
+_STAGE_STALE_SEC = 24 * 3600
+
+
+def sweep_stage_dirs(archive_dir, older_than_sec=_STAGE_STALE_SEC):
+    """Delete stage dirs leaked by interrupted requests.
+
+    Stage dirs live inside archive_dir (see stage_segments) and are
+    normally removed by TemporaryDirectory.cleanup(); a process killed
+    mid-request leaks one, and because it holds hardlinks it keeps
+    purged segments' disk space alive until removed.
+
+    Called with the default age from stage_segments (anything younger
+    might belong to a request in flight) and with older_than_sec=0 at
+    web-server boot, when no request can be in flight at all.
+    """
+    cutoff = time.time() - older_than_sec
+    for path in glob.glob(os.path.join(archive_dir, _STAGE_PREFIX + '*')):
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _link_or_copy(src, dst):
+    """Hardlink src to dst, falling back to a byte copy.
+
+    A hardlink pins the completed segment's inode against the purger with
+    zero data movement.  The fallback covers stage dirs that could not be
+    created on the archive filesystem and filesystems without hardlink
+    support.  FileNotFoundError (the purger won the race) propagates to
+    the caller either way.
+    """
+    try:
+        os.link(src, dst)
+    except FileNotFoundError:
+        raise
+    except OSError:
+        shutil.copy2(src, dst)
+
+
 def stage_segments(archive_dir, live_dir, start_ts, end_ts,
                    _copy=_copy_active_to_stage):
     """Copy overlapping segments into a TemporaryDirectory and return it.
@@ -155,7 +205,21 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
     """
-    tmp = tempfile.TemporaryDirectory(prefix='archive_stage_')
+    sweep_stage_dirs(archive_dir)
+    # The stage dir lives on the archive filesystem so completed segments
+    # can be hardlinked instead of copied — the system tmp dir is usually
+    # a different filesystem (container layer or tmpfs), where os.link
+    # would fail with EXDEV every time.  The dot-prefix keeps it out of
+    # every '*.mp4' glob (purge, staging, /archive).
+    try:
+        tmp = tempfile.TemporaryDirectory(prefix=_STAGE_PREFIX,
+                                          dir=archive_dir)
+    except OSError:
+        tmp = tempfile.TemporaryDirectory(prefix='archive_stage_')
+    # mkdtemp creates 0700; open it up to 0755 so host-side tooling that
+    # walks a bind-mounted archive volume (find/du, the functional-test
+    # harness) can at least descend into a dir it cannot delete.
+    os.chmod(tmp.name, 0o755)
 
     now = time.time()
     renamed = []
@@ -169,9 +233,9 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
     for path, seg_start, seg_end in renamed:
         if seg_start < end_ts and seg_end > start_ts:
             try:
-                shutil.copy2(path, os.path.join(tmp.name, os.path.basename(path)))
+                _link_or_copy(path, os.path.join(tmp.name, os.path.basename(path)))
             except FileNotFoundError:
-                pass  # purge deleted it between glob and copy; skip it
+                pass  # purge deleted it between glob and link; skip it
 
     # The active (currently-writing) segment is the highest-named
     # sequential .mp4 in live_dir.  Its start time equals the end of the
@@ -232,7 +296,7 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
                     if times and abs(times[0] - seg_start) < 1.0:
                         if times[0] < end_ts and times[1] > start_ts:
                             try:
-                                shutil.copy2(path, os.path.join(
+                                _link_or_copy(path, os.path.join(
                                     tmp.name, os.path.basename(path)))
                             except FileNotFoundError:
                                 pass
@@ -241,8 +305,33 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
     return tmp
 
 
+# ── Zip assembly ──────────────────────────────────────────────────────────────
+#
+# The zip format work (stored entries, exact size prediction, zip64) lives
+# in zip_stream.py; this side only maps staged segment files onto its
+# ZipEntry model.
+
+
+def zip_entries(stage_dir):
+    """One ZipEntry per .mp4 in stage_dir, sorted by name.
+
+    Sizes are captured here, once: staged files are immutable, and every
+    later step (zip_stream_size, write_zip_stream) works from this
+    snapshot so the streamed bytes always match the announced size.
+    """
+    entries = []
+    for path in sorted(glob.glob(os.path.join(stage_dir, '*.mp4'))):
+        st = os.stat(path)
+        entries.append(ZipEntry(
+            arcname   = os.path.basename(path),
+            path      = path,
+            size      = st.st_size,
+            date_time = time.localtime(st.st_mtime)[:6],
+        ))
+    return entries
+
+
 def zip_segments(stage_dir, zip_path):
     """Write all .mp4 files in stage_dir into a zip archive at zip_path."""
-    with zipfile.ZipFile(zip_path, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(glob.glob(os.path.join(stage_dir, '*.mp4'))):
-            zf.write(path, os.path.basename(path))
+    with open(zip_path, 'wb') as fh:
+        write_zip_stream(zip_entries(stage_dir), fh)

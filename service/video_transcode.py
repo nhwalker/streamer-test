@@ -3,10 +3,16 @@ video_transcode.py -- ffmpeg-based video assembly for the /video endpoint.
 
 Takes a directory of staged .mp4 segments and produces a single output .mp4
 that exactly covers the requested time window:
-  - a full-duration solid-color base video covers the entire window
-  - each segment is overlaid at its correct temporal position
-  - segments starting before the window are trimmed; segments extending past
-    the end are cut off implicitly when the base video ends
+  - the output is a concat of pieces in timeline order: each overlapping
+    segment contributes one clip, and every uncovered stretch (leading,
+    between segments, trailing) becomes a generated solid-color clip, so
+    each frame is processed once regardless of how many segments there are
+  - segments starting before the window are opened with an input-side seek
+    (-ss), so the pre-window content is skipped at the demuxer instead of
+    decoded and discarded; segments extending past the end are trimmed
+  - a segment whose real content is shorter than its filename window claims
+    (crash-truncated tail, estimated active-segment end) is padded with the
+    fill color so every later piece still lands at its true temporal offset
   - the output is always a complete, faststart MP4 (moov atom at the front)
     so web players can begin decoding from the first received bytes
 
@@ -75,8 +81,9 @@ _encoder_args = functools.lru_cache(maxsize=None)(_detect_encoder_args)
 @dataclass
 class TimelineItem:
     path:           str
-    offset_s:       float  # > 0 → trim=start=offset_s to skip pre-window content
-    output_start_s: float  # seconds from start of output where overlay begins
+    offset_s:       float  # > 0 → seek this far into the file (pre-window content)
+    output_start_s: float  # seconds from start of output where the clip begins
+    duration_s:     float  # clip length after clipping to the window
 
 
 # ── File introspection ────────────────────────────────────────────────────────
@@ -127,10 +134,12 @@ def _build_timeline(stage_dir, start_ts, end_ts):
             continue
         fpath = os.path.join(stage_dir, fname)
         clip_start = max(seg_start, start_ts)
+        clip_end   = min(seg_end, end_ts)
         timeline.append(TimelineItem(
             path           = fpath,
             offset_s       = clip_start - seg_start,
             output_start_s = clip_start - start_ts,
+            duration_s     = clip_end - clip_start,
         ))
     timeline.sort(key=lambda x: x.output_start_s)
     return timeline
@@ -138,17 +147,52 @@ def _build_timeline(stage_dir, start_ts, end_ts):
 
 # ── ffmpeg assembly ───────────────────────────────────────────────────────────
 
+# Gaps and clip slivers below this many seconds are timestamp noise, not
+# real coverage differences; they are absorbed rather than rendered.
+_EPS = 1e-3
+
+
+def _plan_pieces(timeline, total_dur):
+    """Split [0, total_dur] into an ordered piece list covering it exactly.
+
+    Returns ('seg', item, seek_s, dur_s) and ('gap', dur_s) tuples.  A
+    segment overlapped by the previous piece (clock-estimation slop on the
+    active segment) has its head advanced; gaps arise wherever no segment
+    covers the output.
+    """
+    pieces = []
+    pos = 0.0
+    for item in timeline:
+        start, dur, seek = item.output_start_s, item.duration_s, item.offset_s
+        if start > pos + _EPS:
+            pieces.append(('gap', start - pos))
+            pos = start
+        overlap = pos - start   # > 0 when the previous piece covers our head
+        if overlap > 0:
+            seek += overlap
+            dur  -= overlap
+        if dur <= _EPS:
+            continue
+        pieces.append(('seg', item, seek, dur))
+        pos += dur
+    if total_dur - pos > _EPS or not pieces:
+        pieces.append(('gap', total_dur - pos))
+    return pieces
+
+
 def transcode_to_video(stage_dir, start_ts, end_ts,
                        fill_color_argb, output_path,
                        default_width=1920, default_height=1080,
                        _query_info=None):
     """Assemble a single MP4 covering [start_ts, end_ts] from staged segments.
 
-    A solid fill_color_argb (0xAARRGGBB) base video covers the full duration.
-    Each segment is overlaid at its correct temporal position.  Gaps between
-    segments and at the edges are filled by the base.  The output is written
-    with `-movflags +faststart` so web players can start playback before the
-    full file has been received.
+    The window is cut into consecutive pieces — one clip per overlapping
+    segment, one generated fill_color_argb (0xAARRGGBB) clip per uncovered
+    stretch — which are normalised to a common size/rate/format and joined
+    with the concat filter, so every output frame is produced by exactly one
+    piece (the old overlay-chain approach ran each frame through one filter
+    per segment).  The output is written with `-movflags +faststart` so web
+    players can start playback before the full file has been received.
     output_path will be overwritten.  Raises RuntimeError on ffmpeg failure.
     """
     if _query_info is None:
@@ -170,43 +214,42 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
     size      = f'{width}x{height}'
     total_dur = end_ts - start_ts
 
-    cmd = ['ffmpeg', '-y']
-    for item in timeline:
-        cmd += ['-i', item.path]
+    pieces = _plan_pieces(timeline, total_dur)
 
+    cmd     = ['ffmpeg', '-y']
     filters = []
-
-    if timeline:
-        filters.append(
-            f'color=c={color}:s={size}:r={fps_str}'
-            f':duration={total_dur:.6f},setpts=PTS-STARTPTS[base]'
-        )
-
-        for i, item in enumerate(timeline):
-            label = f'[c{i}]'
-            y     = item.output_start_s
-            if item.offset_s > 0:
-                filters.append(
-                    f'[{i}:v]trim=start={item.offset_s:.6f}'
-                    f',setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
-                )
-            else:
-                filters.append(
-                    f'[{i}:v]setpts=PTS-STARTPTS+{y:.6f}/TB{label}'
-                )
-
-        prev = 'base'
-        for i in range(len(timeline)):
-            src  = f'[{prev}]' if prev == 'base' else prev
-            clip = f'[c{i}]'
-            out  = '[out]' if i == len(timeline) - 1 else f'[t{i}]'
-            filters.append(f'{src}{clip}overlay=eof_action=pass{out}')
-            prev = f'[t{i}]'
-    else:
-        filters.append(
-            f'color=c={color}:s={size}:r={fps_str}'
-            f':duration={total_dur:.6f},setpts=PTS-STARTPTS[out]'
-        )
+    labels  = []
+    n_inputs = 0
+    for k, piece in enumerate(pieces):
+        label = f'[p{k}]'
+        if piece[0] == 'gap':
+            _, dur = piece
+            filters.append(
+                f'color=c={color}:s={size}:r={fps_str}'
+                f':duration={dur:.6f},format=yuv420p,setsar=1{label}'
+            )
+        else:
+            _, item, seek, dur = piece
+            in_idx = n_inputs
+            n_inputs += 1
+            if seek > _EPS:
+                # Input-side seek: decode from the nearest prior keyframe
+                # instead of decoding and discarding the whole head.
+                cmd += ['-ss', f'{seek:.6f}']
+            cmd += ['-i', item.path]
+            filters.append(
+                f'[{in_idx}:v]setpts=PTS-STARTPTS'
+                f',scale={width}:{height},setsar=1,fps={fps_str}'
+                f',format=yuv420p'
+                # Undershoot guard: pad with fill color, then cut to the
+                # planned length, so a segment carrying less real content
+                # than its filename window claims cannot shift every
+                # later piece off its true temporal offset.
+                f',tpad=stop_mode=add:stop_duration={dur:.6f}:color={color}'
+                f',trim=end={dur:.6f},setpts=PTS-STARTPTS{label}'
+            )
+        labels.append(label)
+    filters.append(''.join(labels) + f'concat=n={len(pieces)}:v=1:a=0[out]')
 
     cmd += ['-filter_complex', ';'.join(filters)]
     cmd += ['-map', '[out]', *_encoder_args()]

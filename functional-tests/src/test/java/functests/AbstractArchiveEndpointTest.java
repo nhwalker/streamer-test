@@ -172,11 +172,18 @@ abstract class AbstractArchiveEndpointTest {
     }
 
     @Test
-    @DisplayName("/archive has no 12-hour duration limit")
+    @DisplayName("/archive accepts windows longer than /video's 12-hour cap")
     @Description("Verifies that /archive accepts durations longer than 12 hours (unlike /video, which caps at 43200 s).")
-    void archiveHasNoMaxDurationLimit() throws Exception {
-        // 43201 s is just over the /video limit; /archive has no such restriction.
+    void archiveAcceptsLongerWindowsThanVideo() throws Exception {
+        // 43201 s is just over the /video limit; /archive allows up to 24 h.
         assertEquals(200, get("?last=43201s").statusCode());
+    }
+
+    @Test
+    @DisplayName("/archive rejects windows over 24 hours")
+    @Description("Verifies that /archive rejects durations longer than its own 24-hour cap (86400 s) with HTTP 400.")
+    void archiveRejectsWindowsOver24Hours() throws Exception {
+        assertEquals(400, get("?last=86401s").statusCode());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

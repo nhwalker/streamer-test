@@ -4,6 +4,7 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -187,6 +188,18 @@ public final class ServiceStack {
         if (!stopped.compareAndSet(false, true)) return;
 
         stopColorWindow();
+
+        // Empty /archive from inside the container while it is still
+        // running: the service stages /archive//video downloads in
+        // root-owned .archive_stage_* dirs on this bind mount, and one
+        // left behind by an interrupted request cannot be read or deleted
+        // by the host-side walk below.  (-f keeps rm quiet when a glob
+        // matches nothing.)
+        try {
+            service.execInContainer("sh", "-c",
+                    "rm -rf /archive/* /archive/.[!.]*");
+        } catch (Exception ignored) {}
+
         try { service.stop(); } catch (Exception ignored) {}
 
         xvfbProcess.destroy();
@@ -200,11 +213,16 @@ public final class ServiceStack {
         try { Files.deleteIfExists(Path.of("/tmp/.X11-unix/X99")); } catch (IOException ignored) {}
 
         if (archiveDir != null && Files.exists(archiveDir)) {
+            // Files.walk surfaces unreadable subdirectories as
+            // UncheckedIOException mid-iteration; anything the host user
+            // cannot remove is abandoned in the temp dir rather than
+            // failing the teardown (the in-container rm above should have
+            // removed such dirs already).
             try {
                 Files.walk(archiveDir)
                      .sorted(Comparator.reverseOrder())
                      .forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
-            } catch (IOException ignored) {}
+            } catch (IOException | UncheckedIOException ignored) {}
         }
     }
 

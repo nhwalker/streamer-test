@@ -1,7 +1,7 @@
 """
 Unit tests for the /archive//video building blocks: parse_duration and
-parse_timestamp (archive_times.py), stage_segments and zip_segments
-(archive_export.py).
+parse_timestamp (archive_times.py), stage_segments and the stored-zip
+streamer (archive_export.py).
 
 No Docker or live HTTP server required.  The active-segment branch of
 stage_segments byte-copies the live fragmented MP4 into the stage dir;
@@ -304,6 +304,59 @@ class TestStageSegments:
                 if fname.endswith('.mp4'):
                     assert parse_segment_times(fname) is not None, \
                         f'{fname} has no timestamp'
+
+    def test_completed_segments_are_hardlinked(self, dirs):
+        """Staging pins the inode via os.link — no byte copy on the same fs."""
+        archive, live = dirs
+        now = time.time()
+        path, name = _make_renamed_segment(archive, now - 1200, now - 600)
+        with stage_segments(archive, live, now - 1300, now - 500) as stage_dir:
+            staged = os.path.join(stage_dir, name)
+            assert os.stat(staged).st_ino == os.stat(path).st_ino
+
+    def test_stage_dir_created_on_archive_filesystem(self, dirs):
+        """The stage dir must live inside archive_dir so hardlinks work."""
+        archive, live = dirs
+        tmp = stage_segments(archive, live, 0, time.time())
+        try:
+            assert os.path.dirname(tmp.name) == archive
+        finally:
+            tmp.cleanup()
+
+    def test_stale_stage_dirs_are_swept(self, dirs):
+        """Crash-leaked stage dirs are removed; fresh ones are left alone."""
+        from archive_export import _STAGE_STALE_SEC
+        archive, live = dirs
+        stale = os.path.join(archive, '.archive_stage_old')
+        fresh = os.path.join(archive, '.archive_stage_fresh')
+        os.makedirs(stale)
+        os.makedirs(fresh)
+        old = time.time() - _STAGE_STALE_SEC - 60
+        os.utime(stale, (old, old))
+        with stage_segments(archive, live, 0, time.time()):
+            pass
+        assert not os.path.exists(stale)
+        assert os.path.exists(fresh)
+
+    def test_boot_sweep_removes_fresh_stage_dirs(self, dirs):
+        """With older_than_sec=0 (web-server boot) even fresh leftovers go —
+        no request can be in flight at boot."""
+        from archive_export import sweep_stage_dirs
+        archive, _live = dirs
+        fresh = os.path.join(archive, '.archive_stage_fresh')
+        os.makedirs(fresh)
+        sweep_stage_dirs(archive, older_than_sec=0)
+        assert not os.path.exists(fresh)
+
+    def test_stage_dir_is_world_traversable(self, dirs):
+        """0755 (not mkdtemp's 0700) so host-side tooling walking a
+        bind-mounted archive volume can descend into a leaked stage dir."""
+        archive, live = dirs
+        tmp = stage_segments(archive, live, 0, time.time())
+        try:
+            assert os.stat(tmp.name).st_mode & 0o777 == 0o755
+        finally:
+            tmp.cleanup()
 
     def test_unnamed_files_in_archive_dir_are_ignored(self, dirs):
         """Stray unnamed files inside archive_dir (e.g. from a previous
