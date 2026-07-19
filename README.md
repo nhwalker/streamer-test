@@ -2,7 +2,7 @@
 
 Streams a Linux desktop (X11) to any modern browser with sub-second latency
 while continuously recording it to disk. One container image (Red Hat
-UBI 10), no source builds: **ffmpeg** (capture + encode) → **MediaMTX**
+UBI 9), no source builds: **ffmpeg** (capture + encode) → **MediaMTX**
 (WebRTC/WHEP egress) → browser.
 
 > Migrating from the GStreamer/webrtcsink version? See
@@ -59,7 +59,7 @@ graph TD
         X11 -->|"exposes"| sock
     end
 
-    subgraph container["Container (UBI 10)"]
+    subgraph container["Container (UBI 9)"]
         direction TB
         ff["ffmpeg\nx11grab → filter graph →\nh264_nvenc / libx264"]
         mtx["MediaMTX\nRTSP ingest (loopback)\nWHEP egress :8889"]
@@ -121,7 +121,7 @@ make service hub     # or: podman build -t desktop-stream-service:ci service/
 
 | Component | Source | Air-gap story |
 |---|---|---|
-| ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL10) | mirror the repo |
+| ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL9) | mirror the repo |
 | Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | mirror the repos |
 | MediaMTX | GitHub release binary, **pinned version + sha256** | vendor the tarball, pass `--build-arg MEDIAMTX_URL=…` |
 | Web page + WHEP client | `service/web/` | in-repo, no build step |

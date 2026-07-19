@@ -1,61 +1,63 @@
 # desktop-stream-service: ffmpeg (x11grab + NVENC) -> MediaMTX (WebRTC/WHEP).
 #
 # Single-stage build — no source compilation.  Everything comes from
-# mirror-able RPM repositories (Rocky 10 / EPEL 10 / RPM Fusion Free) except
+# mirror-able RPM repositories (Rocky 9 / EPEL 9 / RPM Fusion Free) except
 # MediaMTX, which is a single static Go binary vendored from a pinned release
 # (override MEDIAMTX_URL to pull it from an internal artifact store on
 # air-gapped builders).
-FROM registry.access.redhat.com/ubi10/ubi:latest
+FROM registry.access.redhat.com/ubi9/ubi:latest
 
-# ── Repos: Rocky 10 + EPEL10 + RPM Fusion Free ───────────────────────────────
-RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial \
-    && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10 \
+# ── Repos: Rocky 9 + EPEL9 + RPM Fusion Free ─────────────────────────────────
+RUN rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
     && printf '%s\n' \
-        '[rocky10-baseos]' \
-        'name=Rocky Linux 10 - BaseOS' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/BaseOS/$basearch/os/' \
+        '[rocky9-baseos]' \
+        'name=Rocky Linux 9 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-appstream]' \
-        'name=Rocky Linux 10 - AppStream' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/AppStream/$basearch/os/' \
+        '[rocky9-appstream]' \
+        'name=Rocky Linux 9 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
         '' \
-        '[rocky10-crb]' \
-        'name=Rocky Linux 10 - CRB' \
-        'baseurl=https://dl.rockylinux.org/pub/rocky/10/CRB/$basearch/os/' \
+        '[rocky9-crb]' \
+        'name=Rocky Linux 9 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/$basearch/os/' \
         'enabled=1' \
         'gpgcheck=1' \
-        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-rockyofficial' \
-        '       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-10' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
         'priority=100' \
-        > /etc/yum.repos.d/rocky10-supplement.repo \
+        > /etc/yum.repos.d/rocky9-supplement.repo \
     && dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm \
-        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm \
     && dnf clean all
 
 # ── Runtime packages ─────────────────────────────────────────────────────────
 # ffmpeg comes from RPM Fusion Free (full build: h264_nvenc, libx264,
 # libopus, x11grab).  Do NOT let EPEL's stripped ffmpeg-free variant in —
 # it conflicts with RPM Fusion's ffmpeg-libs and lacks NVENC.
+# UBI 9's default python3 is 3.9, but the application code needs >= 3.10
+# (zip(strict=True) in stream_command.py; tooling targets 3.11).  Install
+# AppStream's python3.12 and shadow /usr/bin/python3 via /usr/local/bin so
+# every `python3` shebang and entrypoint call resolves to 3.12 while dnf
+# keeps the system 3.9 it depends on.
 RUN dnf install -y \
         --setopt=install_weak_deps=False \
         --setopt=tsflags=nodocs \
         ffmpeg \
-        python3 \
-        python3-pip \
+        python3.12 \
+        python3.12-pip \
         nmap-ncat \
         tar \
-    && pip3 install --no-cache-dir --root-user-action=ignore python-xlib \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && python3.12 -m pip install --no-cache-dir --root-user-action=ignore python-xlib \
     && ffmpeg -hide_banner -encoders | grep -q h264_nvenc \
     && ffmpeg -hide_banner -devices  | grep -q x11grab \
     && dnf clean all \

@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 
 RUN microdnf install -y python3 && microdnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf*
