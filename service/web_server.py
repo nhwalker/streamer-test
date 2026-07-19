@@ -69,16 +69,11 @@ import urllib.parse
 
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
-from archive_export import (
-    stage_segments,
-    sweep_stage_dirs,
-    write_zip_stream,
-    zip_entries,
-    zip_stream_size,
-)
+from archive_export import stage_segments, sweep_stage_dirs, zip_entries
 from archive_times import parse_duration, parse_timestamp
 from desktop_config import load_config
 from video_transcode import transcode_to_video
+from zip_stream import write_zip_stream, zip_stream_size
 
 WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
 ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')

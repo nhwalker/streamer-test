@@ -99,6 +99,7 @@ COPY encoders.py          /usr/local/bin/encoders.py
 COPY video_transcode.py   /usr/local/bin/video_transcode.py
 COPY desktop_config.py    /usr/local/bin/desktop_config.py
 COPY x11.py               /usr/local/bin/x11.py
+COPY zip_stream.py        /usr/local/bin/zip_stream.py
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/pipeline.py \
              /usr/local/bin/stream_command.py /usr/local/bin/web_server.py
 
