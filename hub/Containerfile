@@ -1,4 +1,6 @@
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# Pinned to the current minor — bump alongside service/Containerfile each
+# RHEL 9.x release.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
 
 RUN microdnf install -y python3 && microdnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf*
