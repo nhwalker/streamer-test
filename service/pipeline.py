@@ -74,7 +74,14 @@ ARCHIVE_MAX_AGE_DAYS = int(os.environ.get('ARCHIVE_MAX_AGE_DAYS', '0'))
 # hard-broken configuration (bad display, missing encoder) doesn't spin.
 _RESTART_BACKOFF_START_SEC = 2.0
 _RESTART_BACKOFF_MAX_SEC   = 30.0
-_FINALIZE_POLL_SEC         = 0.5
+# The finalizer re-reads the segment CSV every _FINALIZE_POLL_SEC; segments
+# rotate every ARCHIVE_SEGMENT_SEC (minutes), so sub-second polling buys
+# nothing.  Don't raise it much further though: until a rotated segment is
+# finalized it is invisible to /archive, whose active-segment time estimate
+# is anchored on the last *finalized* segment.  The ffmpeg process itself
+# is watched at _PROC_TICK_SEC so exits and shutdowns stay prompt.
+_FINALIZE_POLL_SEC         = 2.0
+_PROC_TICK_SEC             = 0.5
 # Graceful-stop budget: SIGINT lets ffmpeg flush the last segment + list
 # entry; escalate to SIGKILL if it wedges.
 _STOP_GRACE_SEC            = 10.0
@@ -182,7 +189,9 @@ def main():
         started = time.monotonic()
         while proc.poll() is None:
             finalizer.poll()
-            time.sleep(_FINALIZE_POLL_SEC)
+            deadline = time.monotonic() + _FINALIZE_POLL_SEC
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(_PROC_TICK_SEC)
 
         if shutting_down.is_set():
             try:

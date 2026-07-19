@@ -1,13 +1,14 @@
 """
 Unit tests for the /archive//video building blocks: parse_duration and
-parse_timestamp (archive_times.py), stage_segments and zip_segments
-(archive_export.py).
+parse_timestamp (archive_times.py), stage_segments and the stored-zip
+streamer (archive_export.py).
 
 No Docker or live HTTP server required.  The active-segment branch of
 stage_segments byte-copies the live fragmented MP4 into the stage dir;
 these tests inject a fake copy callable so they stay self-contained.
 """
 import datetime
+import io
 import os
 import time
 import zipfile
@@ -17,7 +18,10 @@ import pytest
 from archive_export import (
     _copy_active_to_stage,
     stage_segments,
+    write_zip_stream,
+    zip_entries,
     zip_segments,
+    zip_stream_size,
 )
 from archive_times import parse_duration, parse_timestamp
 
@@ -305,6 +309,39 @@ class TestStageSegments:
                     assert parse_segment_times(fname) is not None, \
                         f'{fname} has no timestamp'
 
+    def test_completed_segments_are_hardlinked(self, dirs):
+        """Staging pins the inode via os.link — no byte copy on the same fs."""
+        archive, live = dirs
+        now = time.time()
+        path, name = _make_renamed_segment(archive, now - 1200, now - 600)
+        with stage_segments(archive, live, now - 1300, now - 500) as stage_dir:
+            staged = os.path.join(stage_dir, name)
+            assert os.stat(staged).st_ino == os.stat(path).st_ino
+
+    def test_stage_dir_created_on_archive_filesystem(self, dirs):
+        """The stage dir must live inside archive_dir so hardlinks work."""
+        archive, live = dirs
+        tmp = stage_segments(archive, live, 0, time.time())
+        try:
+            assert os.path.dirname(tmp.name) == archive
+        finally:
+            tmp.cleanup()
+
+    def test_stale_stage_dirs_are_swept(self, dirs):
+        """Crash-leaked stage dirs are removed; fresh ones are left alone."""
+        from archive_export import _STAGE_STALE_SEC
+        archive, live = dirs
+        stale = os.path.join(archive, '.archive_stage_old')
+        fresh = os.path.join(archive, '.archive_stage_fresh')
+        os.makedirs(stale)
+        os.makedirs(fresh)
+        old = time.time() - _STAGE_STALE_SEC - 60
+        os.utime(stale, (old, old))
+        with stage_segments(archive, live, 0, time.time()):
+            pass
+        assert not os.path.exists(stale)
+        assert os.path.exists(fresh)
+
     def test_unnamed_files_in_archive_dir_are_ignored(self, dirs):
         """Stray unnamed files inside archive_dir (e.g. from a previous
         single-directory deployment, or a crash) must not be treated as
@@ -479,6 +516,84 @@ class TestZipSegments:
         zip_path = str(tmp_path / 'out.zip')
         zip_segments(str(tmp_path), zip_path)
         assert os.path.isfile(zip_path)
+
+
+# ── zip streaming (zip_entries / zip_stream_size / write_zip_stream) ──────────
+
+class TestZipStream:
+    """The hand-rolled stored-zip writer behind the streamed /archive
+    response: announced size must equal streamed size exactly (it becomes
+    the HTTP Content-Length), and the output must round-trip through a
+    standard reader."""
+
+    def _entries(self, tmp_path, files):
+        for name, content in files.items():
+            (tmp_path / name).write_bytes(content)
+        return zip_entries(str(tmp_path))
+
+    def _stream(self, entries):
+        buf = io.BytesIO()
+        write_zip_stream(entries, buf)
+        return buf.getvalue()
+
+    def test_stream_size_matches_bytes_written(self, tmp_path):
+        entries = self._entries(tmp_path, {
+            'stream-00000.mp4': b'a' * 1000,
+            'stream-00001.mp4': b'b' * 17,
+            'stream-00002.mp4': b'',
+        })
+        assert len(self._stream(entries)) == zip_stream_size(entries)
+
+    def test_roundtrip_through_zipfile(self, tmp_path):
+        files = {'stream-00000.mp4': b'aaa', 'stream-00001.mp4': b'bbbb'}
+        data = self._stream(self._entries(tmp_path, files))
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            assert set(zf.namelist()) == set(files)
+            for name, content in files.items():
+                assert zf.read(name) == content
+
+    def test_entries_are_stored_not_deflated(self, tmp_path):
+        """H.264 segments don't deflate; STORED skips the pointless CPU burn
+        and makes the zip size computable up front."""
+        data = self._stream(self._entries(tmp_path,
+                                          {'stream-00000.mp4': b'x' * 100}))
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            assert all(i.compress_type == zipfile.ZIP_STORED
+                       for i in zf.infolist())
+
+    def test_no_data_descriptors(self, tmp_path):
+        """Flag bit 3 must be clear: STORED entries with data descriptors are
+        rejected by streaming readers (e.g. Java's ZipInputStream)."""
+        data = self._stream(self._entries(tmp_path,
+                                          {'stream-00000.mp4': b'x' * 100}))
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            assert all(i.flag_bits & 0x0008 == 0 for i in zf.infolist())
+
+    def test_empty_zip(self):
+        assert zip_stream_size([]) == 22  # bare end-of-central-directory
+        data = self._stream([])
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            assert zf.namelist() == []
+
+    def test_size_does_not_read_file_data(self, tmp_path):
+        """zip_stream_size is header arithmetic only — safe to call before
+        sending headers even for huge archives."""
+        entries = self._entries(tmp_path, {'stream-00000.mp4': b'x' * 100})
+        os.unlink(entries[0].path)          # size must not need the bytes
+        assert zip_stream_size(entries) > 0
+
+    def test_zip64_roundtrip(self, tmp_path, monkeypatch):
+        """Force the zip64 paths with a tiny threshold and verify a standard
+        reader still round-trips the archive and the size stays exact."""
+        import archive_export
+        monkeypatch.setattr(archive_export, '_ZIP64_LIMIT', 100)
+        entries = self._entries(tmp_path, {'stream-00000.mp4': b'x' * 500,
+                                           'stream-00001.mp4': b'y' * 30})
+        data = self._stream(entries)
+        assert len(data) == zip_stream_size(entries)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            assert zf.read('stream-00000.mp4') == b'x' * 500
+            assert zf.read('stream-00001.mp4') == b'y' * 30
 
 
 # ── integration: stage → zip ──────────────────────────────────────────────────

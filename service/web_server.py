@@ -23,7 +23,10 @@ GET /archive?start=<timestamp>&end=<timestamp>
 GET /archive?last=<duration>
   Returns a zip of the .mp4 segments whose recorded time overlaps the
   requested window, including the active (currently-writing) segment when
-  the window extends past the last completed segment.
+  the window extends past the last completed segment.  The zip is streamed
+  (stored entries, exact Content-Length, nothing written to disk).
+  Requests longer than 24 hours are rejected with 400; at most
+  ARCHIVE_MAX_CONCURRENT downloads run at once (503 + Retry-After beyond).
 
 GET /video?start=<timestamp>&end=<timestamp>
 GET /video?last=<duration>
@@ -51,6 +54,7 @@ Environment variables:
                        segments (timestamp-named, fragmented MP4)
   ARCHIVE_LIVE_DIR     Directory the in-progress .mp4   (/archive-live)
                        fragmented-MP4 segment is being written into
+  ARCHIVE_MAX_CONCURRENT  Max simultaneous /archive downloads  (2)
   VIDEO_FILL_COLOR     ARGB hex fill color for gaps     (0xFF000000)
   VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
   VIDEO_DEFAULT_HEIGHT Output height when no segments   (1080)
@@ -65,7 +69,12 @@ import urllib.parse
 
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
-from archive_export import stage_segments, zip_segments
+from archive_export import (
+    stage_segments,
+    write_zip_stream,
+    zip_entries,
+    zip_stream_size,
+)
 from archive_times import parse_duration, parse_timestamp
 from desktop_config import load_config
 from video_transcode import transcode_to_video
@@ -73,18 +82,26 @@ from video_transcode import transcode_to_video
 WEB_DIR              = os.environ.get('WEB_DIR', '/var/www/html')
 ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_LIVE_DIR     = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
+ARCHIVE_MAX_SEC      = 24 * 3600
+ARCHIVE_MAX_CONCURRENT = int(os.environ.get('ARCHIVE_MAX_CONCURRENT', '2'))
 VIDEO_FILL_COLOR     = int(os.environ.get('VIDEO_FILL_COLOR', '0xFF000000'), 16)
 VIDEO_DEFAULT_WIDTH  = int(os.environ.get('VIDEO_DEFAULT_WIDTH', '1920'))
 VIDEO_DEFAULT_HEIGHT = int(os.environ.get('VIDEO_DEFAULT_HEIGHT', '1080'))
 VIDEO_MAX_SEC        = 12 * 3600
 VIDEO_MAX_CONCURRENT = int(os.environ.get('VIDEO_MAX_CONCURRENT', '2'))
-VIDEO_RETRY_AFTER_SEC = 15
+RETRY_AFTER_SEC      = 15
 
 # Each /video request is a full ffmpeg re-encode that competes with the
 # always-on live encoders for CPU (and NVENC sessions, where the budget is
 # tight).  Beyond the cap, requests get 503 + Retry-After instead of
 # degrading the live stream.
 _video_slots = threading.BoundedSemaphore(VIDEO_MAX_CONCURRENT)
+
+# /archive is much cheaper per hour than /video (no re-encode), but each
+# download is still a sustained disk-read + network burst on the box that
+# is also recording; cap how many run at once so a batch of downloads
+# cannot starve the recorder's disk bandwidth.
+_archive_slots = threading.BoundedSemaphore(ARCHIVE_MAX_CONCURRENT)
 
 CONFIG = load_config()
 CONFIG_JSON = json.dumps(CONFIG).encode('utf-8')
@@ -140,26 +157,51 @@ class Router(SimpleHTTPRequestHandler):
             return None
         return start_ts, end_ts
 
+    def _send_busy(self, limit, what):
+        self.send_response(503, 'Busy')
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Retry-After', str(RETRY_AFTER_SEC))
+        body = f'{limit} {what} already running; retry shortly\n'.encode('utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_archive(self):
         window = self._parse_window()
         if window is None:
             return
         start_ts, end_ts = window
 
-        tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR, start_ts, end_ts)
+        if end_ts - start_ts > ARCHIVE_MAX_SEC:
+            self.send_error(400, 'requested range exceeds 24-hour maximum')
+            return
+
+        if not _archive_slots.acquire(blocking=False):
+            self._send_busy(ARCHIVE_MAX_CONCURRENT, '/archive downloads')
+            return
         try:
-            zip_path = os.path.join(tmp.name, '_archive.zip')
-            zip_segments(tmp.name, zip_path)
-            zip_size = os.path.getsize(zip_path)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/zip')
-            self.send_header('Content-Disposition', 'attachment; filename="archive.zip"')
-            self.send_header('Content-Length', str(zip_size))
-            self.end_headers()
-            with open(zip_path, 'rb') as fh:
-                shutil.copyfileobj(fh, self.wfile, length=64 * 1024)
+            tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR,
+                                 start_ts, end_ts)
+            try:
+                # The stored-zip layout is a pure function of the entry
+                # names and sizes, so the exact Content-Length is known
+                # before any data moves — the zip streams straight to the
+                # socket and never touches the disk.
+                entries = zip_entries(tmp.name)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition',
+                                 'attachment; filename="archive.zip"')
+                self.send_header('Content-Length', str(zip_stream_size(entries)))
+                self.end_headers()
+                try:
+                    write_zip_stream(entries, self.wfile)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # client went away mid-download
+            finally:
+                tmp.cleanup()
         finally:
-            tmp.cleanup()
+            _archive_slots.release()
 
     def _handle_video(self):
         window = self._parse_window()
@@ -172,14 +214,7 @@ class Router(SimpleHTTPRequestHandler):
             return
 
         if not _video_slots.acquire(blocking=False):
-            self.send_response(503, 'Busy')
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.send_header('Retry-After', str(VIDEO_RETRY_AFTER_SEC))
-            body = (f'{VIDEO_MAX_CONCURRENT} /video transcodes already '
-                    'running; retry shortly\n').encode('utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_busy(VIDEO_MAX_CONCURRENT, '/video transcodes')
             return
         # The slot covers only the expensive part (staging + ffmpeg
         # encode).  Streaming the finished file to the client is I/O-bound

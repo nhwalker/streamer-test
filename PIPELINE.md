@@ -224,8 +224,11 @@ ffmpeg appends one CSV line per **completed** segment to
 stream-00000.mp4,0.000000,600.000000     # name, start_s, end_s (stream time)
 ```
 
-`archive_finalize.SegmentFinalizer` (polled every 0.5 s from `pipeline.py`)
-tails that file and, for each new line:
+`archive_finalize.SegmentFinalizer` (polled every 2 s from `pipeline.py` —
+rotations are minutes apart, so faster polling buys nothing, but the
+interval stays small because `/archive`'s active-segment time estimate is
+anchored on the last *finalized* segment) tails that file and, for each
+new line:
 
 1. Reconstructs wall-clock timestamps as `epoch_anchor + stream_time`,
    where the anchor is `time.time()` at ffmpeg spawn (the capture is
@@ -368,18 +371,29 @@ The runtime config: `desktopName`, `width`, `height`, `framerate`,
 
 ### `GET /archive?start=<ts>&end=<ts>` / `GET /archive?last=<duration>`
 
-Zip of the segments overlapping the window. Completed segments are copied
-byte-for-byte. The active segment (highest sequential name in the live dir)
+Zip of the segments overlapping the window. Completed segments are
+hardlinked into the staging dir (the link pins the inode against the
+purger with zero data movement; byte-copy is the cross-filesystem
+fallback). The active segment (highest sequential name in the live dir)
 is included when the window extends past the last completed segment — as a
 plain byte-copy, since the fMP4's moov is at the front and a truncated
 trailing fragment is ignored by players. The fd-based copy pins the inode,
 so a rotation mid-copy cannot corrupt the download.
 
+The zip uses stored (uncompressed) entries — the segments are H.264 that
+DEFLATE cannot shrink — which makes the total size a pure function of the
+entry names and sizes: the response streams straight to the socket with an
+exact `Content-Length`, never touching disk. Windows over 24 hours are
+rejected; at most `ARCHIVE_MAX_CONCURRENT` (default 2) downloads run at
+once, overflow requests receive `503` + `Retry-After`.
+
 ### `GET /video?start=<ts>&end=<ts>` / `GET /video?last=<duration>`
 
-One faststart MP4 covering exactly the window: segments are laid on a
-solid-color base track at their true temporal offsets (gaps filled with
-`VIDEO_FILL_COLOR`), re-encoded at `VIDEO_QP` (defaults to `ARCHIVE_QP`).
+One faststart MP4 covering exactly the window: the window is cut into
+consecutive pieces — one clip per overlapping segment (opened with an
+input-side seek when it starts before the window), one generated
+`VIDEO_FILL_COLOR` clip per uncovered stretch — joined with ffmpeg's
+concat filter and re-encoded at `VIDEO_QP` (defaults to `ARCHIVE_QP`).
 Windows over 12 hours are rejected. At most `VIDEO_MAX_CONCURRENT`
 (default 2) transcodes run at once — each is a full ffmpeg encode that
 competes with the live encoders — and overflow requests receive

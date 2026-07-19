@@ -224,6 +224,7 @@ fixed-CBR alternative.
 | `ARCHIVE_QP` | `18` | QP for `visually-lossless` mode |
 | `ARCHIVE_BITRATE` | `6000` | kbps, `legacy` mode only |
 | `ARCHIVE_MAX_BYTES` / `ARCHIVE_MAX_AGE_DAYS` | `0` | Size/age-based purge; 0 = unlimited |
+| `ARCHIVE_MAX_CONCURRENT` | `2` | Max simultaneous `/archive` downloads; beyond it requests get `503` + `Retry-After` (windows over 24 h get `400`) |
 | `VIDEO_FILL_COLOR` | `0xFF000000` | `/video` gap-fill color |
 | `VIDEO_QP` | = `ARCHIVE_QP` | `/video` output quality; tracks the archive so there's no second knob |
 | `VIDEO_MAX_CONCURRENT` | `2` | Max simultaneous `/video` transcodes; beyond it requests get `503` + `Retry-After` so archive downloads can't starve the live encoders |
