@@ -39,7 +39,8 @@ def _mock_video_file_info(monkeypatch):
     (containing b'fake') are included in the timeline rather than filtered.
     """
     import video_transcode as _vt
-    monkeypatch.setattr(_vt, '_query_file_info', lambda _path: (600.0, 1280, 720, '25/1'))
+    monkeypatch.setattr(_vt, '_query_file_info',
+                        lambda _path: (600.0, 1280, 720, '25/1', 'h264'))
 
 
 def _make_seg(directory, index, age_seconds=0):
@@ -255,7 +256,25 @@ class TestUnnamedFilesIgnored:
         assert len(tl) == 1
 
 
-# ── concat assembly (transcode_to_video's ffmpeg command) ─────────────────────
+# ── concat assembly (transcode_to_video's ffmpeg commands) ────────────────────
+
+def _capture_ffmpeg_runs(monkeypatch):
+    """Stub subprocess.run, recording every ffmpeg argv in calls['cmds']."""
+    calls = {'cmds': []}
+
+    class _Result:
+        returncode = 0
+        stderr     = b''
+
+    def fake_run(cmd, **_kw):
+        calls['cmds'].append(cmd)
+        return _Result()
+
+    monkeypatch.setattr(video_transcode.subprocess, 'run', fake_run)
+    monkeypatch.setattr(video_transcode, '_encoder_args',
+                        lambda: ['-c:v', 'libx264'])
+    return calls
+
 
 class TestConcatAssembly:
     """The assembled filter graph is a concat of consecutive pieces: one
@@ -265,30 +284,21 @@ class TestConcatAssembly:
 
     @pytest.fixture
     def captured(self, monkeypatch):
-        calls = {}
-
-        class _Result:
-            returncode = 0
-            stderr     = b''
-
-        def fake_run(cmd, **_kw):
-            calls['cmd'] = cmd
-            return _Result()
-
-        monkeypatch.setattr(video_transcode.subprocess, 'run', fake_run)
-        monkeypatch.setattr(video_transcode, '_encoder_args',
-                            lambda: ['-c:v', 'libx264'])
-        return calls
+        return _capture_ffmpeg_runs(monkeypatch)
 
     def _transcode(self, stage_dir, start_ts, end_ts):
+        # Probe duration (600 s) never matches these tests' segment
+        # windows, so the stream-copy fast path stays disabled and the
+        # single-pass concat-filter encode is what's captured.
         transcode_to_video(
             str(stage_dir), start_ts, end_ts, 0xFF112233,
             os.path.join(str(stage_dir), 'out.mp4'),
-            _query_info=lambda _p: (600.0, 1280, 720, '30/1'),
+            _query_info=lambda _p: (600.0, 1280, 720, '30/1', 'h264'),
         )
 
     def _filter(self, calls):
-        cmd = calls['cmd']
+        assert len(calls['cmds']) == 1  # single-pass = exactly one ffmpeg run
+        cmd = calls['cmds'][0]
         return cmd[cmd.index('-filter_complex') + 1]
 
     def test_no_overlay_chain(self, tmp_path, captured):
@@ -324,7 +334,7 @@ class TestConcatAssembly:
         now = time.time()
         _make_renamed(tmp_path, now - 1000, now)
         self._transcode(tmp_path, now - 900, now - 100)
-        cmd = captured['cmd']
+        cmd = captured['cmds'][0]
         idx = cmd.index('-ss')
         assert float(cmd[idx + 1]) == pytest.approx(100.0, abs=0.01)
         assert cmd[idx + 2] == '-i'
@@ -334,7 +344,7 @@ class TestConcatAssembly:
         now = time.time()
         _make_renamed(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
-        assert '-ss' not in captured['cmd']
+        assert '-ss' not in captured['cmds'][0]
 
     def test_no_segments_pure_color(self, tmp_path, captured):
         now = time.time()
@@ -342,14 +352,14 @@ class TestConcatAssembly:
         filt = self._filter(captured)
         assert filt.count('color=c=') == 1
         assert 'concat=n=1:v=1:a=0' in filt
-        assert '-i' not in captured['cmd']
+        assert '-i' not in captured['cmds'][0]
 
     def test_inputs_appear_in_timeline_order(self, tmp_path, captured):
         now = time.time()
         first,  _ = _make_renamed(tmp_path, now - 800, now - 500)
         second, _ = _make_renamed(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
-        cmd = captured['cmd']
+        cmd = captured['cmds'][0]
         inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == '-i']
         assert inputs == [first, second]
 
@@ -361,3 +371,123 @@ class TestConcatAssembly:
         _make_renamed(tmp_path, now - 800, now - 500)
         self._transcode(tmp_path, now - 900, now)
         assert 'tpad=stop_mode=add' in self._filter(captured)
+
+
+# ── stream-copy fast path ─────────────────────────────────────────────────────
+
+def _probe_from_name(path):
+    """Probe stub whose duration matches the filename's claimed window, so
+    whole segments qualify for the stream-copy fast path."""
+    from archive_times import parse_segment_times
+    times = parse_segment_times(os.path.basename(path))
+    dur = (times[1] - times[0]) if times else 0.0
+    return (dur, 1280, 720, '30/1', 'h264')
+
+
+class TestStreamCopyFastPath:
+    """Whole untrimmed segments must be remuxed with -c copy (never
+    decoded); only gaps and window-clipped boundary segments encode."""
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        return _capture_ffmpeg_runs(monkeypatch)
+
+    def _transcode(self, stage_dir, start_ts, end_ts, probe=_probe_from_name):
+        transcode_to_video(
+            str(stage_dir), start_ts, end_ts, 0xFF112233,
+            os.path.join(str(stage_dir), 'out.mp4'),
+            _query_info=probe,
+        )
+
+    @staticmethod
+    def _copy_cmds(calls):
+        return [c for c in calls['cmds'] if '-bsf:v' in c]
+
+    @staticmethod
+    def _concat_cmd(calls):
+        return calls['cmds'][-1]
+
+    def test_whole_segments_copied_gaps_encoded(self, tmp_path, captured):
+        # window [now-900, now]; whole segments [now-800, now-500] and
+        # [now-400, now-100] → 2 copies, 3 encoded gaps, 1 final concat.
+        now = time.time()
+        _make_renamed(tmp_path, now - 800, now - 500)
+        _make_renamed(tmp_path, now - 400, now - 100)
+        self._transcode(tmp_path, now - 900, now)
+        cmds = captured['cmds']
+        assert len(cmds) == 6
+        copies = self._copy_cmds(captured)
+        assert len(copies) == 2
+        for c in copies:
+            assert 'copy' in c and 'mpegts' in c and '-filter_complex' not in c
+        gap_encodes = [c for c in cmds
+                       if '-filter_complex' in c
+                       and 'color=c=' in c[c.index('-filter_complex') + 1]]
+        assert len(gap_encodes) == 3
+        final = self._concat_cmd(captured)
+        assert 'concat' in final and '+faststart' in final
+        assert final[-1].endswith('out.mp4')
+
+    def test_clipped_boundary_segment_is_encoded_not_copied(
+            self, tmp_path, captured):
+        # Segment A's head is clipped by the window → encoded with -ss;
+        # segment B is whole → copied.
+        now = time.time()
+        _make_renamed(tmp_path, now - 800, now - 500)
+        _make_renamed(tmp_path, now - 400, now - 100)
+        self._transcode(tmp_path, now - 750, now - 100)
+        copies = self._copy_cmds(captured)
+        assert len(copies) == 1
+        seek_encodes = [c for c in captured['cmds'] if '-ss' in c]
+        assert len(seek_encodes) == 1
+        assert '-filter_complex' in seek_encodes[0]
+
+    def test_duration_mismatch_disables_copy(self, tmp_path, captured):
+        """A segment whose probed content is shorter than its filename
+        claims (estimated active-segment end) must not be copied — the
+        copy path can't pad, so it would shift later pieces."""
+        now = time.time()
+        _make_renamed(tmp_path, now - 400, now - 100)
+
+        def short_probe(_path):
+            return (250.0, 1280, 720, '30/1', 'h264')  # claims 300 s
+
+        self._transcode(tmp_path, now - 900, now, probe=short_probe)
+        assert self._copy_cmds(captured) == []
+        assert len(captured['cmds']) == 1  # single-pass encode
+
+    def test_non_h264_disables_copy(self, tmp_path, captured):
+        now = time.time()
+        _make_renamed(tmp_path, now - 400, now - 100)
+
+        def vp9_probe(path):
+            dur, w, h, fps, _ = _probe_from_name(path)
+            return (dur, w, h, fps, 'vp9')
+
+        self._transcode(tmp_path, now - 900, now, probe=vp9_probe)
+        assert self._copy_cmds(captured) == []
+        assert len(captured['cmds']) == 1
+
+    def test_fast_path_failure_falls_back_to_single_pass(
+            self, tmp_path, monkeypatch):
+        """If any fast-path ffmpeg run fails, the request is retried as a
+        full single-pass re-encode instead of returning 500."""
+        calls = {'cmds': []}
+
+        def fake_run(cmd, **_kw):
+            class _R:
+                returncode = 1 if '-bsf:v' in cmd else 0
+                stderr     = b'boom'
+            calls['cmds'].append(cmd)
+            return _R()
+
+        monkeypatch.setattr(video_transcode.subprocess, 'run', fake_run)
+        monkeypatch.setattr(video_transcode, '_encoder_args',
+                            lambda: ['-c:v', 'libx264'])
+        now = time.time()
+        _make_renamed(tmp_path, now - 400, now - 100)
+        self._transcode(tmp_path, now - 900, now)
+        final = calls['cmds'][-1]
+        assert '-filter_complex' in final       # single-pass encode ran
+        assert 'concat=n=' in final[final.index('-filter_complex') + 1]
+        assert final[-1].endswith('out.mp4')

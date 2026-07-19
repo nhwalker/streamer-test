@@ -109,12 +109,12 @@ class Router(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
 
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == '/archive':
-            self._handle_archive()
-        elif path == '/video':
-            self._handle_video()
-        elif path == '/config.json':
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/archive':
+            self._handle_archive(parsed.query)
+        elif parsed.path == '/video':
+            self._handle_video(parsed.query)
+        elif parsed.path == '/config.json':
             self._handle_config()
         else:
             super().do_GET()
@@ -134,10 +134,10 @@ class Router(SimpleHTTPRequestHandler):
             path = '/index.html'
         return super().translate_path(path)
 
-    def _parse_window(self):
-        """Return (start_ts, end_ts) from the request query, or None after
-        having sent a 400 response."""
-        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+    def _parse_window(self, query):
+        """Return (start_ts, end_ts) from the request query string, or None
+        after having sent a 400 response."""
+        params = urllib.parse.parse_qs(query)
         try:
             if 'last' in params:
                 end_ts   = time.time()
@@ -162,8 +162,8 @@ class Router(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_archive(self):
-        window = self._parse_window()
+    def _handle_archive(self, query):
+        window = self._parse_window(query)
         if window is None:
             return
         start_ts, end_ts = window
@@ -199,8 +199,8 @@ class Router(SimpleHTTPRequestHandler):
         finally:
             _archive_slots.release()
 
-    def _handle_video(self):
-        window = self._parse_window()
+    def _handle_video(self, query):
+        window = self._parse_window(query)
         if window is None:
             return
         start_ts, end_ts = window
