@@ -8,7 +8,8 @@ for the assembly tests).
 Model: _build_timeline returns a list of TimelineItem (one per overlapping
 segment, no gap items).  transcode_to_video turns that into consecutive
 pieces — one clip per segment, one generated color clip per uncovered
-stretch — joined with the concat filter.
+stretch — joined either by the concat filter (single-pass encode) or by
+the concat demuxer over per-piece intermediates (stream-copy fast path).
 
 All files in the stage directory must have timestamps in their filenames.
 Files without recognized timestamps are skipped.

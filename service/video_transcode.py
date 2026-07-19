@@ -90,6 +90,48 @@ class TimelineItem:
     duration_s:     float  # clip length after clipping to the window
 
 
+@dataclass
+class Piece:
+    """One consecutive slice of the output timeline (see _plan_pieces).
+
+    kind    'seg' — a clip from a staged segment; 'gap' — generated fill.
+    dur_s   length of this piece on the output timeline.
+    item    the TimelineItem behind a 'seg' piece (None for gaps).
+    seek_s  input-side seek into item.path before the clip starts.  Not
+            the same as item.offset_s: it additionally includes any head
+            clamp applied when the previous piece already covers this
+            segment's start.
+    """
+    kind:   str
+    dur_s:  float
+    item:   TimelineItem | None = None
+    seek_s: float = 0.0
+
+
+@dataclass
+class _Canvas:
+    """The output raster every piece is normalised to, plus the gap fill.
+
+    `color` is an ffmpeg 0xRRGGBB string (see _fill_color_str)."""
+    width:   int
+    height:  int
+    fps_str: str
+    color:   str
+
+    @property
+    def size(self):
+        return f'{self.width}x{self.height}'
+
+
+def _fill_color_str(argb):
+    """ffmpeg 0xRRGGBB color string from a 0xAARRGGBB int.
+
+    The alpha byte is deliberately dropped: the output raster has no
+    alpha channel, so only the RGB part of VIDEO_FILL_COLOR is used.
+    """
+    return f'0x{argb & 0xFFFFFF:06X}'
+
+
 # ── File introspection ────────────────────────────────────────────────────────
 
 def _query_file_info(path):
@@ -176,40 +218,42 @@ def _run_ffmpeg(cmd):
 
 
 def _plan_pieces(timeline, total_dur):
-    """Split [0, total_dur] into an ordered piece list covering it exactly.
+    """Split [0, total_dur] into an ordered Piece list covering it exactly.
 
-    Returns ('seg', item, seek_s, dur_s) and ('gap', dur_s) tuples.  A
-    segment overlapped by the previous piece (clock-estimation slop on the
-    active segment) has its head advanced; gaps arise wherever no segment
-    covers the output.
+    Gaps arise wherever no segment covers the output; a segment whose
+    head is already covered by the previous piece (clock-estimation slop
+    on the active segment) has its clip head advanced instead, so output
+    time never runs backwards.
     """
     pieces = []
     pos = 0.0
     for item in timeline:
-        start, dur, seek = item.output_start_s, item.duration_s, item.offset_s
-        if start > pos + _EPS:
-            pieces.append(('gap', start - pos))
-            pos = start
-        overlap = pos - start   # > 0 when the previous piece covers our head
-        if overlap > 0:
-            seek += overlap
-            dur  -= overlap
+        if item.output_start_s > pos + _EPS:
+            pieces.append(Piece('gap', item.output_start_s - pos))
+            pos = item.output_start_s
+        head_clamp = max(0.0, pos - item.output_start_s)
+        dur = item.duration_s - head_clamp
         if dur <= _EPS:
-            continue
-        pieces.append(('seg', item, seek, dur))
+            continue   # entirely covered by the previous piece
+        pieces.append(Piece('seg', dur, item=item,
+                            seek_s=item.offset_s + head_clamp))
         pos += dur
     if total_dur - pos > _EPS or not pieces:
-        pieces.append(('gap', total_dur - pos))
+        # Trailing fill.  For a degenerate window (total_dur ≈ 0 with an
+        # empty timeline) this deliberately appends a zero-length gap:
+        # ffmpeg rejects a zero-duration color source, so the request
+        # fails the way it always has (RuntimeError → HTTP 500).
+        pieces.append(Piece('gap', total_dur - pos))
     return pieces
 
 
-def _gap_filter(dur, size, fps_str, color, label):
+def _gap_filter(dur, canvas, label):
     """Generated solid-color source for an uncovered stretch."""
-    return (f'color=c={color}:s={size}:r={fps_str}'
+    return (f'color=c={canvas.color}:s={canvas.size}:r={canvas.fps_str}'
             f':duration={dur:.6f},format=yuv420p,setsar=1{label}')
 
 
-def _seg_filter(in_idx, dur, width, height, fps_str, color, label):
+def _seg_filter(in_idx, dur, canvas, label):
     """Normalisation chain for a segment clip (input already seeked).
 
     The tpad+trim pair is the undershoot guard: pad with fill color, then
@@ -218,38 +262,36 @@ def _seg_filter(in_idx, dur, width, height, fps_str, color, label):
     its true temporal offset.
     """
     return (f'[{in_idx}:v]setpts=PTS-STARTPTS'
-            f',scale={width}:{height},setsar=1,fps={fps_str}'
-            f',format=yuv420p'
-            f',tpad=stop_mode=add:stop_duration={dur:.6f}:color={color}'
+            f',scale={canvas.width}:{canvas.height},setsar=1'
+            f',fps={canvas.fps_str},format=yuv420p'
+            f',tpad=stop_mode=add:stop_duration={dur:.6f}:color={canvas.color}'
             f',trim=end={dur:.6f},setpts=PTS-STARTPTS{label}')
 
 
-def _is_stream_copyable(piece, out_w, out_h, _query_info):
+def _is_stream_copyable(piece, canvas, _query_info):
     """True when a piece can be stream-copied instead of re-encoded.
 
     Requires an untrimmed whole-segment piece whose probed content is
     H.264 at the output resolution and actually carries the duration its
     filename claims (see _COPY_DUR_TOL_SEC).
     """
-    if piece[0] != 'seg':
+    if piece.kind != 'seg':
         return False
-    _, item, seek, dur = piece
-    if seek > _EPS or item.offset_s > _EPS:
+    if piece.seek_s > _EPS or piece.item.offset_s > _EPS:
         return False
-    times = parse_segment_times(os.path.basename(item.path))
+    times = parse_segment_times(os.path.basename(piece.item.path))
     if times is None:
         return False
     seg_dur = times[1] - times[0]
-    if abs(dur - seg_dur) > _EPS:
+    if abs(piece.dur_s - seg_dur) > _EPS:
         return False   # clipped by the window or a neighbouring piece
-    probed_dur, w, h, _fps, codec = _query_info(item.path)
-    if codec != 'h264' or (w, h) != (out_w, out_h):
+    probed_dur, w, h, _fps, codec = _query_info(piece.item.path)
+    if codec != 'h264' or (w, h) != (canvas.width, canvas.height):
         return False
     return abs(probed_dur - seg_dur) <= _COPY_DUR_TOL_SEC
 
 
-def _encode_single_pass(pieces, width, height, fps_str, size, color,
-                        output_path):
+def _encode_single_pass(pieces, canvas, output_path):
     """One ffmpeg run: every piece decoded/generated, concat filter, encode."""
     cmd     = ['ffmpeg', '-y']
     filters = []
@@ -257,20 +299,17 @@ def _encode_single_pass(pieces, width, height, fps_str, size, color,
     n_inputs = 0
     for k, piece in enumerate(pieces):
         label = f'[p{k}]'
-        if piece[0] == 'gap':
-            _, dur = piece
-            filters.append(_gap_filter(dur, size, fps_str, color, label))
+        if piece.kind == 'gap':
+            filters.append(_gap_filter(piece.dur_s, canvas, label))
         else:
-            _, item, seek, dur = piece
             in_idx = n_inputs
             n_inputs += 1
-            if seek > _EPS:
+            if piece.seek_s > _EPS:
                 # Input-side seek: decode from the nearest prior keyframe
                 # instead of decoding and discarding the whole head.
-                cmd += ['-ss', f'{seek:.6f}']
-            cmd += ['-i', item.path]
-            filters.append(_seg_filter(in_idx, dur, width, height,
-                                       fps_str, color, label))
+                cmd += ['-ss', f'{piece.seek_s:.6f}']
+            cmd += ['-i', piece.item.path]
+            filters.append(_seg_filter(in_idx, piece.dur_s, canvas, label))
         labels.append(label)
     filters.append(''.join(labels) + f'concat=n={len(pieces)}:v=1:a=0[out]')
 
@@ -280,8 +319,7 @@ def _encode_single_pass(pieces, width, height, fps_str, size, color,
     _run_ffmpeg(cmd)
 
 
-def _assemble_with_stream_copy(pieces, copyable, width, height, fps_str,
-                               size, color, output_path):
+def _assemble_with_stream_copy(pieces, copyable, canvas, output_path):
     """Fast path: copy whole segments' bitstreams, encode only the rest.
 
     Every piece becomes an MPEG-TS intermediate next to output_path —
@@ -298,25 +336,21 @@ def _assemble_with_stream_copy(pieces, copyable, width, height, fps_str,
         ts_path = os.path.join(workdir, f'piece_{k:04d}.ts')
         ts_paths.append(ts_path)
         if copyable[k]:
-            _, item, _seek, _dur = piece
-            _run_ffmpeg(['ffmpeg', '-y', '-i', item.path,
+            _run_ffmpeg(['ffmpeg', '-y', '-i', piece.item.path,
                          '-map', '0:v:0', '-c', 'copy',
                          '-bsf:v', 'h264_mp4toannexb',
                          '-f', 'mpegts', ts_path])
             continue
         cmd = ['ffmpeg', '-y']
-        if piece[0] == 'gap':
-            _, dur = piece
+        if piece.kind == 'gap':
             cmd += ['-filter_complex',
-                    _gap_filter(dur, size, fps_str, color, '[out]')]
+                    _gap_filter(piece.dur_s, canvas, '[out]')]
         else:
-            _, item, seek, dur = piece
-            if seek > _EPS:
-                cmd += ['-ss', f'{seek:.6f}']
-            cmd += ['-i', item.path]
+            if piece.seek_s > _EPS:
+                cmd += ['-ss', f'{piece.seek_s:.6f}']
+            cmd += ['-i', piece.item.path]
             cmd += ['-filter_complex',
-                    _seg_filter(0, dur, width, height, fps_str, color,
-                                '[out]')]
+                    _seg_filter(0, piece.dur_s, canvas, '[out]')]
         cmd += ['-map', '[out]', *_encoder_args(), '-f', 'mpegts', ts_path]
         _run_ffmpeg(cmd)
 
@@ -357,25 +391,17 @@ def transcode_to_video(stage_dir, start_ts, end_ts,
         if w > 0 and h > 0:
             width, height, fps_str = w, h, fps
             break
+    canvas = _Canvas(width, height, fps_str,
+                     _fill_color_str(fill_color_argb))
 
-    r = (fill_color_argb >> 16) & 0xFF
-    g = (fill_color_argb >>  8) & 0xFF
-    b =  fill_color_argb        & 0xFF
-    color     = f'0x{r:02X}{g:02X}{b:02X}'
-    size      = f'{width}x{height}'
-    total_dur = end_ts - start_ts
-
-    pieces   = _plan_pieces(timeline, total_dur)
-    copyable = [_is_stream_copyable(p, width, height, _query_info)
-                for p in pieces]
+    pieces   = _plan_pieces(timeline, end_ts - start_ts)
+    copyable = [_is_stream_copyable(p, canvas, _query_info) for p in pieces]
 
     if any(copyable):
         try:
-            _assemble_with_stream_copy(pieces, copyable, width, height,
-                                       fps_str, size, color, output_path)
+            _assemble_with_stream_copy(pieces, copyable, canvas, output_path)
             return
         except RuntimeError as exc:
             print(f'[video] WARNING: stream-copy fast path failed ({exc}); '
                   'falling back to full re-encode', flush=True)
-    _encode_single_pass(pieces, width, height, fps_str, size, color,
-                        output_path)
+    _encode_single_pass(pieces, canvas, output_path)
