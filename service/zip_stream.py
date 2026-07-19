@@ -37,6 +37,17 @@ class ZipEntry(NamedTuple):
     date_time: tuple   # (Y, M, D, h, m, s) local time, for the zip headers
 
 
+class _CentralEntry(NamedTuple):
+    """What the central directory needs to record about a written member."""
+    name:          bytes
+    flags:         int
+    crc:           int
+    size:          int
+    header_offset: int
+    dtime:         int
+    ddate:         int
+
+
 def _dos_datetime(date_time):
     """(dos_time, dos_date) for a (Y, M, D, h, m, s) tuple; clamps pre-1980."""
     y, mo, d, h, mi, s = date_time[:6]
@@ -109,30 +120,30 @@ def _write_zip(entries, out, include_data):
                 offset += w(chunk)
         else:
             offset += e.size
-        central.append((name, flags, crc, e.size, header_offset,
-                        dtime, ddate))
+        central.append(_CentralEntry(name, flags, crc, e.size,
+                                     header_offset, dtime, ddate))
 
     cd_start  = offset
     n_entries = len(central)
-    for name, flags, crc, size, header_offset, dtime, ddate in central:
+    for c in central:
         extra_fields = []
-        size_marker  = size
-        if size >= _ZIP64_LIMIT:
-            extra_fields += [size, size]        # uncompressed, compressed
+        size_marker  = c.size
+        if c.size >= _ZIP64_LIMIT:
+            extra_fields += [c.size, c.size]    # uncompressed, compressed
             size_marker   = 0xFFFFFFFF
-        off_marker = header_offset
-        if header_offset >= _ZIP64_LIMIT:
-            extra_fields.append(header_offset)
+        off_marker = c.header_offset
+        if c.header_offset >= _ZIP64_LIMIT:
+            extra_fields.append(c.header_offset)
             off_marker = 0xFFFFFFFF
         extra = (struct.pack('<HH' + 'Q' * len(extra_fields),
                              0x0001, 8 * len(extra_fields), *extra_fields)
                  if extra_fields else b'')
         version = 45 if extra_fields else 20
         offset += w(struct.pack(
-            '<IHHHHHHIIIHHHHHII', 0x02014B50, version, version, flags, 0,
-            dtime, ddate, crc, size_marker, size_marker,
-            len(name), len(extra), 0, 0, 0, 0, off_marker))
-        offset += w(name)
+            '<IHHHHHHIIIHHHHHII', 0x02014B50, version, version, c.flags, 0,
+            c.dtime, c.ddate, c.crc, size_marker, size_marker,
+            len(c.name), len(extra), 0, 0, 0, 0, off_marker))
+        offset += w(c.name)
         offset += w(extra)
     cd_size = offset - cd_start
 

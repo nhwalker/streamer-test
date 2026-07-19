@@ -27,6 +27,7 @@ import time
 import pytest
 
 import video_transcode
+from helpers import make_completed_segment, make_live_segment
 from video_transcode import _build_timeline, transcode_to_video
 
 SEGMENT_SEC = 600
@@ -44,31 +45,6 @@ def _mock_video_file_info(monkeypatch):
                         lambda _path: (600.0, 1280, 720, '25/1', 'h264'))
 
 
-def _make_seg(directory, index, age_seconds=0):
-    """Write a fake unnamed segment (no timestamp in name) and set its mtime."""
-    path = os.path.join(str(directory), f'stream-{index:05d}.mp4')
-    with open(path, 'wb') as fh:
-        fh.write(b'fake')
-    mtime = time.time() - age_seconds
-    os.utime(path, (mtime, mtime))
-    return path
-
-
-def _make_renamed(directory, start_epoch, end_epoch):
-    """Write a fake renamed segment (timestamps in filename)."""
-    import datetime as _dt
-    utc = _dt.timezone.utc
-    fmt = '%Y%m%d-%H%M%S'
-
-    def _fmt(e):
-        d = _dt.datetime.fromtimestamp(e, tz=utc)
-        return f'{d.strftime(fmt)}.{d.microsecond // 1000:03d}'
-
-    name = f'stream_{_fmt(start_epoch)}_to_{_fmt(end_epoch)}.mp4'
-    path = os.path.join(str(directory), name)
-    with open(path, 'wb') as fh:
-        fh.write(b'fake')
-    return path, name
 
 
 # ── empty stage dir ───────────────────────────────────────────────────────────
@@ -92,14 +68,14 @@ class TestSingleSegmentFillsRange:
 
     def test_one_item_returned(self, tmp_path):
         now = time.time()
-        _make_renamed(tmp_path, now - 700, now - 100)
+        make_completed_segment(tmp_path, now - 700, now - 100)
         tl = _build_timeline(str(tmp_path), now - 600, now - 200)
         assert len(tl) == 1
 
     def test_offset_nonzero_when_segment_starts_before_window(self, tmp_path):
         now = time.time()
         seg_start = now - 700
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = now - 600  # 100 s into the segment
         tl = _build_timeline(str(tmp_path), req_start, now - 200)
         assert tl[0].offset_s == pytest.approx(100.0, abs=0.01)
@@ -108,7 +84,7 @@ class TestSingleSegmentFillsRange:
     def test_zero_offset_zero_output_start_when_segment_starts_at_window(self, tmp_path):
         now = time.time()
         seg_start = now - 600
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), seg_start, now - 100)
         assert tl[0].offset_s == pytest.approx(0.0, abs=0.001)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
@@ -121,7 +97,7 @@ class TestGapsAtEdges:
     def test_one_item_with_leading_gap(self, tmp_path):
         now = time.time()
         seg_start = now - 400
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 600, now - 100)
         assert len(tl) == 1
         assert tl[0].path is not None
@@ -129,7 +105,7 @@ class TestGapsAtEdges:
     def test_output_start_nonzero_with_leading_gap(self, tmp_path):
         now = time.time()
         seg_start = now - 400
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = now - 600  # 200 s before segment
         tl = _build_timeline(str(tmp_path), req_start, now - 100)
         assert tl[0].output_start_s == pytest.approx(200.0, abs=0.1)
@@ -137,7 +113,7 @@ class TestGapsAtEdges:
     def test_one_item_with_trailing_gap(self, tmp_path):
         now = time.time()
         seg_start = now - 900
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), seg_start, now)
         assert len(tl) == 1
         assert tl[0].path is not None
@@ -145,7 +121,7 @@ class TestGapsAtEdges:
     def test_zero_offset_with_trailing_gap(self, tmp_path):
         now = time.time()
         seg_start = now - 900
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), seg_start, now)
         assert tl[0].offset_s == pytest.approx(0.0, abs=0.001)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
@@ -157,15 +133,15 @@ class TestGapBetweenSegments:
 
     def test_two_items_with_middle_gap(self, tmp_path):
         now = time.time()
-        _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
-        _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
+        make_completed_segment(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
+        make_completed_segment(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 1400, now)
         assert len(tl) == 2
 
     def test_second_item_output_start_nonzero(self, tmp_path):
         now = time.time()
-        _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
-        _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
+        make_completed_segment(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
+        make_completed_segment(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
         req_start = now - 1400
         tl = _build_timeline(str(tmp_path), req_start, now - 100)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
@@ -174,8 +150,8 @@ class TestGapBetweenSegments:
 
     def test_items_ordered_by_start_time(self, tmp_path):
         now = time.time()
-        _make_renamed(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
-        _make_renamed(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
+        make_completed_segment(tmp_path, now - 1400, now - 1400 + SEGMENT_SEC)
+        make_completed_segment(tmp_path, now - 600,  now - 600  + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 1400, now - 100)
         assert tl[0].output_start_s < tl[1].output_start_s
 
@@ -187,7 +163,7 @@ class TestClipOffset:
     def test_offset_nonzero_when_request_starts_mid_segment(self, tmp_path):
         now = time.time()
         seg_start = now - 800
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = seg_start + 200  # 200 s into the segment
         tl = _build_timeline(str(tmp_path), req_start, seg_start + 500)
         assert tl[0].offset_s == pytest.approx(200.0, abs=0.001)
@@ -195,7 +171,7 @@ class TestClipOffset:
     def test_output_start_zero_when_request_starts_mid_segment(self, tmp_path):
         now = time.time()
         seg_start = now - 800
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = seg_start + 200
         tl = _build_timeline(str(tmp_path), req_start, seg_start + 500)
         assert tl[0].output_start_s == pytest.approx(0.0, abs=0.001)
@@ -203,7 +179,7 @@ class TestClipOffset:
     def test_zero_offset_when_segment_starts_within_window(self, tmp_path):
         now = time.time()
         seg_start = now - 400
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 600, now)
         assert tl[0].offset_s == pytest.approx(0.0, abs=0.001)
 
@@ -215,14 +191,14 @@ class TestClipDuration:
     def test_duration_of_segment_fully_inside_window(self, tmp_path):
         now = time.time()
         seg_start = now - 500
-        _make_renamed(tmp_path, seg_start, seg_start + 300)
+        make_completed_segment(tmp_path, seg_start, seg_start + 300)
         tl = _build_timeline(str(tmp_path), now - 600, now - 100)
         assert tl[0].duration_s == pytest.approx(300.0, abs=0.01)
 
     def test_duration_clipped_at_window_end(self, tmp_path):
         now = time.time()
         seg_start = now - 400
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 600, now - 100)
         # clip runs from seg_start to window end: 300 s
         assert tl[0].duration_s == pytest.approx(300.0, abs=0.01)
@@ -230,7 +206,7 @@ class TestClipDuration:
     def test_duration_reduced_by_head_offset(self, tmp_path):
         now = time.time()
         seg_start = now - 700
-        _make_renamed(tmp_path, seg_start, seg_start + SEGMENT_SEC)
+        make_completed_segment(tmp_path, seg_start, seg_start + SEGMENT_SEC)
         req_start = now - 600  # 100 s into the segment
         tl = _build_timeline(str(tmp_path), req_start, now - 200)
         # clip covers [req_start, seg_end=now-100] ∩ [.., now-200] → 400 s
@@ -243,7 +219,7 @@ class TestUnnamedFilesIgnored:
 
     def test_unnamed_file_not_included(self, tmp_path):
         """Files without timestamp in name are skipped."""
-        _make_seg(tmp_path, 0, age_seconds=100)
+        make_live_segment(tmp_path, 0, age_seconds=100)
         now = time.time()
         tl = _build_timeline(str(tmp_path), now - 200, now)
         assert tl == []
@@ -251,8 +227,8 @@ class TestUnnamedFilesIgnored:
     def test_mix_named_and_unnamed(self, tmp_path):
         """Unnamed files are skipped; renamed files are included normally."""
         now = time.time()
-        _make_seg(tmp_path, 0, age_seconds=100)
-        _make_renamed(tmp_path, now - 200, now - 200 + SEGMENT_SEC)
+        make_live_segment(tmp_path, 0, age_seconds=100)
+        make_completed_segment(tmp_path, now - 200, now - 200 + SEGMENT_SEC)
         tl = _build_timeline(str(tmp_path), now - 200, now)
         assert len(tl) == 1
 
@@ -304,8 +280,8 @@ class TestConcatAssembly:
 
     def test_no_overlay_chain(self, tmp_path, captured):
         now = time.time()
-        _make_renamed(tmp_path, now - 800, now - 500)
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 800, now - 500)
+        make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
         assert 'overlay' not in self._filter(captured)
         assert 'concat=' in self._filter(captured)
@@ -314,8 +290,8 @@ class TestConcatAssembly:
         # window [now-900, now]; segments [now-800, now-500], [now-400, now-100]
         # → gap, seg, gap, seg, gap = 5 pieces, 3 of them color.
         now = time.time()
-        _make_renamed(tmp_path, now - 800, now - 500)
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 800, now - 500)
+        make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
         filt = self._filter(captured)
         assert 'concat=n=5:v=1:a=0' in filt
@@ -323,7 +299,7 @@ class TestConcatAssembly:
 
     def test_full_coverage_has_no_color_piece(self, tmp_path, captured):
         now = time.time()
-        _make_renamed(tmp_path, now - 1000, now)
+        make_completed_segment(tmp_path, now - 1000, now)
         self._transcode(tmp_path, now - 900, now - 100)
         filt = self._filter(captured)
         assert 'concat=n=1:v=1:a=0' in filt
@@ -333,7 +309,7 @@ class TestConcatAssembly:
         """A segment starting before the window is opened with -ss so its
         pre-window content is skipped at the demuxer, not decoded."""
         now = time.time()
-        _make_renamed(tmp_path, now - 1000, now)
+        make_completed_segment(tmp_path, now - 1000, now)
         self._transcode(tmp_path, now - 900, now - 100)
         cmd = captured['cmds'][0]
         idx = cmd.index('-ss')
@@ -343,7 +319,7 @@ class TestConcatAssembly:
     def test_no_input_seek_when_segment_starts_inside_window(
             self, tmp_path, captured):
         now = time.time()
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
         assert '-ss' not in captured['cmds'][0]
 
@@ -357,8 +333,8 @@ class TestConcatAssembly:
 
     def test_inputs_appear_in_timeline_order(self, tmp_path, captured):
         now = time.time()
-        first,  _ = _make_renamed(tmp_path, now - 800, now - 500)
-        second, _ = _make_renamed(tmp_path, now - 400, now - 100)
+        first,  _ = make_completed_segment(tmp_path, now - 800, now - 500)
+        second, _ = make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
         cmd = captured['cmds'][0]
         inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == '-i']
@@ -369,7 +345,7 @@ class TestConcatAssembly:
         """Each clip is tpad-ed with fill color then cut to its planned
         length, so short real content can't shift later pieces."""
         now = time.time()
-        _make_renamed(tmp_path, now - 800, now - 500)
+        make_completed_segment(tmp_path, now - 800, now - 500)
         self._transcode(tmp_path, now - 900, now)
         assert 'tpad=stop_mode=add' in self._filter(captured)
 
@@ -412,8 +388,8 @@ class TestStreamCopyFastPath:
         # window [now-900, now]; whole segments [now-800, now-500] and
         # [now-400, now-100] → 2 copies, 3 encoded gaps, 1 final concat.
         now = time.time()
-        _make_renamed(tmp_path, now - 800, now - 500)
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 800, now - 500)
+        make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
         cmds = captured['cmds']
         assert len(cmds) == 6
@@ -434,8 +410,8 @@ class TestStreamCopyFastPath:
         # Segment A's head is clipped by the window → encoded with -ss;
         # segment B is whole → copied.
         now = time.time()
-        _make_renamed(tmp_path, now - 800, now - 500)
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 800, now - 500)
+        make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 750, now - 100)
         copies = self._copy_cmds(captured)
         assert len(copies) == 1
@@ -448,7 +424,7 @@ class TestStreamCopyFastPath:
         claims (estimated active-segment end) must not be copied — the
         copy path can't pad, so it would shift later pieces."""
         now = time.time()
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 400, now - 100)
 
         def short_probe(_path):
             return (250.0, 1280, 720, '30/1', 'h264')  # claims 300 s
@@ -459,7 +435,7 @@ class TestStreamCopyFastPath:
 
     def test_non_h264_disables_copy(self, tmp_path, captured):
         now = time.time()
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 400, now - 100)
 
         def vp9_probe(path):
             dur, w, h, fps, _ = _probe_from_name(path)
@@ -486,7 +462,7 @@ class TestStreamCopyFastPath:
         monkeypatch.setattr(video_transcode, '_encoder_args',
                             lambda: ['-c:v', 'libx264'])
         now = time.time()
-        _make_renamed(tmp_path, now - 400, now - 100)
+        make_completed_segment(tmp_path, now - 400, now - 100)
         self._transcode(tmp_path, now - 900, now)
         final = calls['cmds'][-1]
         assert '-filter_complex' in final       # single-pass encode ran
