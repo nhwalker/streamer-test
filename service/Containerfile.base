@@ -1,0 +1,115 @@
+# desktop-stream-service BASE image — the ONLINE setup phase.
+#
+# This file pulls in every third-party FOSS component (ffmpeg, Python,
+# MediaMTX, supporting RPMs) and nothing from this repository.  Build it
+# where the network (or your mirrors) is reachable:
+#
+#   make service-base        # or: podman build -t desktop-stream-service-base:ci \
+#                            #       -f service/Containerfile.base service/
+#
+# The application itself is layered on top by service/Containerfile, which
+# only COPYs in-repo files and therefore builds fully offline once this
+# base image is present locally (podman save/load it across an air gap, or
+# pull the copy CI publishes to ghcr).
+#
+# No source compilation.  Everything comes from mirror-able RPM
+# repositories (Rocky 9 / EPEL 9 / RPM Fusion Free) except MediaMTX, which
+# is a single static Go binary vendored from a pinned release (override
+# MEDIAMTX_URL to pull it from an internal artifact store on air-gapped
+# builders).
+# Pinned to the current minor.  Minor tags stop receiving rebuilds (and
+# security fixes) when the next minor GAs — bump this pin each RHEL 9.x
+# release (~every 6 months; 9.9 expected ~Nov 2026).
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
+
+# ── Repos: Rocky 9 + EPEL9 + RPM Fusion Free ─────────────────────────────────
+# ubi-minimal ships microdnf, which cannot install packages straight from a
+# URL the way dnf can — the EPEL and RPM Fusion release RPMs are fetched with
+# curl and installed with rpm instead.
+RUN curl -fsSL -o /tmp/RPM-GPG-KEY-Rocky-9 \
+        https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9 \
+    && rpm --import /tmp/RPM-GPG-KEY-Rocky-9 \
+    && rm /tmp/RPM-GPG-KEY-Rocky-9 \
+    && printf '%s\n' \
+        '[rocky9-baseos]' \
+        'name=Rocky Linux 9 - BaseOS' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/BaseOS/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
+        'priority=100' \
+        '' \
+        '[rocky9-appstream]' \
+        'name=Rocky Linux 9 - AppStream' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/AppStream/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
+        'priority=100' \
+        '' \
+        '[rocky9-crb]' \
+        'name=Rocky Linux 9 - CRB' \
+        'baseurl=https://dl.rockylinux.org/pub/rocky/9/CRB/$basearch/os/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9' \
+        'priority=100' \
+        > /etc/yum.repos.d/rocky9-supplement.repo \
+    && curl -fsSL -o /tmp/epel-release.rpm \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+    && curl -fsSL -o /tmp/rpmfusion-free-release.rpm \
+        https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm \
+    && rpm -Uvh /tmp/epel-release.rpm /tmp/rpmfusion-free-release.rpm \
+    && rm /tmp/epel-release.rpm /tmp/rpmfusion-free-release.rpm
+
+# ── Runtime packages ─────────────────────────────────────────────────────────
+# ffmpeg comes from RPM Fusion Free (full build: h264_nvenc, libx264,
+# libopus, x11grab).  Do NOT let EPEL's stripped ffmpeg-free variant in —
+# it conflicts with RPM Fusion's ffmpeg-libs and lacks NVENC.
+# ubi-minimal has no Python at all, and the application code needs >= 3.10
+# (zip(strict=True) in stream_command.py; tooling targets 3.11).  Install
+# AppStream's python3.12 — which provides only /usr/bin/python3.12 — and
+# symlink it as /usr/local/bin/python3 so every `python3` shebang and
+# entrypoint call resolves to it (shadowing /usr/bin/python3 should a
+# dependency ever drag the 3.9 stack in).
+#
+# hostname + gawk serve entrypoint.sh's HOST_IP banner lookup; gzip backs
+# `tar -xzf` for the MediaMTX tarball below.  None are guaranteed in
+# ubi-minimal.
+RUN microdnf install -y \
+        --setopt=install_weak_deps=0 \
+        --nodocs \
+        ffmpeg \
+        python3.12 \
+        python3.12-pip \
+        nmap-ncat \
+        hostname \
+        gawk \
+        tar \
+        gzip \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && python3.12 -m pip install --no-cache-dir --root-user-action=ignore python-xlib \
+    && ffmpeg -hide_banner -encoders | grep -q h264_nvenc \
+    && ffmpeg -hide_banner -devices  | grep -q x11grab \
+    && microdnf clean all \
+    && rm -rf /var/cache/dnf /var/cache/microdnf /var/cache/yum /var/log/dnf* \
+              /usr/share/doc /usr/share/man /usr/share/info \
+              /root/.cache/pip
+
+# ── MediaMTX (vendored release binary) ───────────────────────────────────────
+# Pinned version + checksum.  Air-gapped builds: pass
+#   --build-arg MEDIAMTX_URL=https://artifacts.internal/…/mediamtx.tar.gz
+# pointing at the mirrored tarball (and keep MEDIAMTX_SHA256 in sync when
+# bumping the version).
+ARG MEDIAMTX_VERSION=v1.19.2
+ARG MEDIAMTX_URL=https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz
+ARG MEDIAMTX_SHA256=""
+RUN curl -fsSL -o /tmp/mediamtx.tar.gz "${MEDIAMTX_URL}" \
+    && if [ -n "${MEDIAMTX_SHA256}" ]; then \
+           echo "${MEDIAMTX_SHA256}  /tmp/mediamtx.tar.gz" | sha256sum -c -; \
+       else \
+           echo "WARNING: MEDIAMTX_SHA256 not set — skipping checksum check"; \
+       fi \
+    && tar -xzf /tmp/mediamtx.tar.gz -C /usr/local/bin mediamtx \
+    && rm /tmp/mediamtx.tar.gz \
+    && /usr/local/bin/mediamtx --version

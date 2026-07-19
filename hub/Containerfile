@@ -1,9 +1,12 @@
-# Pinned to the current minor — bump alongside service/Containerfile each
-# RHEL 9.x release.
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
-
-RUN microdnf install -y python3 && microdnf clean all \
-    && rm -rf /var/cache/dnf /var/log/dnf*
+# desktop-stream-hub APP image — the OFFLINE application phase.
+#
+# Layers the in-repo application onto the prebuilt base image from
+# hub/Containerfile.base.  COPY and chmod only — no network — so this
+# builds air-gapped as long as the base image is in local storage
+# (`make setup` builds it online).  Build with `--pull=never`
+# (make OFFLINE=1) to guarantee no registry access is attempted.
+ARG BASE_IMAGE=desktop-stream-hub-base:ci
+FROM ${BASE_IMAGE}
 
 COPY web/           /etc/hub/web/
 COPY web_server.py  /usr/local/bin/web_server.py

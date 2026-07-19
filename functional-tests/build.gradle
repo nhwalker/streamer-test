@@ -48,6 +48,28 @@ allure {
     }
 }
 
+// ── Offline support ──────────────────────────────────────────────────────────
+// The online setup phase (`make setup` → `./gradlew resolveDependencies`)
+// downloads the wrapper distribution and every dependency any configuration
+// can ever ask for — including the Allure commandline bundle — into the
+// Gradle cache; afterwards the suite runs without network via
+// `./gradlew --offline test` (`make functional OFFLINE=1`).
+tasks.register('resolveDependencies') {
+    group = 'build setup'
+    description = 'Resolves every dependency into the Gradle cache for later --offline runs.'
+    doLast {
+        [buildscript.configurations, configurations].each { container ->
+            container.findAll { it.canBeResolved }.each { cfg ->
+                try {
+                    logger.lifecycle("Resolving ${cfg.name} (${cfg.resolve().size()} files)")
+                } catch (Exception e) {
+                    logger.warn("Could not resolve ${cfg.name}: ${e.message}")
+                }
+            }
+        }
+    }
+}
+
 test {
     useJUnitPlatform()
     testLogging {
