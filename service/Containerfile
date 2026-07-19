@@ -5,7 +5,10 @@
 # MediaMTX, which is a single static Go binary vendored from a pinned release
 # (override MEDIAMTX_URL to pull it from an internal artifact store on
 # air-gapped builders).
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# Pinned to the current minor.  Minor tags stop receiving rebuilds (and
+# security fixes) when the next minor GAs — bump this pin each RHEL 9.x
+# release (~every 6 months; 9.9 expected ~Nov 2026).
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
 
 # ── Repos: Rocky 9 + EPEL9 + RPM Fusion Free ─────────────────────────────────
 # ubi-minimal ships microdnf, which cannot install packages straight from a
