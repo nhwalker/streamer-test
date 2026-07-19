@@ -392,8 +392,13 @@ once, overflow requests receive `503` + `Retry-After`.
 One faststart MP4 covering exactly the window: the window is cut into
 consecutive pieces — one clip per overlapping segment (opened with an
 input-side seek when it starts before the window), one generated
-`VIDEO_FILL_COLOR` clip per uncovered stretch — joined with ffmpeg's
-concat filter and re-encoded at `VIDEO_QP` (defaults to `ARCHIVE_QP`).
+`VIDEO_FILL_COLOR` clip per uncovered stretch. Whole segments that need
+no trimming are **stream-copied** (remuxed via MPEG-TS intermediates and
+the concat demuxer — their bitstream is never decoded); only gap fills
+and window-clipped boundary segments are re-encoded at `VIDEO_QP`
+(defaults to `ARCHIVE_QP`). When nothing is copyable, a single-pass
+concat-filter encode runs instead; it is also the fallback if the fast
+path fails.
 Windows over 12 hours are rejected. At most `VIDEO_MAX_CONCURRENT`
 (default 2) transcodes run at once — each is a full ffmpeg encode that
 competes with the live encoders — and overflow requests receive

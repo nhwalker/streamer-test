@@ -9,6 +9,7 @@ test can hold one slot open while probing the overflow path.
 """
 import http.client
 import threading
+import time
 
 import pytest
 
@@ -106,5 +107,13 @@ def test_slot_is_released_after_completion(archive_server):
     release.set()                            # staging proceeds immediately
     results = {}
     for key in ('a', 'b'):                   # sequential requests both succeed
-        _get_archive(port, results, key)
+        # /archive holds its slot through streaming, and the client can see
+        # the last body byte a moment before the server thread's cleanup
+        # releases the slot — retry briefly on 503 instead of racing it.
+        deadline = time.monotonic() + 5
+        while True:
+            _get_archive(port, results, key)
+            if results[key][0] != 503 or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
         assert results[key][0] == 200

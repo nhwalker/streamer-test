@@ -35,6 +35,20 @@ const turnCred = params.get('turn_cred');
 const video  = document.getElementById('stream');
 const status = document.getElementById('status');
 
+// Metrics readout elements — looked up once here; the 1 Hz metrics loop
+// (updateMetrics/stopMetrics) touches them every tick.
+const metricEls = {
+  fps:    document.getElementById('m-fps'),
+  lat:    document.getElementById('m-lat'),
+  res:    document.getElementById('m-res'),
+  qp:     document.getElementById('m-qp'),
+  frz:    document.getElementById('m-frz'),
+  jbd:    document.getElementById('m-jbd'),
+  codec:  document.getElementById('m-codec'),
+  hw:     document.getElementById('m-hw'),
+  health: document.getElementById('m-health'),
+};
+
 const setStatus = (msg, isError = false) => {
   status.textContent = msg;
   status.className   = isError ? 'error' : '';
@@ -378,14 +392,8 @@ async function updateMetrics() {
     }
   }
 
-  const fpsEl   = document.getElementById('m-fps');
-  const latEl   = document.getElementById('m-lat');
-  const resEl   = document.getElementById('m-res');
-  const qpEl    = document.getElementById('m-qp');
-  const frzEl   = document.getElementById('m-frz');
-  const jbdEl   = document.getElementById('m-jbd');
-  const codecEl = document.getElementById('m-codec');
-  const hwEl    = document.getElementById('m-hw');
+  const { fps: fpsEl, lat: latEl, res: resEl, qp: qpEl,
+          frz: frzEl, jbd: jbdEl, codec: codecEl, hw: hwEl } = metricEls;
 
   fpsEl.textContent = fps    != null ? fps.toFixed(1) : '--';
   // RTT/2 in ms = rttSec * 1000 / 2 = rttSec * 500
@@ -436,7 +444,7 @@ async function updateMetrics() {
     setQuality(frzEl, freezeTier(freezesPerMin));
     setQuality(jbdEl, jbdTier(avgJbMs));
   }
-  const dot = document.getElementById('m-health');
+  const dot = metricEls.health;
   dot.classList.remove('lossless', 'visually-lossless', 'good',
                        'yellow', 'red');
   if (health) dot.classList.add(health);
@@ -454,13 +462,13 @@ function stopMetrics() {
     _metricsTimer = null;
   }
   _snapshots.length = 0;
-  for (const id of ['m-fps', 'm-lat', 'm-res', 'm-qp', 'm-frz', 'm-jbd',
-                    'm-codec', 'm-hw']) {
-    const el = document.getElementById(id);
+  for (const key of ['fps', 'lat', 'res', 'qp', 'frz', 'jbd',
+                     'codec', 'hw']) {
+    const el = metricEls[key];
     el.textContent = '--';
     setQuality(el, null);
   }
-  document.getElementById('m-health').classList.remove(
+  metricEls.health.classList.remove(
     'lossless', 'visually-lossless', 'good', 'yellow', 'red');
 }
 
