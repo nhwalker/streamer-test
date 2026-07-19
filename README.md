@@ -2,7 +2,7 @@
 
 Streams a Linux desktop (X11) to any modern browser with sub-second latency
 while continuously recording it to disk. One container image (Red Hat
-UBI 9), no source builds: **ffmpeg** (capture + encode) → **MediaMTX**
+UBI 9 minimal), no source builds: **ffmpeg** (capture + encode) → **MediaMTX**
 (WebRTC/WHEP egress) → browser.
 
 > Migrating from the GStreamer/webrtcsink version? See
@@ -113,7 +113,7 @@ reconnects (~250 ms blip).
 
 ## Build
 
-Single-stage build, no compilation (~600 MB, a few minutes):
+Single-stage build on `ubi9/ubi-minimal`, no compilation (a few minutes):
 
 ```bash
 make service hub     # or: podman build -t desktop-stream-service:ci service/
