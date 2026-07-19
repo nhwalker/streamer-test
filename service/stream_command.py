@@ -174,50 +174,54 @@ def build_filter_complex(config):
     width, height = config['width'], config['height']
     streams = list(_iter_streams(config))
 
-    n_top = len(streams) + 1  # +1 archive
+    parts = []      # one graph stage per entry; ';'.joined at the end
+
+    def stage(src_lbl, steps, out_lbl):
+        """Append one graph stage: [src]step,step,...[out].
+
+        `steps` is a list of filter strings; an empty list becomes a
+        `null` rename so the pad still gets its expected name.
+        """
+        parts.append(f'[{src_lbl}]{",".join(steps) if steps else "null"}'
+                     f'[{out_lbl}]')
+
+    # Head: normalise the capture to the configured WxH and NV12 once,
+    # then fan out to one pad per stream plus the archive.
     top_labels = [f'v_{key}' for key, _, _ in streams] + ['v_arch']
-    parts = [
-        f'[0:v]scale={width}:{height},format=nv12,split={n_top}'
+    parts.append(
+        f'[0:v]scale={width}:{height},format=nv12,split={len(top_labels)}'
         + ''.join(f'[{lbl}]' for lbl in top_labels)
-    ]
+    )
 
     branches = []
     for key, crop, tiers in streams:
-        src = f'v_{key}'
-        pre = ''
         if crop is not None:
             cw, ch, cx, cy = crop
-            pre = f'crop={cw}:{ch}:{cx}:{cy},'
-        tier_labels = [f'{key}_t{i}' for i in range(len(tiers))]
-
-        if len(tiers) == 1:
-            # Single tier: no split needed.
-            chains = [(src, tiers[0], tier_labels[0], pre)]
+            crop_step = f'crop={cw}:{ch}:{cx}:{cy}'
+            base_w, base_h = cw, ch
         else:
-            split_outs = [f'{lbl}_raw' for lbl in tier_labels]
-            parts.append(
-                f'[{src}]{pre}split={len(tiers)}'
-                + ''.join(f'[{o}]' for o in split_outs)
-            )
-            pre = ''  # crop already applied before the split
-            chains = [(o, t, lbl, '')
-                      for o, t, lbl in zip(split_outs, tiers, tier_labels,
-                                           strict=True)]
+            crop_step = None
+            base_w, base_h = width, height
 
-        for src_lbl, tier, out_lbl, chain_pre in chains:
-            base_w = crop[0] if crop else width
-            base_h = crop[1] if crop else height
-            need_scale = (tier['width'], tier['height']) != (base_w, base_h)
-            filters = chain_pre
-            if need_scale:
-                filters += f'scale={tier["width"]}:{tier["height"]}'
-            if filters.endswith(','):
-                filters = filters[:-1]
-            if filters:
-                parts.append(f'[{src_lbl}]{filters}[{out_lbl}]')
-            elif src_lbl != out_lbl:
-                # Pure passthrough — null filter just renames the pad.
-                parts.append(f'[{src_lbl}]null[{out_lbl}]')
+        tier_labels = [f'{key}_t{i}' for i in range(len(tiers))]
+        if len(tiers) == 1:
+            # Single tier: crop (if any) and scale run in one stage.
+            tier_srcs  = [f'v_{key}']
+            tier_steps = [crop_step] if crop_step else []
+        else:
+            # Crop once, split, then each tier's stage only scales.
+            tier_srcs   = [f'{lbl}_raw' for lbl in tier_labels]
+            crop_prefix = f'{crop_step},' if crop_step else ''
+            parts.append(f'[v_{key}]{crop_prefix}split={len(tiers)}'
+                         + ''.join(f'[{s}]' for s in tier_srcs))
+            tier_steps = []
+
+        for src_lbl, tier, out_lbl in zip(tier_srcs, tiers, tier_labels,
+                                          strict=True):
+            steps = list(tier_steps)
+            if (tier['width'], tier['height']) != (base_w, base_h):
+                steps.append(f'scale={tier["width"]}:{tier["height"]}')
+            stage(src_lbl, steps, out_lbl)
             branches.append({'label': out_lbl, **tier})
 
     return ';'.join(parts), branches
