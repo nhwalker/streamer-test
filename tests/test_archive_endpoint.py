@@ -558,7 +558,7 @@ class TestStageAndZip:
             tmp.cleanup()
 
 
-# ── _truncate_to_complete_boxes ───────────────────────────────────────────────
+# ── truncate_to_complete_boxes (fmp4.py) ───────────────────────────────────────────────
 
 class TestTruncateToCompleteBoxes:
     """The staged active-segment copy must always end on a complete
@@ -570,46 +570,46 @@ class TestTruncateToCompleteBoxes:
         return str(p)
 
     def test_complete_file_untouched(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         data = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
                 + _box(b'moof') + _box(b'mdat', b'z' * 100))
         p = self._write(tmp_path, data)
-        assert _truncate_to_complete_boxes(p) is True
+        assert truncate_to_complete_boxes(p) is True
         assert open(p, 'rb').read() == data
 
     def test_partial_trailing_box_dropped(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         good = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
                 + _box(b'moof') + _box(b'mdat', b'q' * 40))
         partial = (100).to_bytes(4, 'big') + b'mdat' + b'z' * 20  # claims 100, has 28
         p = self._write(tmp_path, good + partial)
-        assert _truncate_to_complete_boxes(p) is True
+        assert truncate_to_complete_boxes(p) is True
         assert open(p, 'rb').read() == good
 
     def test_trailing_moof_without_mdat_dropped(self, tmp_path):
         # The exact CI failure shape: the cut fell inside the first mdat,
         # leaving a complete moof whose sample data is missing.  The bare
         # moof must go too — ffmpeg rejects a moof with no mdat behind it.
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         prefix = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
         cut = prefix + _box(b'moof', b'm' * 32) + b'\x00\x00\x82' # partial mdat
         p = self._write(tmp_path, cut)
-        assert _truncate_to_complete_boxes(p) is False
+        assert truncate_to_complete_boxes(p) is False
         assert open(p, 'rb').read() == prefix
 
     def test_bare_header_fragment_dropped(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
         p = self._write(tmp_path, good + b'\x00\x00')  # 2 stray bytes
-        assert _truncate_to_complete_boxes(p) is False  # no fragment kept
+        assert truncate_to_complete_boxes(p) is False  # no fragment kept
         assert open(p, 'rb').read() == good
 
     def test_size_zero_box_stops_walk(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
         weird = (0).to_bytes(4, 'big') + b'mdat' + b'z' * 40  # size 0 = "to EOF"
         p = self._write(tmp_path, good + weird)
-        assert _truncate_to_complete_boxes(p) is False
+        assert truncate_to_complete_boxes(p) is False
         assert open(p, 'rb').read() == good
 
     def test_staged_copy_is_truncated_end_to_end(self, tmp_path):

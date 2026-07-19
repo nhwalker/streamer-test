@@ -10,7 +10,8 @@ WEB_DIR.
 The endpoint implementations live elsewhere; this module is request/response
 glue only:
 
-  archive_export.py    segment staging + zipping for /archive and /video
+  archive_export.py    segment staging for /archive and /video
+  zip_stream.py        stored-zip streaming (exact size up front) for /archive
   video_transcode.py   MP4 assembly for /video
   archive_times.py     parse_duration / parse_timestamp for query params
 
