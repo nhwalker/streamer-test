@@ -113,24 +113,37 @@ reconnects (~250 ms blip).
 
 ## Build
 
-Single-stage build on `ubi9/ubi-minimal`, no compilation (a few minutes):
+Two-phase build on `ubi9/ubi-minimal`, no compilation. The **online setup
+phase** (`*/Containerfile.base`) bakes every third-party FOSS component
+into base images and warms the Gradle dependency cache; the **app phase**
+(`*/Containerfile`) only COPYs in-repo files onto the base, so it builds
+with no network at all:
 
 ```bash
-make service hub     # or: podman build -t desktop-stream-service:ci service/
+make setup                    # ONLINE: base images + Gradle dependency cache
+make service hub              # app images (offline-capable)
+make functional OFFLINE=1     # enforce the air gap: --pull=never / --offline
 ```
 
-| Component | Source | Air-gap story |
+For an air-gapped builder, run `make setup` where the network (or your
+mirrors) is reachable, then transfer the base images (`podman save`/`load`
+`desktop-stream-service-base:ci` and `desktop-stream-hub-base:ci` — CI
+also publishes them to ghcr as `<image>-base`) and the Gradle cache
+(`~/.gradle`); everything else builds and runs with `OFFLINE=1`.
+
+| Component | Source | Phase / air-gap story |
 |---|---|---|
-| ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL9) | mirror the repo |
-| Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | mirror the repos |
-| MediaMTX | GitHub release binary, **pinned version + sha256** | vendor the tarball, pass `--build-arg MEDIAMTX_URL=…` |
-| Web page + WHEP client | `service/web/` | in-repo, no build step |
+| ffmpeg (full: NVENC, libx264, libopus, x11grab) | RPM Fusion Free (EL9) | base image — mirror the repo |
+| Python 3, pip, python-xlib | UBI/Rocky/EPEL + PyPI | base image — mirror the repos |
+| MediaMTX | GitHub release binary, **pinned version + sha256** | base image — vendor the tarball, pass `--build-arg MEDIAMTX_URL=…` |
+| Java test dependencies + Gradle distribution | Maven Central / services.gradle.org | `make setup` warms the cache; tests run `--offline` |
+| Web page + WHEP client | `service/web/` | app image — in-repo, no build step |
 
 Watch out for:
 
 - **EPEL's `ffmpeg-free`** conflicts with RPM Fusion's `ffmpeg-libs` and
-  lacks NVENC — the Containerfile asserts `h264_nvenc` and `x11grab` at
-  build time.
+  lacks NVENC — `Containerfile.base` asserts `h264_nvenc` and `x11grab`
+  at build time.
 - **MediaMTX can't be built with `go install`** (its `go generate` fetches
   assets); vendoring the checksum-verified release binary is the supported
   path.

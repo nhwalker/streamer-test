@@ -72,6 +72,18 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
 
+      - name: Extract base-image metadata
+        id: base_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.REPO_NAME }}/${{ matrix.image }}-base
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -83,17 +95,59 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build, cache, and export image
+      # Online setup phase: everything third-party (Containerfile.base),
+      # loaded into the local daemon so the offline app build below can
+      # FROM it without a registry.
+      - name: Build base image (online phase)
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
-          file: ${{ matrix.context }}/Containerfile
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          push: ${{ github.event_name != 'pull_request' }}
-          outputs: type=docker,dest=${{ matrix.tarball }}
-          cache-from: type=gha,scope=${{ matrix.cache_scope }}
-          cache-to: type=gha,scope=${{ matrix.cache_scope }},mode=max
+          file: ${{ matrix.context }}/Containerfile.base
+          tags: ${{ steps.base_meta.outputs.tags }}
+          labels: ${{ steps.base_meta.outputs.labels }}
+          load: true
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}-base
+          cache-to: type=gha,scope=${{ matrix.cache_scope }}-base,mode=max
+
+      # Offline app phase: COPYs the in-repo application onto the base.
+      # --network=none proves no step needs the network.
+      - name: Build app image (offline phase)
+        env:
+          APP_TAGS: ${{ steps.meta.outputs.tags }}
+          APP_LABELS: ${{ steps.meta.outputs.labels }}
+          BASE_TAGS: ${{ steps.base_meta.outputs.tags }}
+        run: |
+          base_tag=$(printf '%s\n' "$BASE_TAGS" | head -n1)
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "$APP_TAGS"
+          while IFS= read -r label; do
+            [ -n "$label" ] && args+=(--label "$label")
+          done <<< "$APP_LABELS"
+          docker build \
+            --network=none \
+            --pull=false \
+            --build-arg "BASE_IMAGE=${base_tag}" \
+            -f ${{ matrix.context }}/Containerfile \
+            "${args[@]}" \
+            ${{ matrix.context }}
+
+      - name: Export app image tarball
+        env:
+          APP_TAGS: ${{ steps.meta.outputs.tags }}
+        run: docker save -o ${{ matrix.tarball }} "$(printf '%s\n' "$APP_TAGS" | head -n1)"
+
+      - name: Push images
+        if: github.event_name != 'pull_request'
+        env:
+          APP_TAGS: ${{ steps.meta.outputs.tags }}
+          BASE_TAGS: ${{ steps.base_meta.outputs.tags }}
+        run: |
+          printf '%s\n%s\n' "$BASE_TAGS" "$APP_TAGS" \
+            | while IFS= read -r tag; do
+                [ -n "$tag" ] && docker push "$tag"
+              done
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
@@ -197,13 +251,19 @@ jobs:
             sleep 0.5
           done
 
-      - name: Run functional tests
+      # Online setup phase: wrapper distribution + every dependency into the
+      # Gradle cache, so the test run below can prove the offline path works.
+      - name: Warm Gradle dependency cache (online phase)
+        working-directory: functional-tests
+        run: ./gradlew resolveDependencies
+
+      - name: Run functional tests (offline phase)
         working-directory: functional-tests
         env:
           SERVICE_IMAGE:      "desktop-stream-service:ci"
           HUB_IMAGE:          "desktop-stream-hub:ci"
           WEBRTC_TURN_SERVER: "turn://ci:ci@127.0.0.1:3478"
-        run: ./gradlew test
+        run: ./gradlew --offline test
 
       - name: Generate Allure report
         if: always()
