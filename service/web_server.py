@@ -10,7 +10,8 @@ WEB_DIR.
 The endpoint implementations live elsewhere; this module is request/response
 glue only:
 
-  archive_export.py    segment staging + zipping for /archive and /video
+  archive_export.py    segment staging for /archive and /video
+  zip_stream.py        stored-zip streaming (exact size up front) for /archive
   video_transcode.py   MP4 assembly for /video
   archive_times.py     parse_duration / parse_timestamp for query params
 
@@ -59,6 +60,7 @@ Environment variables:
   VIDEO_DEFAULT_WIDTH  Output width when no segments    (1920)
   VIDEO_DEFAULT_HEIGHT Output height when no segments   (1080)
 """
+import contextlib
 import json
 import os
 import shutil
@@ -98,6 +100,20 @@ _video_slots = threading.BoundedSemaphore(VIDEO_MAX_CONCURRENT)
 # is also recording; cap how many run at once so a batch of downloads
 # cannot starve the recorder's disk bandwidth.
 _archive_slots = threading.BoundedSemaphore(ARCHIVE_MAX_CONCURRENT)
+
+
+@contextlib.contextmanager
+def _holding(slot):
+    """Release an already-acquired semaphore slot when the block exits.
+
+    Handlers acquire non-blocking first (the failure path sends a 503),
+    then wrap the work the slot is meant to cover in `with _holding(...)`
+    so the slot's scope is visible syntactically.
+    """
+    try:
+        yield
+    finally:
+        slot.release()
 
 CONFIG = load_config()
 CONFIG_JSON = json.dumps(CONFIG).encode('utf-8')
@@ -175,7 +191,10 @@ class Router(SimpleHTTPRequestHandler):
         if not _archive_slots.acquire(blocking=False):
             self._send_busy(ARCHIVE_MAX_CONCURRENT, '/archive downloads')
             return
-        try:
+        # /archive never encodes; its cost IS the disk read + network
+        # stream, so the slot is held for the whole response.  (Contrast
+        # /video below, which frees its slot before streaming.)
+        with _holding(_archive_slots):
             tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR,
                                  start_ts, end_ts)
             try:
@@ -196,8 +215,6 @@ class Router(SimpleHTTPRequestHandler):
                     pass  # client went away mid-download
             finally:
                 tmp.cleanup()
-        finally:
-            _archive_slots.release()
 
     def _handle_video(self, query):
         window = self._parse_window(query)
@@ -212,29 +229,29 @@ class Router(SimpleHTTPRequestHandler):
         if not _video_slots.acquire(blocking=False):
             self._send_busy(VIDEO_MAX_CONCURRENT, '/video transcodes')
             return
-        # The slot covers only the expensive part (staging + ffmpeg
-        # encode).  Streaming the finished file to the client is I/O-bound
-        # and must not count against the CPU budget — a slow download
-        # would otherwise hold a transcode slot for its whole duration.
-        stage_tmp  = None
-        output_tmp = tempfile.TemporaryDirectory(prefix='video_out_')
+        stage_tmp   = None
+        output_tmp  = tempfile.TemporaryDirectory(prefix='video_out_')
         output_path = os.path.join(output_tmp.name, 'video.mp4')
         try:
-            try:
-                stage_tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR,
-                                           start_ts, end_ts)
-                transcode_to_video(
-                    stage_tmp.name, start_ts, end_ts,
-                    VIDEO_FILL_COLOR, output_path,
-                    default_width=VIDEO_DEFAULT_WIDTH,
-                    default_height=VIDEO_DEFAULT_HEIGHT,
-                )
-            except Exception as exc:
-                print(f'[video] transcode error: {exc}', flush=True)
-                self.send_error(500, 'Internal server error')
-                return
-            finally:
-                _video_slots.release()
+            # The slot covers only the expensive part (staging + ffmpeg
+            # encode).  Streaming the finished file to the client is
+            # I/O-bound and must not count against the CPU budget — a slow
+            # download would otherwise hold a transcode slot for its whole
+            # duration.
+            with _holding(_video_slots):
+                try:
+                    stage_tmp = stage_segments(ARCHIVE_DIR, ARCHIVE_LIVE_DIR,
+                                               start_ts, end_ts)
+                    transcode_to_video(
+                        stage_tmp.name, start_ts, end_ts,
+                        VIDEO_FILL_COLOR, output_path,
+                        default_width=VIDEO_DEFAULT_WIDTH,
+                        default_height=VIDEO_DEFAULT_HEIGHT,
+                    )
+                except Exception as exc:
+                    print(f'[video] transcode error: {exc}', flush=True)
+                    self.send_error(500, 'Internal server error')
+                    return
 
             try:
                 video_size = os.path.getsize(output_path)

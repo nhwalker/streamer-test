@@ -20,6 +20,7 @@ from archive_export import (
     zip_segments,
 )
 from archive_times import parse_duration, parse_timestamp
+from helpers import make_completed_segment, make_live_segment
 
 # Reference UTC epoch for 2024-01-15 10:30:00 UTC
 _REF_DT  = datetime.datetime(2024, 1, 15, 10, 30, 0, tzinfo=datetime.timezone.utc)
@@ -40,32 +41,6 @@ def _fake_copy(content_marker=b'copied-mp4'):
         with open(dst, 'wb') as fh:
             fh.write(content_marker)
     return _stub
-
-
-def _make_segment(directory, index, content=b'mp4-data', age_seconds=0):
-    """Write a fake unnamed (active) live .mp4 segment file."""
-    os.makedirs(str(directory), exist_ok=True)
-    path = os.path.join(str(directory), f'stream-{index:05d}.mp4')
-    with open(path, 'wb') as fh:
-        fh.write(content)
-    mtime = time.time() - age_seconds
-    os.utime(path, (mtime, mtime))
-    return path
-
-
-def _make_renamed_segment(directory, start_epoch, end_epoch, content=b'data'):
-    """Write a fake completed .mp4 segment with timestamps embedded in its name."""
-    os.makedirs(str(directory), exist_ok=True)
-    utc = datetime.timezone.utc
-    fmt = '%Y%m%d-%H%M%S'
-    def _fmt(e):
-        d = datetime.datetime.fromtimestamp(e, tz=utc)
-        return f'{d.strftime(fmt)}.{d.microsecond // 1000:03d}'
-    name = f'stream_{_fmt(start_epoch)}_to_{_fmt(end_epoch)}.mp4'
-    path = os.path.join(str(directory), name)
-    with open(path, 'wb') as fh:
-        fh.write(content)
-    return path, name
 
 
 @pytest.fixture
@@ -184,14 +159,14 @@ class TestStageSegments:
     def test_renamed_segment_in_range_included(self, dirs):
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
+        make_completed_segment(archive, now - 1200, now - 600)
         with stage_segments(archive, live, now - 1100, now - 700) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
 
     def test_renamed_segment_outside_range_excluded(self, dirs):
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 2400, now - 1800)
+        make_completed_segment(archive, now - 2400, now - 1800)
         with stage_segments(archive, live, now - 600, now) as stage_dir:
             assert os.listdir(stage_dir) == []
 
@@ -199,7 +174,7 @@ class TestStageSegments:
         archive, live = dirs
         now = time.time()
         for i in range(4):
-            _make_renamed_segment(archive, now - (4 - i) * 700,
+            make_completed_segment(archive, now - (4 - i) * 700,
                                            now - (3 - i) * 700)
         with stage_segments(archive, live, 0, now + 1) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 4
@@ -207,7 +182,7 @@ class TestStageSegments:
     def test_active_without_renamed_predecessor_excluded(self, dirs):
         """Active (unnamed) file is excluded when no completed segment precedes it."""
         archive, live = dirs
-        _make_segment(live, 0)
+        make_live_segment(live, 0)
         with stage_segments(archive, live, 0, time.time() + 1,
                             _copy=_fake_copy()) as stage_dir:
             assert os.listdir(stage_dir) == []
@@ -215,8 +190,8 @@ class TestStageSegments:
     def test_active_with_renamed_predecessor_included(self, dirs):
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0)  # active: starts at now-600, ends at now
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(live, 0)  # active: starts at now-600, ends at now
         with stage_segments(archive, live, now - 300, now + 1,
                             _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
@@ -225,8 +200,8 @@ class TestStageSegments:
         archive, live = dirs
         now = time.time()
         renamed_end = now - 600
-        _make_renamed_segment(archive, now - 1200, renamed_end)
-        _make_segment(live, 0)  # active: starts at renamed_end
+        make_completed_segment(archive, now - 1200, renamed_end)
+        make_live_segment(live, 0)  # active: starts at renamed_end
         # query window ends before the active segment starts
         with stage_segments(archive, live, 0, renamed_end - 10,
                             _copy=_fake_copy()) as stage_dir:
@@ -236,9 +211,9 @@ class TestStageSegments:
         """Only the highest-named unnamed file is considered; others are orphans."""
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1800, now - 1200)
-        _make_segment(live, 0)  # orphan from a crash
-        _make_segment(live, 1)  # active
+        make_completed_segment(archive, now - 1800, now - 1200)
+        make_live_segment(live, 0)  # orphan from a crash
+        make_live_segment(live, 1)  # active
         with stage_segments(archive, live, now - 1800, now + 1,
                             _copy=_fake_copy()) as stage_dir:
             # renamed + active only; orphan dropped → 2 files
@@ -248,7 +223,7 @@ class TestStageSegments:
         archive, live = dirs
         content = b'\x00\x00\x00\x20ftypisomrenamed-mp4'
         now = time.time()
-        _, name = _make_renamed_segment(archive, now - 1200, now - 600, content=content)
+        _, name = make_completed_segment(archive, now - 1200, now - 600, content=content)
         with stage_segments(archive, live, now - 1300, now - 500) as stage_dir:
             with open(os.path.join(stage_dir, name), 'rb') as fh:
                 assert fh.read() == content
@@ -257,8 +232,8 @@ class TestStageSegments:
         """Active live .mp4 is streamed verbatim into the stage dir."""
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0, content=b'\x00\x00\x00\x20ftypisomlive-mp4-bytes')
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(live, 0, content=b'\x00\x00\x00\x20ftypisomlive-mp4-bytes')
 
         marker = b'\x00\x00\x00\x20ftypisom-copied'
         # Window overlaps both renamed (ends at now-600) and active
@@ -277,8 +252,8 @@ class TestStageSegments:
         """When the copy raises on the active segment, the partial output is removed."""
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0)
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(live, 0)
 
         def failing_copy(src_fd, dst):
             with open(dst, 'wb') as fh:
@@ -296,8 +271,8 @@ class TestStageSegments:
         from archive_times import parse_segment_times
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0)
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(live, 0)
         with stage_segments(archive, live, now - 1200, now + 1,
                             _copy=_fake_copy()) as stage_dir:
             for fname in os.listdir(stage_dir):
@@ -309,7 +284,7 @@ class TestStageSegments:
         """Staging pins the inode via os.link — no byte copy on the same fs."""
         archive, live = dirs
         now = time.time()
-        path, name = _make_renamed_segment(archive, now - 1200, now - 600)
+        path, name = make_completed_segment(archive, now - 1200, now - 600)
         with stage_segments(archive, live, now - 1300, now - 500) as stage_dir:
             staged = os.path.join(stage_dir, name)
             assert os.stat(staged).st_ino == os.stat(path).st_ino
@@ -364,8 +339,8 @@ class TestStageSegments:
         the active segment."""
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(archive, 0)  # legacy/stray, must be ignored
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(archive, 0)  # legacy/stray, must be ignored
         with stage_segments(archive, live, now - 300, now + 1) as stage_dir:
             # Only the renamed segment overlaps; no active in live_dir.
             assert os.listdir(stage_dir) == []
@@ -379,14 +354,14 @@ class TestStageSegmentsRenamed:
     def test_renamed_segment_in_range_included(self, dirs):
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
+        make_completed_segment(archive, now - 1200, now - 600)
         with stage_segments(archive, live, now - 1100, now - 700) as stage_dir:
             assert len(os.listdir(stage_dir)) == 1
 
     def test_renamed_segment_outside_range_excluded(self, dirs):
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 2400, now - 1800)
+        make_completed_segment(archive, now - 2400, now - 1800)
         with stage_segments(archive, live, now - 600, now) as stage_dir:
             assert os.listdir(stage_dir) == []
 
@@ -394,7 +369,7 @@ class TestStageSegmentsRenamed:
         archive, live = dirs
         content = b'\x00\x00\x00\x20ftypisomrenamed-mp4'
         now = time.time()
-        _, name = _make_renamed_segment(archive, now - 1200, now - 600, content=content)
+        _, name = make_completed_segment(archive, now - 1200, now - 600, content=content)
         with stage_segments(archive, live, now - 1300, now - 500) as stage_dir:
             with open(os.path.join(stage_dir, name), 'rb') as fh:
                 assert fh.read() == content
@@ -404,8 +379,8 @@ class TestStageSegmentsRenamed:
         # A query covering [now-300, now+1] should get only the active segment.
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0)  # active (in live_dir)
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(live, 0)  # active (in live_dir)
         with stage_segments(archive, live, now - 300, now + 1,
                             _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 1
@@ -413,8 +388,8 @@ class TestStageSegmentsRenamed:
     def test_mix_renamed_and_unnamed_all_in_range(self, dirs):
         archive, live = dirs
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600)
-        _make_segment(live, 0)  # active
+        make_completed_segment(archive, now - 1200, now - 600)
+        make_live_segment(live, 0)  # active
         with stage_segments(archive, live, now - 1300, now + 1,
                             _copy=_fake_copy()) as stage_dir:
             assert len([f for f in os.listdir(stage_dir) if f.endswith('.mp4')]) == 2
@@ -542,8 +517,8 @@ class TestStageAndZip:
         archive, live = dirs
         content = b'\x00\x00\x00\x20ftypisomsegment-data'
         now = time.time()
-        _make_renamed_segment(archive, now - 1200, now - 600, content=content)
-        _make_segment(live, 0, content=b'active')
+        make_completed_segment(archive, now - 1200, now - 600, content=content)
+        make_live_segment(live, 0, content=b'active')
 
         tmp = stage_segments(archive, live, now - 1200, now + 1,
                              _copy=_fake_copy(b'copied-mp4'))
@@ -558,7 +533,7 @@ class TestStageAndZip:
             tmp.cleanup()
 
 
-# ── _truncate_to_complete_boxes ───────────────────────────────────────────────
+# ── truncate_to_complete_boxes (fmp4.py) ───────────────────────────────────────────────
 
 class TestTruncateToCompleteBoxes:
     """The staged active-segment copy must always end on a complete
@@ -570,46 +545,46 @@ class TestTruncateToCompleteBoxes:
         return str(p)
 
     def test_complete_file_untouched(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         data = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
                 + _box(b'moof') + _box(b'mdat', b'z' * 100))
         p = self._write(tmp_path, data)
-        assert _truncate_to_complete_boxes(p) is True
+        assert truncate_to_complete_boxes(p) is True
         assert open(p, 'rb').read() == data
 
     def test_partial_trailing_box_dropped(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         good = (_box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
                 + _box(b'moof') + _box(b'mdat', b'q' * 40))
         partial = (100).to_bytes(4, 'big') + b'mdat' + b'z' * 20  # claims 100, has 28
         p = self._write(tmp_path, good + partial)
-        assert _truncate_to_complete_boxes(p) is True
+        assert truncate_to_complete_boxes(p) is True
         assert open(p, 'rb').read() == good
 
     def test_trailing_moof_without_mdat_dropped(self, tmp_path):
         # The exact CI failure shape: the cut fell inside the first mdat,
         # leaving a complete moof whose sample data is missing.  The bare
         # moof must go too — ffmpeg rejects a moof with no mdat behind it.
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         prefix = _box(b'ftyp', b'x' * 8) + _box(b'moov', b'y' * 24)
         cut = prefix + _box(b'moof', b'm' * 32) + b'\x00\x00\x82' # partial mdat
         p = self._write(tmp_path, cut)
-        assert _truncate_to_complete_boxes(p) is False
+        assert truncate_to_complete_boxes(p) is False
         assert open(p, 'rb').read() == prefix
 
     def test_bare_header_fragment_dropped(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
         p = self._write(tmp_path, good + b'\x00\x00')  # 2 stray bytes
-        assert _truncate_to_complete_boxes(p) is False  # no fragment kept
+        assert truncate_to_complete_boxes(p) is False  # no fragment kept
         assert open(p, 'rb').read() == good
 
     def test_size_zero_box_stops_walk(self, tmp_path):
-        from archive_export import _truncate_to_complete_boxes
+        from fmp4 import truncate_to_complete_boxes
         good = _box(b'ftyp') + _box(b'moov', b'y' * 8)
         weird = (0).to_bytes(4, 'big') + b'mdat' + b'z' * 40  # size 0 = "to EOF"
         p = self._write(tmp_path, good + weird)
-        assert _truncate_to_complete_boxes(p) is False
+        assert truncate_to_complete_boxes(p) is False
         assert open(p, 'rb').read() == good
 
     def test_staged_copy_is_truncated_end_to_end(self, tmp_path):

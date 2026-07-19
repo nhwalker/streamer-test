@@ -136,12 +136,11 @@ def main():
     )
 
     shutting_down = threading.Event()
-    proc_ref = {'proc': None}
+    proc = None   # current ffmpeg; the signal handler closes over it
 
     def on_signal(sig, _frame):
         print(f'[service] Signal {sig} received, stopping ffmpeg', flush=True)
         shutting_down.set()
-        proc = proc_ref['proc']
         if proc and proc.poll() is None:
             # SIGINT == ffmpeg's own graceful-quit path: it finishes the
             # current segment, writes the trailer + final segment-list
@@ -180,7 +179,6 @@ def main():
         print(f'[service] launching ffmpeg ({len(cmd)} args, '
               f'segment numbering from {start_number})', flush=True)
         proc = subprocess.Popen(cmd)   # stdout/stderr inherit -> container log
-        proc_ref['proc'] = proc
 
         finalizer = SegmentFinalizer(
             segment_list_path, ARCHIVE_LIVE_DIR, ARCHIVE_DIR,
