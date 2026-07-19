@@ -143,15 +143,19 @@ _STAGE_PREFIX    = '.archive_stage_'
 _STAGE_STALE_SEC = 24 * 3600
 
 
-def _sweep_stale_stages(archive_dir):
-    """Delete stage dirs leaked by crashed requests.
+def sweep_stage_dirs(archive_dir, older_than_sec=_STAGE_STALE_SEC):
+    """Delete stage dirs leaked by interrupted requests.
 
     Stage dirs live inside archive_dir (see stage_segments) and are
-    normally removed by TemporaryDirectory.cleanup(); a hard crash
+    normally removed by TemporaryDirectory.cleanup(); a process killed
     mid-request leaks one, and because it holds hardlinks it keeps
     purged segments' disk space alive until removed.
+
+    Called with the default age from stage_segments (anything younger
+    might belong to a request in flight) and with older_than_sec=0 at
+    web-server boot, when no request can be in flight at all.
     """
-    cutoff = time.time() - _STAGE_STALE_SEC
+    cutoff = time.time() - older_than_sec
     for path in glob.glob(os.path.join(archive_dir, _STAGE_PREFIX + '*')):
         try:
             if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
@@ -205,7 +209,7 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
     The caller owns the returned TemporaryDirectory and must clean it up
     (use as a context manager or call .cleanup() explicitly).
     """
-    _sweep_stale_stages(archive_dir)
+    sweep_stage_dirs(archive_dir)
     # The stage dir lives on the archive filesystem so completed segments
     # can be hardlinked instead of copied — the system tmp dir is usually
     # a different filesystem (container layer or tmpfs), where os.link
@@ -216,6 +220,10 @@ def stage_segments(archive_dir, live_dir, start_ts, end_ts,
                                           dir=archive_dir)
     except OSError:
         tmp = tempfile.TemporaryDirectory(prefix='archive_stage_')
+    # mkdtemp creates 0700; open it up to 0755 so host-side tooling that
+    # walks a bind-mounted archive volume (find/du, the functional-test
+    # harness) can at least descend into a dir it cannot delete.
+    os.chmod(tmp.name, 0o755)
 
     now = time.time()
     renamed = []

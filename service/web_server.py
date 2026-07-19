@@ -71,6 +71,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 from archive_export import (
     stage_segments,
+    sweep_stage_dirs,
     write_zip_stream,
     zip_entries,
     zip_stream_size,
@@ -261,6 +262,10 @@ class Router(SimpleHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    # No request can be in flight yet, so every stage dir in the archive
+    # is debris from a previous run's unclean stop — sweep regardless of
+    # age (the in-request sweep only removes dirs older than a day).
+    sweep_stage_dirs(ARCHIVE_DIR, older_than_sec=0)
     port = int(os.environ.get('WEB_PORT', '8080'))
     server = ThreadingHTTPServer(('', port), Router)
     server.serve_forever()

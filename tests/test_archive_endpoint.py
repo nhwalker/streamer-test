@@ -342,6 +342,26 @@ class TestStageSegments:
         assert not os.path.exists(stale)
         assert os.path.exists(fresh)
 
+    def test_boot_sweep_removes_fresh_stage_dirs(self, dirs):
+        """With older_than_sec=0 (web-server boot) even fresh leftovers go —
+        no request can be in flight at boot."""
+        from archive_export import sweep_stage_dirs
+        archive, _live = dirs
+        fresh = os.path.join(archive, '.archive_stage_fresh')
+        os.makedirs(fresh)
+        sweep_stage_dirs(archive, older_than_sec=0)
+        assert not os.path.exists(fresh)
+
+    def test_stage_dir_is_world_traversable(self, dirs):
+        """0755 (not mkdtemp's 0700) so host-side tooling walking a
+        bind-mounted archive volume can descend into a leaked stage dir."""
+        archive, live = dirs
+        tmp = stage_segments(archive, live, 0, time.time())
+        try:
+            assert os.stat(tmp.name).st_mode & 0o777 == 0o755
+        finally:
+            tmp.cleanup()
+
     def test_unnamed_files_in_archive_dir_are_ignored(self, dirs):
         """Stray unnamed files inside archive_dir (e.g. from a previous
         single-directory deployment, or a crash) must not be treated as
