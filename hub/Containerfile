@@ -1,4 +1,6 @@
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# Pinned to 9.6 to validate rollback to that minor via CI — see PR; not
+# intended for merge.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6
 
 RUN microdnf install -y python3 && microdnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf*
