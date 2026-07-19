@@ -248,22 +248,22 @@ function jbdTier(ms) {
   return 'red';
 }
 
-async function updateMetrics() {
-  const pc = window._streamPc;
-  if (!pc || typeof pc.getStats !== 'function') return;
-  let stats;
-  try { stats = await pc.getStats(); } catch (_) { return; }
+// The metrics tick is a four-stage pipeline, one function per stage:
+//   extractSnapshot   raw counters out of one getStats() report
+//   deriveWindow      rolling-window rates from oldest vs newest snapshot
+//   classifyHealth    the five-tier overall verdict
+//   renderMetrics     values + colours into the readout
+// updateMetrics() only wires them together.
 
+// Pull the raw counters for this tick out of a getStats() report.
+function extractSnapshot(stats) {
   const codecsById = new Map();
   stats.forEach(r => { if (r.type === 'codec') codecsById.set(r.id, r.mimeType); });
 
-  const snap = { t: performance.now() };
-  let curFps = null;
-  let rttSec = null;
-
+  const snap = { t: performance.now(), curFps: null, rttSec: null };
   stats.forEach(r => {
     if (r.type === 'inbound-rtp' && r.kind === 'video') {
-      curFps              = (typeof r.framesPerSecond === 'number') ? r.framesPerSecond : null;
+      snap.curFps         = (typeof r.framesPerSecond === 'number') ? r.framesPerSecond : null;
       snap.framesDecoded  = r.framesDecoded     ?? 0;
       snap.qpSum          = (typeof r.qpSum === 'number') ? r.qpSum : null;
       snap.freezeCount    = r.freezeCount       ?? 0;
@@ -284,28 +284,28 @@ async function updateMetrics() {
     }
     // Per-stream RTT (preferred): from RTCP RR/SR exchange for this video track.
     if (r.type === 'remote-inbound-rtp' && r.kind === 'video') {
-      if (typeof r.roundTripTime === 'number') rttSec = r.roundTripTime;
+      if (typeof r.roundTripTime === 'number') snap.rttSec = r.roundTripTime;
     }
   });
 
   // Fallback: ICE candidate-pair RTT (network-wide, not video-specific).
   // Used until the first RTCP report exchange completes.
-  if (rttSec == null) {
+  if (snap.rttSec == null) {
     stats.forEach(r => {
       if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') {
-        if (typeof r.currentRoundTripTime === 'number') rttSec = r.currentRoundTripTime;
+        if (typeof r.currentRoundTripTime === 'number') snap.rttSec = r.currentRoundTripTime;
       }
     });
   }
+  return snap;
+}
 
-  _snapshots.push(snap);
-  while (_snapshots.length > WINDOW_LEN + 1) _snapshots.shift();
-
-  const old    = _snapshots[0];
+// Rolling-window rates between the oldest and newest snapshots.
+function deriveWindow(snap, old) {
   const winSec = (snap.t - old.t) / 1000;
 
   // FPS: prefer Chrome's instantaneous value; fallback to window-averaged delta.
-  let fps = curFps;
+  let fps = snap.curFps;
   if (fps == null && winSec > 0 && snap.framesDecoded != null && old.framesDecoded != null) {
     fps = (snap.framesDecoded - old.framesDecoded) / winSec;
   }
@@ -336,72 +336,75 @@ async function updateMetrics() {
       ? ((snap.jbDelay - old.jbDelay) / (snap.jbEmitted - old.jbEmitted)) * 1000
       : null;
 
+  return { fps, rttSec: snap.rttSec, avgQp, lossPct,
+           freezesPerMin, dPli, avgJbMs };
+}
+
+// Overall gumball verdict — five tiers, evaluated worst-first.  The two
+// top tiers (lossless, visually-lossless) require positive evidence:
+// low QP, full target resolution, near-target fps, and zero faults.
+// Without QP data (some browsers don't populate qpSum for hardware
+// decoders) the gumball can't claim either top tier and falls through
+// to "good".  Returns null when nothing qualifies.
+function classifyHealth(snap, d) {
+  const qpYellow = (QP_MAX[snap.mimeType] ?? 51) * QP_YELLOW_RATIO;
+  const qpVL     = QP_VISUALLY_LOSSLESS[snap.mimeType];
+
+  const isRed = (d.freezesPerMin != null && d.freezesPerMin > 2)
+             || d.dPli > 0
+             || (d.lossPct != null && d.lossPct > 5);
+
+  const isYellow = (d.avgQp != null && d.avgQp > qpYellow)
+                || (d.lossPct != null && d.lossPct > 1)
+                || (d.avgJbMs != null && d.avgJbMs > 200);
+
+  // Top-tier prerequisites: full delivery, no faults of any size.
+  const noFaults = !isRed
+                && !isYellow
+                && (d.freezesPerMin == null || d.freezesPerMin === 0)
+                && (d.lossPct       == null || d.lossPct       === 0)
+                && d.dPli === 0
+                && (d.avgJbMs == null || d.avgJbMs <= JBD_TOP_TIER_MAX_MS);
+
+  const fpsAtTarget = d.fps != null
+                   && _targetFps != null
+                   && d.fps >= _targetFps - 1;
+
+  const resAtTarget = _targetWidth != null
+                   && _targetHeight != null
+                   && snap.frameWidth  === _targetWidth
+                   && snap.frameHeight === _targetHeight;
+
+  if (isRed)    return 'red';
+  if (isYellow) return 'yellow';
+  if (noFaults && fpsAtTarget && resAtTarget
+      && d.avgQp != null && d.avgQp <= QP_LOSSLESS_MAX) return 'lossless';
+  if (noFaults && fpsAtTarget && resAtTarget
+      && qpVL != null && d.avgQp != null && d.avgQp <= qpVL) {
+    return 'visually-lossless';
+  }
+  if (d.fps != null && d.fps > 0) return 'good';
+  return null;
+}
+
+// Write one tick's values + colours into the readout.  `warmedUp` gates
+// the per-metric colours and matches the classifier's own gating, so a
+// value never gets a colour before the gumball could.
+function renderMetrics(snap, d, health, warmedUp) {
+  const { fps: fpsEl, lat: latEl, res: resEl, qp: qpEl,
+          frz: frzEl, jbd: jbdEl, codec: codecEl, hw: hwEl } = metricEls;
+
   const res = (snap.frameWidth && snap.frameHeight)
       ? `${snap.frameWidth}×${snap.frameHeight}`
       : null;
 
-  // Health classifier — needs a few samples before it's meaningful.
-  //
-  // Five tiers, evaluated worst-first.  The two top tiers (lossless,
-  // visually-lossless) require positive evidence: low QP, full target
-  // resolution, near-target fps, and zero faults.  Without QP data
-  // (some browsers don't populate qpSum for hardware decoders) the
-  // gumball can't claim either top tier and falls through to "good".
-  let health = null;
-  if (_snapshots.length >= 3) {
-    const qpYellow = (QP_MAX[snap.mimeType] ?? 51) * QP_YELLOW_RATIO;
-    const qpVL     = QP_VISUALLY_LOSSLESS[snap.mimeType];
-
-    const isRed = (freezesPerMin != null && freezesPerMin > 2)
-               || dPli > 0
-               || (lossPct != null && lossPct > 5);
-
-    const isYellow = (avgQp != null && avgQp > qpYellow)
-                  || (lossPct != null && lossPct > 1)
-                  || (avgJbMs != null && avgJbMs > 200);
-
-    // Top-tier prerequisites: full delivery, no faults of any size.
-    const noFaults = !isRed
-                  && !isYellow
-                  && (freezesPerMin == null || freezesPerMin === 0)
-                  && (lossPct       == null || lossPct       === 0)
-                  && dPli === 0
-                  && (avgJbMs == null || avgJbMs <= JBD_TOP_TIER_MAX_MS);
-
-    const fpsAtTarget = fps != null
-                     && _targetFps != null
-                     && fps >= _targetFps - 1;
-
-    const resAtTarget = _targetWidth != null
-                     && _targetHeight != null
-                     && snap.frameWidth  === _targetWidth
-                     && snap.frameHeight === _targetHeight;
-
-    if (isRed) {
-      health = 'red';
-    } else if (isYellow) {
-      health = 'yellow';
-    } else if (noFaults && fpsAtTarget && resAtTarget
-               && avgQp != null && avgQp <= QP_LOSSLESS_MAX) {
-      health = 'lossless';
-    } else if (noFaults && fpsAtTarget && resAtTarget
-               && qpVL != null && avgQp != null && avgQp <= qpVL) {
-      health = 'visually-lossless';
-    } else if (fps != null && fps > 0) {
-      health = 'good';
-    }
-  }
-
-  const { fps: fpsEl, lat: latEl, res: resEl, qp: qpEl,
-          frz: frzEl, jbd: jbdEl, codec: codecEl, hw: hwEl } = metricEls;
-
-  fpsEl.textContent = fps    != null ? fps.toFixed(1) : '--';
+  fpsEl.textContent = d.fps    != null ? d.fps.toFixed(1) : '--';
   // RTT/2 in ms = rttSec * 1000 / 2 = rttSec * 500
-  latEl.textContent = rttSec != null ? Math.round(rttSec * 500).toString() : '--';
-  resEl.textContent = res    ?? '--';
-  qpEl .textContent = avgQp  != null ? Math.round(avgQp).toString() : '--';
-  frzEl.textContent = freezesPerMin != null ? freezesPerMin.toFixed(1) : '--';
-  jbdEl.textContent = avgJbMs != null ? Math.round(avgJbMs).toString() : '--';
+  latEl.textContent = d.rttSec != null ? Math.round(d.rttSec * 500).toString() : '--';
+  resEl.textContent = res      ?? '--';
+  qpEl .textContent = d.avgQp  != null ? Math.round(d.avgQp).toString() : '--';
+  frzEl.textContent = d.freezesPerMin != null ? d.freezesPerMin.toFixed(1) : '--';
+  jbdEl.textContent = d.avgJbMs != null ? Math.round(d.avgJbMs).toString() : '--';
 
   // Codec name: stats report "video/H264" etc.; strip the "video/" prefix
   // for a tighter readout.
@@ -433,21 +436,38 @@ async function updateMetrics() {
 
   // Colour each value according to its individual tier, so the user can
   // see at a glance which metric is keeping the overall gumball below
-  // bright-green.  Tier helpers run only after we have a few samples,
-  // mirroring the gating on the overall classifier.
-  if (_snapshots.length >= 3) {
-    setQuality(fpsEl, fpsTier(fps, _targetFps));
-    setQuality(latEl, latTier(rttSec));
+  // bright-green.
+  if (warmedUp) {
+    setQuality(fpsEl, fpsTier(d.fps, _targetFps));
+    setQuality(latEl, latTier(d.rttSec));
     setQuality(resEl, resTier(snap.frameWidth, snap.frameHeight,
                               _targetWidth, _targetHeight));
-    setQuality(qpEl,  qpTier(avgQp, snap.mimeType));
-    setQuality(frzEl, freezeTier(freezesPerMin));
-    setQuality(jbdEl, jbdTier(avgJbMs));
+    setQuality(qpEl,  qpTier(d.avgQp, snap.mimeType));
+    setQuality(frzEl, freezeTier(d.freezesPerMin));
+    setQuality(jbdEl, jbdTier(d.avgJbMs));
   }
   const dot = metricEls.health;
   dot.classList.remove('lossless', 'visually-lossless', 'good',
                        'yellow', 'red');
   if (health) dot.classList.add(health);
+}
+
+async function updateMetrics() {
+  const pc = window._streamPc;
+  if (!pc || typeof pc.getStats !== 'function') return;
+  let stats;
+  try { stats = await pc.getStats(); } catch (_) { return; }
+
+  const snap = extractSnapshot(stats);
+  _snapshots.push(snap);
+  while (_snapshots.length > WINDOW_LEN + 1) _snapshots.shift();
+
+  const derived = deriveWindow(snap, _snapshots[0]);
+  // The classifier and the per-metric colours need a few samples of
+  // history before they're meaningful.
+  const warmedUp = _snapshots.length >= 3;
+  const health   = warmedUp ? classifyHealth(snap, derived) : null;
+  renderMetrics(snap, derived, health, warmedUp);
 }
 
 function startMetrics() {
@@ -493,6 +513,13 @@ function stopMetrics() {
   // retry timers from a superseded connection are ignored — the user
   // should only see "Stream ended" when the producer actually
   // disappears, never during a tier switch.
+  //
+  // INVARIANT: every async continuation — event handler, timer, await
+  // resumption — must re-check `seq === connectSeq` (and, for handlers
+  // bound to a pc, `pc === currentPc`) BEFORE having any effect, because
+  // teardownCurrent() may have superseded it while it was queued.  When
+  // adding a callback anywhere in the connection path, start it with
+  // that guard.
   let currentPc         = null;
   let currentSessionUrl = null;   // WHEP resource (Location) for DELETE
   let currentTier       = null;
