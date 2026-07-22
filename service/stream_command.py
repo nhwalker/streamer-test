@@ -160,12 +160,14 @@ def _iter_streams(config):
         yield s['name'], crop, s.get('tiers') or []
 
 
-def build_filter_complex(config):
+def build_filter_complex(config, archive=True):
     """Build the filter_complex string and the ordered output branch list.
 
     Returns (filter_str, branches) where branches is a list of dicts:
       {'label': ffmpeg pad label, 'whepPath': MediaMTX path, ...tier fields}
-    plus one final dict {'label': 'arch'} for the archive branch.
+
+    When `archive` is true the top-level split also feeds a [v_arch] pad
+    for the archive branch (mapped separately by build_ffmpeg_command).
 
     The first stage normalises the capture to the configured WxH and NV12
     once (mirroring the old single cudaconvertscale before the tee), so
@@ -186,8 +188,10 @@ def build_filter_complex(config):
                      f'[{out_lbl}]')
 
     # Head: normalise the capture to the configured WxH and NV12 once,
-    # then fan out to one pad per stream plus the archive.
-    top_labels = [f'v_{key}' for key, _, _ in streams] + ['v_arch']
+    # then fan out to one pad per stream (plus the archive, if enabled).
+    top_labels = [f'v_{key}' for key, _, _ in streams]
+    if archive:
+        top_labels.append('v_arch')
     parts.append(
         f'[0:v]scale={width}:{height},format=nv12,split={len(top_labels)}'
         + ''.join(f'[{lbl}]' for lbl in top_labels)
@@ -232,7 +236,9 @@ def build_ffmpeg_command(config, env, use_nvenc, archive_args,
                          segment_sec, segment_start_number=0):
     """Assemble the full ffmpeg argv for the single capture process.
 
-    archive_args     encoder argv fragment from archive_encoder_args()
+    archive_args     encoder argv fragment from archive_encoder_args(),
+                     or None to disable archiving entirely (no [v_arch]
+                     branch, no segment output)
     archive_pattern  live-dir sequential output pattern (…/prefix-%05d.mp4)
     """
     display   = env.get('DISPLAY', ':0')
@@ -240,7 +246,8 @@ def build_ffmpeg_command(config, env, use_nvenc, archive_args,
     rtsp_port = int(env.get('MEDIAMTX_RTSP_PORT', str(DEFAULT_RTSP_PORT)))
     width, height = config['width'], config['height']
 
-    filter_str, branches = build_filter_complex(config)
+    archive = archive_args is not None
+    filter_str, branches = build_filter_complex(config, archive=archive)
 
     cmd = [
         'ffmpeg', '-hide_banner', '-nostdin', '-loglevel', 'warning',
@@ -257,6 +264,9 @@ def build_ffmpeg_command(config, env, use_nvenc, archive_args,
                                  br['width'], br['height'], width, height)
         cmd += ['-f', 'rtsp', '-rtsp_transport', 'tcp',
                 f'rtsp://127.0.0.1:{rtsp_port}/{br["whepPath"]}']
+
+    if not archive:
+        return cmd
 
     # Archive output: fragmented MP4 (moov up front via empty_moov, one
     # fragment per keyframe) so the in-progress file is parseable

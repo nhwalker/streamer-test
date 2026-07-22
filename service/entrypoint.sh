@@ -109,7 +109,11 @@ if tier_count > 1:
     print(f"│  Tiers/stream : {tier_count} (browser auto-picks by viewport)")
 PYEOF
 echo "│  Ingest    : X11 display ${DISPLAY}                  "
-echo "│  Archive   : ${ARCHIVE_DIR} (live: ${ARCHIVE_LIVE_DIR})"
+case "${ARCHIVE_ENABLED:-1}" in
+    0|false|no|off|FALSE|No|NO|Off|OFF|False)
+        echo "│  Archive   : disabled (ARCHIVE_ENABLED=${ARCHIVE_ENABLED:-})" ;;
+    *)  echo "│  Archive   : ${ARCHIVE_DIR} (live: ${ARCHIVE_LIVE_DIR})" ;;
+esac
 echo "└─────────────────────────────────────────────────────┘"
 echo ""
 

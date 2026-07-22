@@ -19,6 +19,9 @@ This module:
   * spawns the single ffmpeg process and restarts it (with backoff) if it
     dies — MediaMTX tolerates the publisher dropping and re-appearing, so
     a crash costs viewers a few seconds of freeze, not a page reload,
+  * forwards ffmpeg's stdout/stderr to its own stdout/stderr line by
+    line with an '[ffmpeg]' prefix, so its output is attributable in the
+    interleaved container log,
   * runs the SegmentFinalizer poll loop while ffmpeg is alive,
   * forwards SIGTERM/SIGINT as a graceful ffmpeg shutdown (ffmpeg writes
     the final segment-list entry on clean exit, so the last archive
@@ -31,6 +34,9 @@ MEDIAMTX_* / WEBRTC_* knobs, desktop_config.py for geometry/ladder):
   DISPLAY                X11 display                              (:0)
   STREAM_FRAMERATE       frames per second                        (30)
 
+  ARCHIVE_ENABLED        set to 0/false/no/off to disable archiving
+                         entirely: ffmpeg gets no archive branch and
+                         the finalizer/purge loops are not started  (1)
   ARCHIVE_DIR            output dir for completed .mp4 segments   (/archive)
   ARCHIVE_LIVE_DIR       output dir for the in-progress .mp4      (/archive-live)
                          segment; written as fragmented MP4 with
@@ -61,6 +67,18 @@ from desktop_config import load_config
 from encoders import nvenc_works
 from stream_command import build_ffmpeg_command, live_gop
 
+_FALSY = {'0', 'false', 'no', 'off'}
+
+
+def env_flag(env, name, default=True):
+    """Parse a boolean env var: 0/false/no/off (any case) means off."""
+    raw = (env.get(name) or '').strip().lower()
+    if not raw:
+        return default
+    return raw not in _FALSY
+
+
+ARCHIVE_ENABLED      = env_flag(os.environ, 'ARCHIVE_ENABLED')
 ARCHIVE_DIR          = os.environ.get('ARCHIVE_DIR', '/archive')
 ARCHIVE_LIVE_DIR     = os.environ.get('ARCHIVE_LIVE_DIR', '/archive-live')
 ARCHIVE_SEGMENT_SEC  = int(os.environ.get('ARCHIVE_SEGMENT_SEC', '600'))
@@ -96,13 +114,16 @@ def _print_summary(config, use_nvenc, archive_pattern):
           f' @ {config["framerate"]} fps')
     print(f'  Pipeline mode     : '
           f'{"GPU (h264_nvenc)" if use_nvenc else "CPU (libx264)"}')
-    print(f'  Live segments     : {archive_pattern}'
-          f' ({ARCHIVE_SEGMENT_SEC}s segments)')
-    print(f'  Completed archive : {ARCHIVE_DIR}')
-    print(f'  Archive quality   : {ARCHIVE_QUALITY}'
-          + (f' (QP={ARCHIVE_QP})' if ARCHIVE_QUALITY == 'visually-lossless'
-             else f' (legacy bitrate={ARCHIVE_BITRATE}kbps)' if ARCHIVE_QUALITY == 'legacy'
-             else ''))
+    if ARCHIVE_ENABLED:
+        print(f'  Live segments     : {archive_pattern}'
+              f' ({ARCHIVE_SEGMENT_SEC}s segments)')
+        print(f'  Completed archive : {ARCHIVE_DIR}')
+        print(f'  Archive quality   : {ARCHIVE_QUALITY}'
+              + (f' (QP={ARCHIVE_QP})' if ARCHIVE_QUALITY == 'visually-lossless'
+                 else f' (legacy bitrate={ARCHIVE_BITRATE}kbps)' if ARCHIVE_QUALITY == 'legacy'
+                 else ''))
+    else:
+        print('  Archive           : disabled (ARCHIVE_ENABLED)')
     webrtc_port = config.get('webrtcPort', 8889)
     print('  WHEP endpoints    :')
     for t in config.get('fullTiers', []):
@@ -116,12 +137,44 @@ def _print_summary(config, use_nvenc, archive_pattern):
                   f'  http://<host>:{webrtc_port}/{t["whepPath"]}/whep')
 
 
+def forward_output(pipe, dest, prefix='[ffmpeg]'):
+    """Copy `pipe` to `dest` line by line, prefixing each line.
+
+    Runs until the pipe hits EOF (i.e. ffmpeg exited and the descriptor
+    drained), so lines written during shutdown are not lost.
+    """
+    with pipe:
+        for line in pipe:
+            print(f'{prefix} {line.rstrip()}', file=dest, flush=True)
+
+
+def spawn_ffmpeg(cmd):
+    """Start ffmpeg, forwarding its stdout/stderr to ours with a prefix.
+
+    Returns (proc, pump_threads).  Join the threads after proc exits to
+    make sure the tail of the output has been flushed through.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True, errors='replace', bufsize=1)
+    pumps = [
+        threading.Thread(target=forward_output, args=(proc.stdout, sys.stdout),
+                         name='ffmpeg-stdout', daemon=True),
+        threading.Thread(target=forward_output, args=(proc.stderr, sys.stderr),
+                         name='ffmpeg-stderr', daemon=True),
+    ]
+    for t in pumps:
+        t.start()
+    return proc, pumps
+
+
 def main():
     config = load_config()
     desktop_name = config['desktopName']
 
-    os.makedirs(ARCHIVE_DIR, exist_ok=True)
-    os.makedirs(ARCHIVE_LIVE_DIR, exist_ok=True)
+    if ARCHIVE_ENABLED:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        os.makedirs(ARCHIVE_LIVE_DIR, exist_ok=True)
 
     use_nvenc = nvenc_works(require_ffmpeg=True)
     archive_pattern   = os.path.join(ARCHIVE_LIVE_DIR, f'{desktop_name}-%05d.mp4')
@@ -129,11 +182,15 @@ def main():
 
     _print_summary(config, use_nvenc, archive_pattern)
 
-    arch_args = archive_encoder_args(
-        quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP,
-        bitrate_legacy=ARCHIVE_BITRATE, use_nvenc=use_nvenc,
-        gop=live_gop(os.environ),
-    )
+    # archive_args=None tells build_ffmpeg_command to omit the archive
+    # branch entirely (no [v_arch] pad, no segment muxer output).
+    arch_args = None
+    if ARCHIVE_ENABLED:
+        arch_args = archive_encoder_args(
+            quality=ARCHIVE_QUALITY, qp=ARCHIVE_QP,
+            bitrate_legacy=ARCHIVE_BITRATE, use_nvenc=use_nvenc,
+            gop=live_gop(os.environ),
+        )
 
     shutting_down = threading.Event()
     proc = None   # current ffmpeg; the signal handler closes over it
@@ -150,7 +207,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT,  on_signal)
 
-    if ARCHIVE_MAX_BYTES or ARCHIVE_MAX_AGE_DAYS:
+    if ARCHIVE_ENABLED and (ARCHIVE_MAX_BYTES or ARCHIVE_MAX_AGE_DAYS):
         def _purge_loop():
             while not shutting_down.wait(ARCHIVE_SEGMENT_SEC):
                 purge_archive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES,
@@ -161,14 +218,16 @@ def main():
 
     backoff = _RESTART_BACKOFF_START_SEC
     while not shutting_down.is_set():
-        # Fresh segment list per ffmpeg run — the finalizer tails from
-        # offset 0 and stream time restarts at 0 with a new epoch anchor.
-        try:
-            os.unlink(segment_list_path)
-        except FileNotFoundError:
-            pass
+        start_number = 0
+        if ARCHIVE_ENABLED:
+            # Fresh segment list per ffmpeg run — the finalizer tails from
+            # offset 0 and stream time restarts at 0 with a new epoch anchor.
+            try:
+                os.unlink(segment_list_path)
+            except FileNotFoundError:
+                pass
+            start_number = next_segment_number(ARCHIVE_LIVE_DIR, desktop_name)
 
-        start_number = next_segment_number(ARCHIVE_LIVE_DIR, desktop_name)
         cmd = build_ffmpeg_command(
             config, os.environ, use_nvenc, arch_args,
             archive_pattern, segment_list_path,
@@ -176,17 +235,22 @@ def main():
         )
 
         epoch_anchor = time.time()
-        print(f'[service] launching ffmpeg ({len(cmd)} args, '
-              f'segment numbering from {start_number})', flush=True)
-        proc = subprocess.Popen(cmd)   # stdout/stderr inherit -> container log
+        print(f'[service] launching ffmpeg ({len(cmd)} args'
+              + (f', segment numbering from {start_number})'
+                 if ARCHIVE_ENABLED else ', archive disabled)'),
+              flush=True)
+        proc, pumps = spawn_ffmpeg(cmd)
 
-        finalizer = SegmentFinalizer(
-            segment_list_path, ARCHIVE_LIVE_DIR, ARCHIVE_DIR,
-            desktop_name, epoch_anchor,
-        )
+        finalizer = None
+        if ARCHIVE_ENABLED:
+            finalizer = SegmentFinalizer(
+                segment_list_path, ARCHIVE_LIVE_DIR, ARCHIVE_DIR,
+                desktop_name, epoch_anchor,
+            )
         started = time.monotonic()
         while proc.poll() is None:
-            finalizer.poll()
+            if finalizer:
+                finalizer.poll()
             deadline = time.monotonic() + _FINALIZE_POLL_SEC
             while proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(_PROC_TICK_SEC)
@@ -199,9 +263,14 @@ def main():
                       file=sys.stderr, flush=True)
                 proc.kill()
                 proc.wait()
+        # Drain the [ffmpeg] output pumps so the tail of the log lands
+        # before any restart/shutdown message.
+        for t in pumps:
+            t.join(timeout=5)
         # Final poll picks up the last segment's list entry (written by
         # ffmpeg at clean exit).
-        finalizer.poll()
+        if finalizer:
+            finalizer.poll()
 
         if shutting_down.is_set():
             break

@@ -230,6 +230,7 @@ fixed-CBR alternative.
 
 | Variable | Default | Description |
 |---|---|---|
+| `ARCHIVE_ENABLED` | `1` | Set to `0`/`false`/`no`/`off` to disable archiving entirely: ffmpeg writes no segments and the finalizer/purge loops don't run (`/archive` and `/video` then have no data to serve) |
 | `ARCHIVE_DIR` | `/archive` | Completed, timestamp-named segments |
 | `ARCHIVE_LIVE_DIR` | `/archive-live` | In-progress segment (readable mid-write — fragmented MP4, moov up front) |
 | `ARCHIVE_SEGMENT_SEC` | `600` | Segment duration |

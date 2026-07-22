@@ -123,6 +123,18 @@ def test_filter_complex_crops_screens_once_before_tier_split():
     assert filt.count('crop=1920:540:0:540') == 1
 
 
+def test_filter_complex_archive_disabled_omits_arch_pad():
+    cfg, _ = _cfg()
+    filt, branches = build_filter_complex(cfg, archive=False)
+    assert '[v_arch]' not in filt
+    # Fan-out shrinks by one: full + 2 screens, no archive leg.
+    assert filt.startswith('[0:v]scale=1920:1080,format=nv12,split=3')
+    # Live branches are unchanged.
+    assert [b['whepPath'] for b in branches] == [
+        'full_t0', 'full_t1', 'top_t0', 'top_t1', 'bottom_t0', 'bottom_t1',
+    ]
+
+
 def test_filter_complex_single_tier_skips_split():
     cfg, _ = _cfg(LIVE_SCALE_LADDER='1.0')
     filt, branches = build_filter_complex(cfg)
@@ -162,6 +174,25 @@ def test_command_archive_writes_readable_fragmented_mp4():
     assert '-segment_time 600' in s
     assert '-segment_list /live/segments.csv' in s
     assert cmd[-1] == '/live/stream-%05d.mp4'
+
+
+def test_command_archive_args_none_disables_archive_output():
+    cfg, env = _cfg()
+    cmd = build_ffmpeg_command(
+        cfg, env, True, None,
+        archive_pattern='/live/stream-%05d.mp4',
+        segment_list_path='/live/segments.csv',
+        segment_sec=600,
+    )
+    s = ' '.join(cmd)
+    # No archive branch anywhere: no pad, no segment muxer, no outputs
+    # under the live dir.
+    assert 'v_arch' not in s
+    assert '-f segment' not in s
+    assert '/live/' not in s
+    # Live tiers still publish as usual; the last output is now RTSP.
+    assert s.count('-rtsp_transport tcp') == 6
+    assert cmd[-1].startswith('rtsp://127.0.0.1:8554/')
 
 
 def test_command_segment_start_number_propagates():
