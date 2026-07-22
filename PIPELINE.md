@@ -161,7 +161,9 @@ Each live tier:
 RTSP-over-TCP on loopback is flow-controlled and memory-speed; SRT/WHIP
 would only add overhead on a real lossy network, which this hop is not.
 
-The archive:
+The archive (omitted entirely — no `[v_arch]` pad, no segment output —
+when `ARCHIVE_ENABLED` is `0`/`false`/`no`/`off`; the finalizer and purge
+loops are skipped too):
 
 ```
 -map [v_arch] <encoder args>
